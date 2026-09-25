@@ -83,6 +83,32 @@ def test_array_parameter_schema_is_generated():
     assert params["required"] == ["edits", "name"]
 
 
+def test_on_event_emits_iteration_and_tool_call():
+    """进度钩子按序发出 iteration / tool_call 事件，供 UI 渲染实时状态。"""
+    events = []
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 2, "b": 3}')]),
+            make_message(content="5"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add], max_steps=5, on_event=lambda e, p: events.append((e, p)))
+
+    assert agent.run("2 + 3") == "5"
+    assert events == [
+        ("iteration", {"step": 1, "max_steps": 5}),
+        ("tool_call", {"name": "add"}),
+        ("iteration", {"step": 2, "max_steps": 5}),
+    ]
+
+
+def test_agent_without_on_event_still_runs():
+    """未设置钩子时零开销、行为不变。"""
+    agent = Agent(llm=ScriptedLLM([make_message(content="好")]), tools=[add])
+    assert agent.on_event is None
+    assert agent.run("hi") == "好"
+
+
 def test_agent_runs_tool_then_answers():
     llm = ScriptedLLM(
         [

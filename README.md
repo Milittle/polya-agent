@@ -66,6 +66,22 @@ REPL 斜杠命令：
 **中断**：`run()` 执行中按 Ctrl+C 只终止本次任务（历史保留，未回填的工具结果自动补齐，
 对话可继续）；输入提示处按 Ctrl+C/Ctrl+D 直接退出。
 
+### 交互与显示
+
+显示层用 [rich](https://github.com/Textualize/rich)、输入层用
+[prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit)、`--help`
+用 [rich-argparse](https://github.com/Hamatti/rich-argparse) 排版。这些只在
+stdin/stdout 是终端时启用；管道/CI 下自动降级为纯文本（补全、实时状态条、颜色都不出现）。
+
+- **回答与审批**：模型回答按 Markdown 渲染（标题、列表、代码块、复选框等）；危险工具审批
+  与执行计划用带边框的 `Panel` 展示。
+- **实时状态**：任务执行期间在底部显示状态条（`⠋ 第 12/25 轮 · 调用 read_file`），轮次与
+  当前工具由 `Agent.on_event` 钩子推送（见下）。`-p` 单任务模式刻意不加状态条，保持可管道。
+- **输入**：命令历史持久化到 `~/.mi_z_history`（上下键翻阅），输入 `/` 自动补全斜杠命令，
+  并按历史给出灰色建议（`→` 接受）。
+- **日志**：`[mi_z.agent] 调用工具 ...` 走 **stderr**，stdout 只承载答案——`-p` 模式可安全
+  `> answer.md` 或接管道；日志与状态条同屏时自动排在状态区上方，不打断刷新。
+
 ## 用法
 
 定义工具就是一个普通函数加 `@tool` 装饰器，JSON Schema 会从签名和类型注解自动生成：
@@ -112,6 +128,10 @@ agent = Agent(
   也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易
   数错——状态栏用代码提前算好。更新采用持久追加（旧状态留在轨迹里，不删改），KV Cache
   前缀始终稳定。也可传入自定义渲染函数 `status_bar=lambda snapshot: ...`。
+- `on_event(event, payload)` 是可选观测钩子：每轮迭代开始发 `("iteration", {"step",
+  "max_steps"})`，每次工具调用前发 `("tool_call", {"name"})`。CLI 的实时状态条就建立在它
+  之上；不设钩子时零开销、核心逻辑不受影响，任何前端（REPL、全屏 TUI、Web）都能接这条事件流。
+  注意它与 `status_bar` 不同：后者是给**模型**看的上下文内容，`on_event` 是给**人**看的进度信号。
 - `agent.total_usage` / `agent.last_usage` 累计/记录每次请求的 token 用量（响应里没有
   usage 字段时保持为 0 / `None`，不会报错）；只做统计，不进消息历史，不影响缓存前缀。
 - **两阶段模式**：`Agent(plan_mode=True, approve_plan=回调)` 启动时进入规划模式——
@@ -178,8 +198,8 @@ TODO 清单是状态栏的「任务规划」组件：`todo_write` 写入共享�
 
 ```
 mi_z/
-  agent.py    # 核心循环 + 审批钩子 + 状态栏注入
-  cli.py      # 命令行入口：REPL + 单任务模式 + 终端审批
+  agent.py    # 核心循环 + 审批钩子 + 状态栏注入 + on_event 进度钩子
+  cli.py      # 命令行入口：REPL + 单任务模式 + 终端审批 + rich/prompt_toolkit 显示层
   llm.py      # OpenAI 兼容接口封装
   tools.py    # @tool 装饰器与工具注册表（框架层）
   builtin.py  # 内置编码工具 + 编码代理提示词（内容层）

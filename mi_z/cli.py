@@ -10,6 +10,18 @@ EOF / Ctrl+C 统一翻译成 ``/quit`` 复用命令分发（避免三处退出�
 输入处中断=退出，``run()`` 执行中中断=仅终止本轮回提示符（历史保留，缺失的
 tool 结果由 Agent 补齐后序列仍合法）。与它不同的是我们有终端审批：危险工具
 执行前 ``y/N/a`` 交互确认，这是 mi-z 的 ``approve`` 钩子接到终端的实现。
+
+显示层用 rich：模型回答按 Markdown 渲染、审批与计划用 Panel 框出。命令输出
+（/todos、/status 等）仍走裸 ``print``——它们含 ``[1]``、``[in_progress]`` 这类
+方括号，交给 rich 会被当标记解析。凡带用户/模型内容的 rich 输出一律 ``markup=False``
+或以 ``Text``/``Markdown`` 包裹，避免内容里的方括号触发标记错误。
+
+输入层用 prompt_toolkit（**仅当 stdin 是终端**）：历史持久化 + 斜杠命令补全。
+管道/CI 下退回裸 ``input``，不在非 tty 环境里驱动全屏行编辑器。
+
+任务执行期间用 rich ``Live`` 在底部显示实时状态（第 N 轮 / 当前工具），事件由
+``Agent.on_event`` 钩子推送；日志经 ``RichHandler`` 排在状态区上方，避免打断。
+Live 同样仅在终端启用；本项是唯一的核心改动（Agent 多了一个可选回调）。
 """
 
 from __future__ import annotations
@@ -18,8 +30,23 @@ import argparse
 import logging
 import os
 import sys
+from contextlib import nullcontext
+from pathlib import Path
 
 from dotenv import load_dotenv
+from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import FileHistory
+from rich.console import Console
+from rich.highlighter import NullHighlighter
+from rich.live import Live
+from rich.logging import RichHandler
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.spinner import Spinner
+from rich.text import Text
+from rich_argparse import RichHelpFormatter
 
 from .agent import Agent
 from .builtin import CODING_SYSTEM_PROMPT, default_tools
@@ -27,6 +54,10 @@ from .llm import LLM
 from .providers import profile_for
 from .todos import TodoStore
 from .tools import Tool
+
+console = Console()
+
+SLASH_COMMANDS = ["/help", "/todos", "/status", "/plan", "/reset", "/exit", "/quit"]
 
 HELP_TEXT = """\
 命令：
@@ -93,21 +124,35 @@ def terminal_approve(interactive: bool):
             return True
         if tool.name in allowed:
             return True
-        if not interactive:
-            print(f"[非交互环境，默认拒绝] {tool.name}({arguments})")
-            return False
         preview = str(arguments)
         if len(preview) > 120:
             preview = preview[:120] + "…"
+        if not interactive:
+            console.print(
+                Panel(
+                    Text(f"{tool.name}({preview})"),
+                    title="非交互环境，默认拒绝",
+                    border_style="red",
+                )
+            )
+            return False
+        console.print(
+            Panel(
+                Text(f"{tool.name}({preview})"),
+                title="危险工具执行审批",
+                subtitle="[green]y[/] 允许  [red]n[/] 拒绝  [yellow]a[/] 本会话内自动放行",
+                border_style="yellow",
+            )
+        )
         try:
-            answer = input(f"允许执行 {tool.name}({preview})? [y/N/a] ").strip().lower()
+            answer = input("确认 [y/N/a] ").strip().lower()
         except EOFError:
             return False
         if answer in ("y", "yes"):
             return True
         if answer == "a":
             allowed.add(tool.name)
-            print(f"[本会话内 {tool.name} 不再询问]")
+            console.print(f"本会话内 {tool.name} 不再询问", style="dim")
             return True
         return False
 
@@ -119,9 +164,9 @@ def terminal_approve_plan(interactive: bool):
 
     def approve_plan(plan: str) -> bool:
         if not interactive:
-            print("[非交互环境，默认拒绝计划；用 --yes 自动批准]")
+            console.print("非交互环境，默认拒绝计划；用 --yes 自动批准", style="red")
             return False
-        print("\n" + "=" * 60 + f"\n{plan}\n" + "=" * 60)
+        console.print(Panel(Markdown(plan), title="执行计划", border_style="cyan"))
         try:
             answer = input("批准该计划并进入执行模式? [y/N] ").strip().lower()
         except EOFError:
@@ -135,6 +180,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="mi-z",
         description="本地编码代理：读文件、改代码、跑命令，干活前先问一句。",
+        formatter_class=RichHelpFormatter,
     )
     parser.add_argument("--root", default=".", help="工作目录，所有文件操作被限制在内（默认 .）")
     parser.add_argument(
@@ -214,13 +260,87 @@ def build_agent(args: argparse.Namespace, llm=None) -> Agent:
     )
 
 
+class SlashCommandCompleter(Completer):
+    """只补全开头的斜杠命令：整行不是命令（普通任务）时不给任何建议。
+
+    一旦出现空格（如 ``/plan on`` 的参数部分）即停止——命令名补全到此为止。
+    """
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for command in SLASH_COMMANDS:
+            if command.startswith(text):
+                yield Completion(command, start_position=-len(text))
+
+
+def make_session() -> PromptSession:
+    """构建带历史与斜杠补全的输入会话；历史持久化到 ``~/.mi_z_history``。"""
+    return PromptSession(
+        history=FileHistory(str(Path.home() / ".mi_z_history")),
+        completer=SlashCommandCompleter(),
+        auto_suggest=AutoSuggestFromHistory(),
+    )
+
+
+class LiveStatusBar:
+    """把 Agent 的进度事件渲染成 rich Spinner，供 Live 实时刷新。
+
+    ``update`` 即传给 ``Agent.on_event`` 的回调；``render`` 读当前状态生成可
+    渲染对象（每帧调用一次，故状态须在实例上而非闭包外）。
+    """
+
+    def __init__(self) -> None:
+        self.step = 0
+        self.max_steps = 0
+        self.tool: str | None = None
+
+    def update(self, event: str, payload: dict) -> None:
+        if event == "iteration":
+            self.step = payload.get("step", self.step)
+            self.max_steps = payload.get("max_steps", self.max_steps)
+            self.tool = None  # 新一轮开始：上一轮的工具名作废
+        elif event == "tool_call":
+            self.tool = payload.get("name")
+
+    def render(self):
+        label = f"第 {self.step}/{self.max_steps} 轮"
+        if self.tool:
+            label += f" · 调用 {self.tool}"
+        return Spinner("dots", text=Text(f" {label}…", style="cyan"))
+
+
+def status_live(status: LiveStatusBar):
+    """任务执行期间在终端底部显示实时状态；非终端（管道/CI）下为 no-op。"""
+    if not console.is_terminal:
+        return nullcontext()
+    return Live(
+        get_renderable=status.render,
+        console=console,
+        transient=True,
+        refresh_per_second=10,
+    )
+
+
 def repl(agent: Agent, root: str) -> None:
-    """交互主循环：斜杠命令本地处理，其余输入交给 agent。"""
+    """交互主循环：斜杠命令本地处理，其余输入交给 agent。
+
+    stdin 是终端时用 prompt_toolkit（历史 + 补全），否则退回 ``input``；任务执行
+    期间用 Live 显示实时状态（仅终端）。``session.prompt`` 与 ``Live`` 都独占终端，
+    但二者不同时活跃（Live 只在 ``run()`` 期间开，之后随即关闭），故不冲突。
+    """
     print(f"mi-z（模型: {agent.llm.model}，工作目录: {os.path.abspath(root)}）")
     print("输入任务开始；/help 查看命令；Ctrl+D 退出。规划模式可用 /plan on 开启。\n")
+    session = make_session() if sys.stdin.isatty() else None
+    status = LiveStatusBar()
+    agent.on_event = status.update
     while True:
         try:
-            user_input = input("> ").strip()
+            if session is not None:
+                user_input = session.prompt("> ").strip()
+            else:
+                user_input = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -233,29 +353,50 @@ def repl(agent: Agent, root: str) -> None:
             print(output)
             continue
         try:
-            print(agent.run(user_input))
-            print(f"\n[用量] {agent.total_usage}")
+            with status_live(status):
+                answer = agent.run(user_input)
+            console.print(Markdown(answer))
+            console.print(f"[用量] {agent.total_usage}", style="dim", markup=False)
         except KeyboardInterrupt:
-            print("\n[已中断本次任务；已完成步骤保留在历史中，可继续对话或 /reset 重来]")
+            console.print(
+                "\n[已中断本次任务；已完成步骤保留在历史中，可继续对话或 /reset 重来]",
+                style="yellow",
+                markup=False,
+            )
         except RuntimeError as exc:
-            print(f"[任务失败] {exc}")
+            console.print(f"[任务失败] {exc}", style="red", markup=False)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     load_dotenv()  # 与 demo.py 一致：从项目 .env 读取 OPENAI_* 配置
-    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(name)s] %(message)s",
+        handlers=[
+            RichHandler(
+                # 日志走 stderr：stdout 只承载答案（-p 模式可安全重定向/管道）。与
+                # stdout 上的 Live 经 stderr 重定向协同——日志自动排在状态区上方。
+                console=Console(stderr=True),
+                show_time=False,
+                show_level=False,
+                show_path=False,
+                markup=False,
+                highlighter=NullHighlighter(),
+            )
+        ],
+    )
     agent = build_agent(args)
     if args.prompt is not None:
         try:
-            print(agent.run(args.prompt))
+            console.print(Markdown(agent.run(args.prompt)))
         except KeyboardInterrupt:
             print("\n[已中断]", file=sys.stderr)
             return 130
         except RuntimeError as exc:
             print(f"[任务失败] {exc}", file=sys.stderr)
             return 1
-        print(f"\n[用量] {agent.total_usage}")
+        console.print(f"[用量] {agent.total_usage}", style="dim", markup=False)
         return 0
     repl(agent, args.root)
     return 0

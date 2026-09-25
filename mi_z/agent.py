@@ -62,6 +62,7 @@ class Agent:
         keep_recent: int = 30,
         profile: ModelProfile | None = None,
         prefix_check: bool = False,
+        on_event: Callable[[str, dict], None] | None = None,
     ):
         self.llm = llm
         self.tools = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
@@ -112,6 +113,10 @@ class Agent:
         # 推理连续性断裂（2.7）——所以提供可开启的运行时断言。
         self.prefix_check = prefix_check
         self._last_prefix: list[dict] | None = None
+        # 观测钩子（可选）：迭代开始与工具调用前向外发出语义事件，供 UI 层渲染
+        # 实时进度（事件：iteration{step,max_steps}、tool_call{name}）。不设钩子
+        # 时零开销、核心逻辑不受影响——与 approve / status_bar 同属可选回调。
+        self.on_event = on_event
 
     def reset(self) -> None:
         self.history.clear()
@@ -120,6 +125,11 @@ class Agent:
         self.tool_counts.clear()
         self.todos.rewrite([])  # 清单随会话一起重置
         self._last_prefix = None  # 前缀基线随之失效
+
+    def _emit(self, event: str, **payload) -> None:
+        """向外发出一个进度事件；未设置 on_event 时零开销。"""
+        if self.on_event is not None:
+            self.on_event(event, payload)
 
     def _check_prefix(self, messages: list[dict]) -> None:
         """前缀不变量的运行时断言：本次请求必须是上一次的严格扩展。
@@ -215,6 +225,7 @@ class Agent:
         schemas = self.tools.schemas() or None
 
         for step in range(1, self.max_steps + 1):
+            self._emit("iteration", step=step, max_steps=self.max_steps)
             if self._should_compress():
                 compacted = self._try_compress(user_input)
                 if compacted is not None:
@@ -284,6 +295,7 @@ class Agent:
                     except json.JSONDecodeError:
                         arguments = {}
                     logger.info("调用工具 %s(%s)", name, arguments)
+                    self._emit("tool_call", name=name)
 
                     item = self.tools.get(name)
                     if item is not None and self.plan_mode and item.dangerous:

@@ -8,7 +8,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from mi_z import Agent, tool
-from mi_z.cli import build_agent, handle_command, main, parse_args, terminal_approve
+from mi_z.cli import LiveStatusBar, build_agent, handle_command, main, parse_args, terminal_approve
 from mi_z.todos import TodoStore
 
 
@@ -157,3 +157,15 @@ def test_repl_loop_runs_and_exits(monkeypatch, tmp_path, capsys):
     assert main(["--root", str(tmp_path)]) == 0
     out = capsys.readouterr().out
     assert "1024" in out and "工具调用" in out  # 答案 + /status 输出
+
+
+def test_live_status_bar_tracks_events():
+    """状态栏读事件更新轮次与当前工具；新一轮开始清掉上一轮的工具名。"""
+    bar = LiveStatusBar()
+    bar.update("iteration", {"step": 2, "max_steps": 25})
+    bar.update("tool_call", {"name": "read_file"})
+    label = bar.render().text.plain
+    assert "第 2/25 轮" in label and "read_file" in label
+
+    bar.update("iteration", {"step": 3, "max_steps": 25})
+    assert "read_file" not in bar.render().text.plain
