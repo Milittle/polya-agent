@@ -17,12 +17,13 @@ from dotenv import load_dotenv
 
 from mi_z import LLM, Agent, default_tools
 from mi_z.builtin import CODING_SYSTEM_PROMPT
+from mi_z.todos import TodoStore
 
 load_dotenv()
 
 QUESTION = (
-    "先用 glob 找出所有测试文件，再读一下 mi_z/agent.py，"
-    "然后用三五句话说明这个文件负责什么、核心循环是怎么跑的。"
+    "先统计 mi_z/ 和 tests/ 各有几个 Python 文件（用 glob），再读 mi_z/agent.py，"
+    "最后用三五句话说明这个文件负责什么、核心循环是怎么跑的。"
 )
 
 
@@ -39,15 +40,18 @@ def approve(tool, arguments) -> bool:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
+    todos = TodoStore()  # 工具和状态栏共享同一份 TODO（工具写入，状态栏渲染）
     agent = Agent(
         llm=LLM(),
-        tools=default_tools(),
+        tools=default_tools(todos=todos),
         system_prompt=CODING_SYSTEM_PROMPT,
         approve=approve,
         status_bar=True,  # 每轮迭代在上下文末尾注入 <agent_status> 元信息（书 2.6）
+        todos=todos,
     )
     print(agent.run(QUESTION))
     print(f"\n[token 用量] {agent.total_usage}")
+    print(f"[TODO 终态] {agent.todos.as_dicts()}")
 
 
 if __name__ == "__main__":

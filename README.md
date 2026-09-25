@@ -105,9 +105,14 @@ agent = Agent(
 | `bash_output` | — | 非阻塞读取会话新输出（后台/慢速命令） |
 | `kill_bash` | ⚠️ | 终止持久会话 |
 | `web_fetch` | — | 抓取 URL，HTML 转文本，`<external_content>` 包裹防注入；**拒绝内网/localhost（SSRF 防护）** |
+| `todo_write` | — | 全量重写 TODO 清单（可选；需 `default_tools(todos=store)` + `Agent(todos=store)` 共享同一实例） |
 
 工具结果会进上下文，因此输出统一截断到 8000 字符。`bash` 会话超时会终止并重启
 （环境状态丢失）；命令必须非交互。`web_fetch` 用标准库实现，零第三方依赖。
+
+TODO 清单是状态栏的「任务规划」组件：`todo_write` 写入共享的 `TodoStore`，
+状态栏每轮把它渲染到上下文末尾——模型不用从历史里回忆还剩什么（外部记忆）：
+`agent.reset()` 会连同清单一起清空。
 
 **跨平台**：除 `bash` 会话（需要 bash，Windows 需 WSL/Git Bash）外，全部工具为
 纯 Python 实现，Windows 原生可跑——不依赖 grep/rg/find 等系统命令。

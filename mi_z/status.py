@@ -15,6 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+_STATUS_LABELS = {
+    "pending": "待办",
+    "in_progress": "进行中",
+    "completed": "已完成",
+    "cancelled": "已取消",
+}
+
 
 @dataclass
 class StatusSnapshot:
@@ -24,6 +31,7 @@ class StatusSnapshot:
     max_steps: int
     tool_calls: dict[str, int] = field(default_factory=dict)  # 工具名 -> 会话累计调用次数
     usage: dict = field(default_factory=dict)  # 累计 token 用量
+    todos: list[dict] = field(default_factory=list)  # TODO 清单（任务规划组件）
     now: datetime = field(default_factory=datetime.now)
 
 
@@ -38,12 +46,20 @@ def render_status(snapshot: StatusSnapshot) -> str:
     else:
         calls = "  - （尚未调用工具）"
     usage = snapshot.usage
+    todo_lines = ""
+    if snapshot.todos:
+        items = "\n".join(
+            f"  [{index}] [{_STATUS_LABELS.get(item['status'], item['status'])}] {item['content']}"
+            for index, item in enumerate(snapshot.todos, 1)
+        )
+        todo_lines = f"- TODO 清单:\n{items}\n"
     return (
         "<agent_status>\n"
         f"当前状态（第 {snapshot.iteration}/{snapshot.max_steps} 轮迭代；"
         "历史中若有多条状态，以最后一条为准）：\n"
         f"- 时间: {snapshot.now:%Y-%m-%d %H:%M:%S}\n"
         f"- 工具调用累计:\n{calls}\n"
+        f"{todo_lines}"
         f"- token 用量: prompt {usage.get('prompt_tokens', 0)},"
         f" completion {usage.get('completion_tokens', 0)}\n"
         "</agent_status>"

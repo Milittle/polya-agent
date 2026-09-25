@@ -8,6 +8,7 @@ from collections import Counter
 from collections.abc import Callable
 
 from .status import StatusSnapshot, render_status
+from .todos import TodoStore
 from .tools import Tool, ToolRegistry
 
 logger = logging.getLogger("mi_z.agent")
@@ -48,6 +49,7 @@ class Agent:
         max_steps: int = 10,
         approve: Callable[[Tool, dict], bool] | None = None,
         status_bar: bool | Callable[[StatusSnapshot], str] | None = None,
+        todos: TodoStore | None = None,
     ):
         self.llm = llm
         self.tools = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
@@ -57,6 +59,9 @@ class Agent:
         # 状态栏渲染器：True 用默认渲染，callable 自定义，None/False 关闭。
         # 状态以 user 消息追加在上下文末尾（书 2.6），绝不修改已有消息。
         self.status_bar = render_status if status_bar is True else status_bar or None
+        # TODO 存储：todo_write 工具写入（default_tools(todos=...) 接同一个实例），
+        # 状态栏每轮把它渲染到上下文末尾——外部记忆，不靠模型回忆。
+        self.todos = todos if todos is not None else TodoStore()
         self.history: list[dict] = []
         # token 用量统计：只做记录，不进消息历史（保持前缀字节稳定）
         self.last_usage: dict | None = None
@@ -68,6 +73,7 @@ class Agent:
         self.last_usage = None
         self.total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.tool_counts.clear()
+        self.todos.rewrite([])  # 清单随会话一起重置
 
     def _record_usage(self, response) -> None:
         """从响应中提取 usage（可能缺失），累计到 total_usage。"""
@@ -100,6 +106,7 @@ class Agent:
                             max_steps=self.max_steps,
                             tool_calls=dict(self.tool_counts),
                             usage=dict(self.total_usage),
+                            todos=self.todos.as_dicts(),
                         )
                     ),
                 }
