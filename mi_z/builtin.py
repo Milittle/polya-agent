@@ -19,6 +19,21 @@ from .tools import Tool, tool
 from .web import web_fetch_impl
 
 MAX_OUTPUT = 8000
+MAX_FILE_BYTES = 2_000_000
+
+# 递归遍历时固定跳过的目录：版本库/虚拟环境/缓存要么巨大要么全是噪音，
+# 扫它们既慢又把第三方库的结果混进上下文（rg/fd 尊重 .gitignore 的纯 Python 等价物）。
+IGNORED_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+}
 
 CODING_SYSTEM_PROMPT = """\
 你是一个在受限工作目录内操作的本地编码代理，通过工具读写文件、搜索代码、执行命令，
@@ -72,6 +87,25 @@ def _resolve(root: Path, path: str) -> Path:
     return target
 
 
+def _walk_files(root: Path, name_filter: str | None = None):
+    """确定性遍历 root 下的文件，跳过 IGNORED_DIRS；name_filter 按 fnmatch 过滤文件名。"""
+    if root.is_file():
+        yield root
+        return
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        entries = sorted(current.iterdir(), key=lambda p: p.name, reverse=True)
+        for entry in entries:
+            if entry.is_dir():
+                if entry.name not in IGNORED_DIRS:
+                    stack.append(entry)
+            elif entry.is_file() and (
+                name_filter is None or fnmatch.fnmatch(entry.name, name_filter)
+            ):
+                yield entry
+
+
 def default_tools(root: str | os.PathLike[str] = ".") -> list[Tool]:
     """构造一组受限在 ``root`` 目录内的编码工具。"""
     base = Path(root).resolve()
@@ -79,16 +113,26 @@ def default_tools(root: str | os.PathLike[str] = ".") -> list[Tool]:
 
     @tool
     def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
-        """读取工作目录内的文本文件，返回内容（不含行号）。编辑任何文件前的必读工具。
-        大文件先用 start_line / end_line 读片段定位（从 1 开始、含两端，如读第 10-50 行
-        传 start_line=10, end_line=50），不要整读。"""
+        """读取工作目录内的文本文件，输出带行号（引用行号、构造 edit_file 的 old_string
+        都以它为准）。编辑任何文件前的必读工具。大文件先用 start_line / end_line 读片段
+        （从 1 开始、含两端，如读第 10-50 行传 start_line=10, end_line=50），不要整读；
+        拿不准行号先 grep 定位。"""
         target = _resolve(base, path)
         if not target.is_file():
             raise FileNotFoundError(f"文件不存在: {path}")
-        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-        if start_line is not None or end_line is not None:
-            lines = lines[(start_line or 1) - 1 : end_line]
-        return _truncate("\n".join(lines))
+        size = target.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise ValueError(f"文件过大（{size} 字节）：请用 grep 定位后按行号读取片段")
+        raw = target.read_bytes()
+        if b"\x00" in raw[:8192]:
+            raise ValueError("二进制文件，无法作为文本读取")
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        start = (start_line or 1) - 1
+        end = end_line if end_line is not None else len(lines)
+        numbered = [
+            f"{number:>6}\t{line}" for number, line in enumerate(lines[start:end], start + 1)
+        ]
+        return _truncate("\n".join(numbered)) or "(空文件)"
 
     @tool(name="list_dir")
     def list_dir(path: str = ".") -> str:
@@ -102,37 +146,70 @@ def default_tools(root: str | os.PathLike[str] = ".") -> list[Tool]:
         return _truncate(listing or "(空目录)")
 
     @tool(name="grep")
-    def grep(pattern: str, path: str = ".", glob: str | None = None) -> str:
-        """在工作目录内按正则搜索文件内容，返回 `文件:行号: 内容`，最多 200 条命中。
-        定位代码的主工具：先宽 pattern 找到文件，再 read_file 读上下文。pattern 必须是
-        合法正则，字面量中的特殊字符（如 . * ( ）要转义；glob 限定文件名，如 '*.py'。"""
+    def grep(
+        pattern: str,
+        path: str = ".",
+        glob: str | None = None,
+        ignore_case: bool = False,
+        context_lines: int = 0,
+    ) -> str:
+        """在工作目录内按正则搜索文件内容（自动跳过 .git/.venv 等目录），最多 200 行输出。
+        命中行格式 `文件:行号: 内容`；context_lines>0 时附带前后上下文行（格式 `文件-行号-`）。
+        ignore_case 忽略大小写。定位代码的主工具：先宽 pattern 找到位置，需要更大范围时
+        传 context_lines 而不是再调 read_file。pattern 是正则，字面量特殊字符（. * ( ）要转义；
+        glob 限定文件名，如 '*.py'。"""
         target = _resolve(base, path)
-        regex = re.compile(pattern)
-        files = [target] if target.is_file() else sorted(target.rglob("*"))
+        regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+        files = [target] if target.is_file() else _walk_files(target, glob)
         hits: list[str] = []
+
+        def _full() -> str:
+            return _truncate("\n".join(hits)) if hits else "(无匹配)"
+
         for file in files:
-            if not file.is_file() or (glob and not fnmatch.fnmatch(file.name, glob)):
+            if file != target and glob and not fnmatch.fnmatch(file.name, glob):
                 continue
             try:
-                text = file.read_text(encoding="utf-8")
+                lines = file.read_text(encoding="utf-8").splitlines()
             except (UnicodeDecodeError, OSError):
                 continue
-            for number, line in enumerate(text.splitlines(), 1):
-                if regex.search(line):
-                    hits.append(f"{file.relative_to(base)}:{number}: {line.strip()}")
-                    if len(hits) >= 200:
-                        return _truncate("\n".join(hits) + "\n... [命中过多，已截断]")
-        return "\n".join(hits) or "(无匹配)"
+            matched = {i for i, line in enumerate(lines, 1) if regex.search(line)}
+            if not matched:
+                continue
+            relative = file.relative_to(base)
+            if context_lines <= 0:
+                for i in sorted(matched):
+                    hits.append(f"{relative}:{i}: {lines[i - 1].strip()}")
+            else:
+                show: set[int] = set()
+                for i in matched:
+                    show.update(
+                        range(max(1, i - context_lines), min(len(lines), i + context_lines) + 1)
+                    )
+                previous: int | None = None
+                for i in sorted(show):
+                    if previous is not None and i > previous + 1:
+                        hits.append("  ---")
+                    mark = ":" if i in matched else "-"
+                    hits.append(f"{relative}{mark}{i}{mark} {lines[i - 1].rstrip()}")
+                    previous = i
+            if len(hits) >= 200:
+                return _truncate("\n".join(hits[:200]) + "\n... [命中过多，已截断]")
+        return _full()
 
     @tool(name="glob")
     def glob(pattern: str, path: str = ".") -> str:
-        """按文件名模式递归找文件（不读内容），返回相对路径列表，最多 200 条。
-        模式语法如 '**/*.py'（递归所有 Python 文件）、'test_*.txt'。按名字找文件
-        用本工具；按内容找用 grep。"""
+        """按文件名模式递归找文件（不读内容，自动跳过 .git/.venv 等目录），返回相对路径，
+        最多 200 条。模式对相对路径匹配，* 也跨目录层级，'**/' 前缀可省略——如 '*.py'
+        等价于 '**/*.py'。按名字找文件用本工具；按内容找用 grep。"""
         target = _resolve(base, path)
-        matches = sorted(
-            p.relative_to(base).as_posix() for p in target.glob(pattern) if p.is_file()
-        )
+        patterns = [pattern.removeprefix("**/")]
+        matches = []
+        for file in _walk_files(target):
+            relative = file.relative_to(base).as_posix()
+            if any(fnmatch.fnmatch(relative, item) for item in patterns):
+                matches.append(relative)
+        matches.sort()
         if not matches:
             return "(无匹配)"
         listing = "\n".join(matches)

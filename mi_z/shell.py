@@ -106,5 +106,9 @@ class ShellSession:
         """终止会话进程（不影响下次 run 自动重启）。"""
         if self._proc is not None:
             self._proc.kill()
+            try:
+                self._proc.wait(timeout=2)  # 收尸，避免僵尸进程堆积
+            except subprocess.TimeoutExpired:  # pragma: no cover - kill 后几乎不会发生
+                pass
             self._proc = None
             self._reader = None

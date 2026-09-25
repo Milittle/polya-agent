@@ -9,15 +9,40 @@
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
 from http import HTTPStatus
+from urllib.parse import urlparse
 
 MAX_BYTES = 1_000_000
 MAX_OUTPUT = 8000
 
 _USER_AGENT = "mi-z-agent/0.1 (web_fetch tool)"
+
+
+def _assert_public_url(url: str) -> None:
+    """SSRF 防护：拒绝 localhost、内网、无域名主机——模型不应能借本工具探测内网。"""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"只支持 http/https URL: {url}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError(f"URL 缺少主机名: {url}")
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        raise ValueError(f"拒绝访问本地地址: {host}")
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:  # 域名：解析后逐一校验，防止域名指向内网
+            addresses = [ipaddress.ip_address(i[4][0]) for i in socket.getaddrinfo(host, None)]
+        except socket.gaierror as exc:
+            raise RuntimeError(f"域名解析失败: {host}") from exc
+    for addr in addresses:
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            raise ValueError(f"拒绝访问内网/保留地址: {addr}")
 
 
 class _TextExtractor(HTMLParser):
@@ -65,9 +90,15 @@ def _truncate(text: str) -> str:
 
 def web_fetch_impl(url: str, timeout: int = 15) -> str:
     """抓取 url 并返回包裹在 <external_content> 里的正文文本。"""
-    if not url.startswith(("http://", "https://")):
-        raise ValueError(f"只支持 http/https URL: {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    _assert_public_url(url)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _USER_AGENT,
+            # urllib 不自动解压：显式要未压缩响应，否则 gzip 字节会被当文本解析
+            "Accept-Encoding": "identity",
+        },
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 URL 来自模型
             if response.status != HTTPStatus.OK:

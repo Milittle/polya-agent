@@ -18,12 +18,21 @@ def test_write_then_read_roundtrip(tools, tmp_path):
         tools.call("write_file", {"path": "a/b.txt", "content": "hello"})
         == "已写入 a/b.txt（5 字符）"
     )
-    assert tools.call("read_file", {"path": "a/b.txt"}) == "hello"
+    assert tools.call("read_file", {"path": "a/b.txt"}) == "     1\thello"  # 输出带行号
 
 
 def test_read_file_line_range(tools):
     tools.call("write_file", {"path": "f.txt", "content": "1\n2\n3\n4"})
-    assert tools.call("read_file", {"path": "f.txt", "start_line": 2, "end_line": 3}) == "2\n3"
+    result = tools.call("read_file", {"path": "f.txt", "start_line": 2, "end_line": 3})
+    assert result == "     2\t2\n     3\t3"
+
+
+def test_read_file_rejects_binary_and_oversized(tools):
+    tools.call("bash", {"command": "printf '\\x00\\x01bin' > bin.dat"})
+    assert "二进制" in tools.call("read_file", {"path": "bin.dat"})
+
+    tools.call("bash", {"command": "head -c 3000000 /dev/zero | tr '\\0' 'x' > big.txt"})
+    assert "文件过大" in tools.call("read_file", {"path": "big.txt"})
 
 
 def test_read_missing_file_returns_error_to_model(tools):
@@ -61,6 +70,39 @@ def test_grep_filters_by_glob_and_reports_line(tools):
     assert "b.txt" not in result
 
 
+def test_grep_skips_ignored_dirs(tools):
+    """grep 不应扫描 .venv/.git 等目录——那会把第三方库的结果混进上下文。"""
+    tools.call("write_file", {"path": "src/app.py", "content": "needle\n"})
+    tools.call("write_file", {"path": ".venv/lib/site.py", "content": "needle\n"})
+    tools.call("write_file", {"path": ".git/config", "content": "needle\n"})
+
+    result = tools.call("grep", {"pattern": "needle"})
+
+    assert "src/app.py:1: needle" in result
+    assert ".venv" not in result and ".git" not in result
+
+
+def test_grep_context_lines_and_ignore_case(tools):
+    tools.call("write_file", {"path": "f.py", "content": "a\nb\nTARGET\nc\nd\n"})
+
+    result = tools.call("grep", {"pattern": "target", "ignore_case": True, "context_lines": 1})
+
+    assert "f.py:3: TARGET" in result  # 命中行用 :
+    assert "f.py-2- b" in result  # 上下文行用 -
+    assert "f.py-4- c" in result
+    assert "a" not in result.replace("a\n", "")  # 超出上下文的不出现
+
+
+def test_glob_skips_ignored_dirs_and_prefix_optional(tools):
+    tools.call("write_file", {"path": "src/app.py", "content": ""})
+    tools.call("write_file", {"path": ".venv/lib/site.py", "content": ""})
+
+    result = tools.call("glob", {"pattern": "*.py"})  # 无 **/ 前缀也应递归匹配
+
+    assert "src/app.py" in result
+    assert ".venv" not in result
+
+
 def test_edit_file_requires_unique_match(tools):
     tools.call("write_file", {"path": "f.txt", "content": "a b a"})
 
@@ -71,7 +113,7 @@ def test_edit_file_requires_unique_match(tools):
     assert tools.call(
         "edit_file", {"path": "f.txt", "old_string": "a", "new_string": "c", "replace_all": True}
     )
-    assert tools.call("read_file", {"path": "f.txt"}) == "c b c"
+    assert tools.call("read_file", {"path": "f.txt"}) == "     1\tc b c"
 
 
 def test_bash_runs_and_reports_exit_code(tools):
@@ -105,7 +147,7 @@ def test_multi_edit_applies_all_edits_atomically(tools):
     )
 
     assert "2 处" in result
-    assert tools.call("read_file", {"path": "f.txt"}) == "1 two 3"
+    assert tools.call("read_file", {"path": "f.txt"}) == "     1\t1 two 3"
 
 
 def test_multi_edit_failure_leaves_file_untouched(tools):
@@ -124,7 +166,7 @@ def test_multi_edit_failure_leaves_file_untouched(tools):
     )
 
     assert "Error" in result and "第 2 处" in result
-    assert tools.call("read_file", {"path": "f.txt"}) == "one two three"
+    assert tools.call("read_file", {"path": "f.txt"}) == "     1\tone two three"  # 原子性：未落盘
 
 
 def test_web_fetch_wraps_content_with_source_marker(tools, monkeypatch):
@@ -152,6 +194,7 @@ def test_web_fetch_wraps_content_with_source_marker(tools, monkeypatch):
             return False
 
     monkeypatch.setattr("mi_z.web.urllib.request.urlopen", lambda req, timeout: FakeResponse())
+    monkeypatch.setattr("mi_z.web._assert_public_url", lambda url: None)  # 测试不做 DNS 解析
     result = tools.call("web_fetch", {"url": "https://example.com/docs"})
 
     assert '<external_content source="webpage" url="https://example.com/docs">' in result
@@ -162,6 +205,20 @@ def test_web_fetch_wraps_content_with_source_marker(tools, monkeypatch):
 def test_web_fetch_rejects_non_http_scheme(tools):
     result = tools.call("web_fetch", {"url": "file:///etc/passwd"})
     assert "Error" in result
+
+
+def test_web_fetch_blocks_ssrf_targets(tools):
+    """localhost / 内网 IP / .local 域一律拒绝——模型不能借本工具探测内网。"""
+    for url in (
+        "http://localhost:8500/admin",
+        "http://127.0.0.1:8080/",
+        "http://192.168.1.1/",
+        "http://10.0.0.5:3000/",
+        "http://printer.local/",
+    ):
+        result = tools.call("web_fetch", {"url": url})
+        assert "Error" in result, url
+        assert "拒绝" in result, url
 
 
 def test_dangerous_flags():

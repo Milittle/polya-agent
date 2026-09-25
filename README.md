@@ -94,20 +94,23 @@ agent = Agent(
 
 | 工具 | 副作用 | 说明 |
 |---|---|---|
-| `read_file` | — | 读文件，可用 `start_line` / `end_line` 读片段 |
+| `read_file` | — | 读文件，**输出带行号**；支持行号片段；拒绝二进制和超大文件 |
 | `list_dir` | — | 列目录（单层），子目录以 `/` 结尾 |
-| `glob` | — | 按文件名模式递归找文件，如 `**/*.py` |
-| `grep` | — | 正则搜索内容，`glob` 限定文件名 |
+| `glob` | — | 按文件名模式递归找文件（自动跳过 `.venv`/`.git` 等） |
+| `grep` | — | 正则搜索内容，支持**上下文行**、忽略大小写、`glob` 限定文件名 |
 | `write_file` | ⚠️ | 写/覆盖文件，自动创建父目录 |
 | `edit_file` | ⚠️ | 定点替换，默认要求匹配唯一 |
 | `multi_edit` | ⚠️ | 一次多处替换，**原子生效**（任一处失败全不落盘） |
 | `bash` | ⚠️ | **持久会话**执行命令：cwd/环境变量跨调用保持 |
 | `bash_output` | — | 非阻塞读取会话新输出（后台/慢速命令） |
 | `kill_bash` | ⚠️ | 终止持久会话 |
-| `web_fetch` | — | 抓取 URL，HTML 转文本，`<external_content>` 包裹防注入 |
+| `web_fetch` | — | 抓取 URL，HTML 转文本，`<external_content>` 包裹防注入；**拒绝内网/localhost（SSRF 防护）** |
 
 工具结果会进上下文，因此输出统一截断到 8000 字符。`bash` 会话超时会终止并重启
 （环境状态丢失）；命令必须非交互。`web_fetch` 用标准库实现，零第三方依赖。
+
+**跨平台**：除 `bash` 会话（需要 bash，Windows 需 WSL/Git Bash）外，全部工具为
+纯 Python 实现，Windows 原生可跑——不依赖 grep/rg/find 等系统命令。
 
 ## 项目结构
 
