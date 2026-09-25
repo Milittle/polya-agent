@@ -32,6 +32,7 @@ class StatusSnapshot:
     tool_calls: dict[str, int] = field(default_factory=dict)  # 工具名 -> 会话累计调用次数
     usage: dict = field(default_factory=dict)  # 累计 token 用量
     todos: list[dict] = field(default_factory=list)  # TODO 清单（任务规划组件）
+    plan_mode: bool = False  # 规划模式（只读；环境状态组件）
     now: datetime = field(default_factory=datetime.now)
 
 
@@ -46,6 +47,9 @@ def render_status(snapshot: StatusSnapshot) -> str:
     else:
         calls = "  - （尚未调用工具）"
     usage = snapshot.usage
+    mode_line = (
+        "- 模式: 规划中（只读；完成计划后调用 exit_plan_mode 提交）\n" if snapshot.plan_mode else ""
+    )
     todo_lines = ""
     if snapshot.todos:
         items = "\n".join(
@@ -58,6 +62,7 @@ def render_status(snapshot: StatusSnapshot) -> str:
         f"当前状态（第 {snapshot.iteration}/{snapshot.max_steps} 轮迭代；"
         "历史中若有多条状态，以最后一条为准）：\n"
         f"- 时间: {snapshot.now:%Y-%m-%d %H:%M:%S}\n"
+        f"{mode_line}"
         f"- 工具调用累计:\n{calls}\n"
         f"{todo_lines}"
         f"- token 用量: prompt {usage.get('prompt_tokens', 0)},"

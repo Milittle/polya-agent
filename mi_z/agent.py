@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from .status import StatusSnapshot, render_status
 from .todos import TodoStore
-from .tools import Tool, ToolRegistry
+from .tools import Tool, ToolRegistry, tool
 
 logger = logging.getLogger("mi_z.agent")
 
@@ -50,6 +50,8 @@ class Agent:
         approve: Callable[[Tool, dict], bool] | None = None,
         status_bar: bool | Callable[[StatusSnapshot], str] | None = None,
         todos: TodoStore | None = None,
+        plan_mode: bool = False,
+        approve_plan: Callable[[str], bool] | None = None,
     ):
         self.llm = llm
         self.tools = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
@@ -59,6 +61,14 @@ class Agent:
         # 状态栏渲染器：True 用默认渲染，callable 自定义，None/False 关闭。
         # 状态以 user 消息追加在上下文末尾（书 2.6），绝不修改已有消息。
         self.status_bar = render_status if status_bar is True else status_bar or None
+        # 两阶段模式：规划模式下危险工具在分发层被拒（工具数组不变——中途增删
+        # tools 会破坏 KV Cache 前缀，书 2.3 的纪律），exit_plan_mode 提交计划、
+        # approve_plan 决定是否放行进入执行模式。approve_plan 缺省自动批准：
+        # 开发者启用规划模式即接受该流程，写操作仍受 approve 钩子约束。
+        self.plan_mode = plan_mode
+        self.approve_plan = approve_plan
+        if plan_mode:
+            self._register_exit_plan_mode()
         # TODO 存储：todo_write 工具写入（default_tools(todos=...) 接同一个实例），
         # 状态栏每轮把它渲染到上下文末尾——外部记忆，不靠模型回忆。
         self.todos = todos if todos is not None else TodoStore()
@@ -85,6 +95,27 @@ class Agent:
         for field in fields:
             self.total_usage[field] += self.last_usage[field]
 
+    def _register_exit_plan_mode(self) -> None:
+        """注册 exit_plan_mode。只在构造时调用一次——注册表在首次 run() 后冻结。"""
+
+        @tool(name="exit_plan_mode")
+        def exit_plan_mode(plan: str) -> str:
+            """提交执行计划，请求批准退出规划模式。plan 写完整计划：目标、步骤、
+            涉及文件、风险与验证方式。规划模式下写操作会被拒绝，只有批准后才能
+            执行；被拒绝时根据反馈修改计划重新提交。"""
+            return self._handle_exit_plan_mode(plan)
+
+        self.tools.add(exit_plan_mode)
+
+    def _handle_exit_plan_mode(self, plan: str) -> str:
+        if not self.plan_mode:
+            return "已处于执行模式，无需再调用 exit_plan_mode。"
+        approved = self.approve_plan(plan) if self.approve_plan is not None else True
+        if approved:
+            self.plan_mode = False
+            return "计划已批准，进入执行模式：现在可以执行写操作（仍受审批钩子约束）。"
+        return "计划被拒绝：请根据用户反馈修改计划，重新调用 exit_plan_mode 提交。"
+
     def run(self, user_input: str) -> str:
         """处理一条用户输入，返回最终答案；对话历史会被保留以便多轮对话。"""
         # 工具定义位于上下文前部，首次请求后必须保持字节级不变（KV Cache 前缀
@@ -107,6 +138,7 @@ class Agent:
                             tool_calls=dict(self.tool_counts),
                             usage=dict(self.total_usage),
                             todos=self.todos.as_dicts(),
+                            plan_mode=self.plan_mode,
                         )
                     ),
                 }
@@ -145,7 +177,14 @@ class Agent:
                 logger.info("调用工具 %s(%s)", name, arguments)
 
                 item = self.tools.get(name)
-                if (
+                if item is not None and self.plan_mode and item.dangerous:
+                    # 规划模式：写操作在分发层拒绝，指引模型先提交计划。
+                    # 不增删 tools 数组（缓存纪律），模式只是运行时状态。
+                    result = (
+                        f"Error: 规划模式下只能使用只读工具（{name} 被拒绝）。"
+                        "完成计划后调用 exit_plan_mode 提交，批准后进入执行模式。"
+                    )
+                elif (
                     item is not None
                     and self.approve is not None
                     and not self.approve(item, arguments)

@@ -83,9 +83,13 @@ agent = Agent(
   前缀始终稳定。也可传入自定义渲染函数 `status_bar=lambda snapshot: ...`。
 - `agent.total_usage` / `agent.last_usage` 累计/记录每次请求的 token 用量（响应里没有
   usage 字段时保持为 0 / `None`，不会报错）；只做统计，不进消息历史，不影响缓存前缀。
+- **两阶段模式**：`Agent(plan_mode=True, approve_plan=回调)` 启动时进入规划模式——
+  危险工具在分发层被拒（带指引），模型探查后调用 `exit_plan_mode(plan=...)` 提交计划，
+  `approve_plan(plan) -> bool` 决定放行（缺省自动批准）；状态栏会显示当前模式。
+  工具数组全程不变（中途增删 tools 会破坏 KV Cache 前缀），模式切换只是运行时状态。
 - 不传 `system_prompt` 时使用内置的通用提示词；`default_tools` 建议搭配
-  `mi_z.builtin.CODING_SYSTEM_PROMPT`（围绕六个内置工具的工作流：探查 → 小步修改 →
-  验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是改写提示词。
+  `mi_z.builtin.CODING_SYSTEM_PROMPT`（围绕内置工具的工作流：任务拆解 → 探查 →
+  小步修改 → 验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是改写提示词。
 
 ## 内置工具
 
