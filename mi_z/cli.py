@@ -157,6 +157,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-url", help="API 地址（默认取 OPENAI_BASE_URL 环境变量）")
     parser.add_argument("--api-key", help="API key（默认取 OPENAI_API_KEY 环境变量）")
     parser.add_argument("--no-status", action="store_true", help="关闭 Agent 状态栏（调试用）")
+    parser.add_argument("--no-compress", action="store_true", help="关闭上下文压缩（默认开启）")
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=128_000,
+        help="上下文窗口大小（token），用量超过 80%% 触发压缩（默认 128000）",
+    )
+    parser.add_argument(
+        "--keep-recent",
+        type=int,
+        default=30,
+        help="压缩保留区：最近 N 条消息内的工具结果不压缩、状态栏不删除（默认 30）",
+    )
     return parser.parse_args(argv)
 
 
@@ -177,6 +190,9 @@ def build_agent(args: argparse.Namespace, llm=None) -> Agent:
         plan_mode=args.plan,
         plan_capable=True,  # exit_plan_mode 构造时注册，/plan 随时切换而不动工具数组
         max_steps=args.max_steps,
+        compress=not args.no_compress,
+        context_window=args.context_window,
+        keep_recent=args.keep_recent,
     )
 
 

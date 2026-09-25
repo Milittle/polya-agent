@@ -1,0 +1,217 @@
+"""上下文压缩的测试：可压目标识别、合并压缩与回填、降级、Agent 触发与熔断。"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from mi_z import Agent, tool
+from mi_z.compact import (
+    COMPRESS_MARKER,
+    compact_messages,
+    compressible_indices,
+    stale_status_indices,
+)
+
+
+def make_message(content=None, tool_calls=None):
+    return SimpleNamespace(content=content, tool_calls=tool_calls)
+
+
+def make_tool_call(call_id, name, arguments):
+    return SimpleNamespace(id=call_id, function=SimpleNamespace(name=name, arguments=arguments))
+
+
+@tool
+def echo(text: str) -> str:
+    """原样返回（测试用只读工具）。"""
+    return f"echo: {text}"
+
+
+def usage(prompt=0, completion=1):
+    return SimpleNamespace(
+        prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion
+    )
+
+
+class ScriptedLLM:
+    """replies 按序返回（压缩调用与主调用共用），并记录每次请求。"""
+
+    def __init__(self, replies, usages=None):
+        self._replies = list(replies)
+        self._usages = list(usages) if usages is not None else [None] * len(replies)
+        self.calls: list[dict] = []
+
+    def chat(self, messages, tools=None):
+        self.calls.append({"messages": list(messages), "tools": tools})
+        message = self._replies.pop(0)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)], usage=self._usages.pop(0)
+        )
+
+
+def sample_history():
+    """含两条 tool 结果与两条状态栏的 8 条历史（keep=3 时下标 0-4 在保留区外）。"""
+    return [
+        {"role": "user", "content": "任务"},  # 0
+        {"role": "user", "content": "<agent_status>\n第1轮\n</agent_status>"},  # 1
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "a"}]},  # 2
+        {"role": "tool", "tool_call_id": "a", "content": "x" * 5000},  # 3
+        {"role": "user", "content": "<agent_status>\n第2轮\n</agent_status>"},  # 4
+        {"role": "assistant", "content": "中间结论"},  # 5
+        {"role": "user", "content": "<agent_status>\n第3轮\n</agent_status>"},  # 6
+        {"role": "tool", "tool_call_id": "b", "content": "近期输出"},  # 7
+    ]
+
+
+# ---------- 目标识别 ----------
+
+
+def test_compressible_indices_respects_marker_and_keep():
+    history = sample_history()
+    assert compressible_indices(history, keep=3) == [3]  # 下标 7 在保留区（7 >= 8-3）
+
+    history[3]["content"] = COMPRESS_MARKER + " 已压过"
+    assert compressible_indices(history, keep=3) == []  # 防重复：已压的跳过
+
+
+def test_stale_status_indices_only_old_status():
+    history = sample_history()
+    assert stale_status_indices(history, keep=3) == [1, 4]  # 6 在保留区外？8-3=5，6≥5 保留
+    assert stale_status_indices(history, keep=1) == [1, 4, 6]
+
+
+# ---------- compact_messages ----------
+
+
+def test_compact_replaces_and_preserves_structure():
+    llm = ScriptedLLM([make_message(content="#3: 第一条工具结果的摘要")])
+    new = compact_messages(llm, sample_history(), keep=3, query="测试任务")
+
+    compress_call = llm.calls[0]
+    assert compress_call["tools"] is None  # 压缩调用不带工具
+    assert "测试任务" in compress_call["messages"][1]["content"]  # query 注入（任务感知）
+    assert "中段截断" in compress_call["messages"][1]["content"]  # 超长内容截断
+
+    tool_a = next(m for m in new if m.get("tool_call_id") == "a")
+    assert tool_a["content"].startswith(COMPRESS_MARKER)
+    assert "原 5000 字符" in tool_a["content"]
+    assert tool_a["content"].endswith("第一条工具结果的摘要")
+
+    # 结构与保留：条数只少在删掉的状态栏；tool_call_id 配对与近期 tool 原样
+    assert len(new) == 6  # 8 条 - 2 条旧状态栏
+    assert next(m for m in new if m.get("tool_call_id") == "b")["content"] == "近期输出"
+    assert {"role": "user", "content": "任务"} in new
+    assert {"role": "assistant", "content": "中间结论"} in new
+
+
+def test_compact_parse_failure_merges_into_earliest():
+    llm = ScriptedLLM([make_message(content="综合摘要：一切尽在不言中")])  # 无编号格式
+    history = sample_history()
+    new = compact_messages(llm, history, keep=0, query="q")  # 两条 tool 都出保留区
+
+    tools = [m for m in new if m.get("role") == "tool"]
+    assert "综合摘要" in tools[0]["content"]  # 并入最早一条
+    assert tools[1]["content"] == f"{COMPRESS_MARKER} (内容已并入前述摘要)"
+    assert history[3]["content"] == "x" * 5000  # 原列表不被修改
+
+
+def test_compact_partial_parse_keeps_missing_original():
+    llm = ScriptedLLM([make_message(content="#7: 只压了第二条")])  # 缺 #3
+    new = compact_messages(llm, sample_history(), keep=0, query="q")
+    tools = [m for m in new if m.get("role") == "tool"]
+    assert tools[0]["content"] == "x" * 5000  # 缺编号的保留原内容，下次再压
+    assert "只压了第二条" in tools[1]["content"]
+
+
+def test_compact_without_targets_skips_llm():
+    llm = ScriptedLLM([])
+    assert compact_messages(llm, sample_history(), keep=8, query="q") is None
+    assert llm.calls == []
+
+
+# ---------- Agent 集成：触发 / 保留区 / 熔断 ----------
+
+
+def test_agent_triggers_compression_on_threshold():
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "echo", '{"text": "一"}')]),
+            make_message(tool_calls=[make_tool_call("c2", "echo", '{"text": "二"}')]),
+            make_message(content="#3: 已压缩的回显"),
+            make_message(content="完成"),
+        ],
+        usages=[usage(prompt=200), usage(prompt=200), usage(prompt=50), usage(prompt=50)],
+    )
+    agent = Agent(
+        llm=llm,
+        tools=[echo],
+        status_bar=True,
+        compress=True,
+        context_window=100,
+        keep_recent=2,
+        max_steps=4,
+    )
+    assert agent.run("干活") == "完成"
+
+    # 两次触发检查后，第 3 次迭代开头完成压缩：调用序列 主/主/压缩/主
+    assert llm.calls[2]["tools"] is None
+
+    after = llm.calls[3]["messages"]  # 压缩后的下一次主请求
+    compressed = [
+        m for m in after if m.get("role") == "tool" and "已压缩" in (m.get("content") or "")
+    ]
+    assert compressed and compressed[0]["content"].startswith(COMPRESS_MARKER)
+    assert not any("<agent_status>" in (m.get("content") or "") for m in after[:-1])  # 旧状态栏已清
+
+    # 保留区内的近期 tool 结果原样保留（状态栏开启时带调用计数前缀）
+    kept = [m for m in agent.history if m.get("role") == "tool"]
+    assert kept[-1]["content"].endswith("echo: 二")
+
+
+def test_agent_below_threshold_or_missing_usage_never_compresses():
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "echo", '{"text": "一"}')]),
+            make_message(content="完成"),
+        ],
+        usages=[usage(prompt=50), usage(prompt=50)],  # 50 < 100*0.8
+    )
+    agent = Agent(llm=llm, tools=[echo], compress=True, context_window=100)
+    agent.run("干活")
+    assert all(call["tools"] is not None for call in llm.calls)
+
+    no_usage = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "echo", '{"text": "一"}')]),
+            make_message(content="完成"),
+        ]
+    )  # usage 全 None
+    agent2 = Agent(llm=no_usage, tools=[echo], compress=True, context_window=100)
+    agent2.run("干活")
+    assert all(call["tools"] is not None for call in no_usage.calls)
+
+
+def test_agent_circuit_breaker_after_three_failures():
+    class FailingCompactLLM(ScriptedLLM):
+        def chat(self, messages, tools=None):
+            if tools is None:  # 压缩调用直接失败
+                self.calls.append({"messages": list(messages), "tools": tools, "failed": True})
+                raise RuntimeError("压缩服务不可用")
+            return super().chat(messages, tools)
+
+    llm = FailingCompactLLM(
+        [
+            make_message(tool_calls=[make_tool_call(f"c{i}", "echo", '{"text": "x"}')])
+            for i in range(4)
+        ]
+        + [make_message(content="完成")],
+        usages=[usage(prompt=200)] * 5,
+    )
+    agent = Agent(
+        llm=llm, tools=[echo], compress=True, context_window=100, keep_recent=1, max_steps=5
+    )
+    assert agent.run("干活") == "完成"  # 压缩失败不拖垮主任务
+
+    failed = [c for c in llm.calls if c.get("failed")]
+    assert len(failed) == 3  # 连续 3 次后熔断，第 4/5 轮不再尝试
+    assert agent._compress_failures == 3

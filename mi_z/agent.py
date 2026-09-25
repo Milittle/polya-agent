@@ -7,6 +7,7 @@ import logging
 from collections import Counter
 from collections.abc import Callable
 
+from .compact import compact_messages
 from .status import StatusSnapshot, render_status
 from .todos import TodoStore
 from .tools import Tool, ToolRegistry, tool
@@ -53,6 +54,10 @@ class Agent:
         plan_mode: bool = False,
         plan_capable: bool = False,
         approve_plan: Callable[[str], bool] | None = None,
+        compress: bool = False,
+        context_window: int = 128_000,
+        compress_threshold: float = 0.8,
+        keep_recent: int = 30,
     ):
         self.llm = llm
         self.tools = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
@@ -80,6 +85,15 @@ class Agent:
         self.last_usage: dict | None = None
         self.total_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.tool_counts: Counter[str] = Counter()
+        # 上下文压缩（书 2.7）：80% 阈值触发、批量压 tool 结果、原地替换。
+        # 触发判据是**最近一次调用**的 prompt_tokens——绝不能用 total_usage：
+        # 累计 counter 每轮重复计入共享前缀，随轮数二次增长，会过早触发。
+        # 连续 3 次压缩失败熔断（对齐 Claude Code 生产值，书 5 章）。
+        self.compress = compress
+        self.context_window = context_window
+        self.compress_threshold = compress_threshold
+        self.keep_recent = keep_recent
+        self._compress_failures = 0
 
     def reset(self) -> None:
         self.history.clear()
@@ -119,6 +133,36 @@ class Agent:
             return "计划已批准，进入执行模式：现在可以执行写操作（仍受审批钩子约束）。"
         return "计划被拒绝：请根据用户反馈修改计划，重新调用 exit_plan_mode 提交。"
 
+    def _should_compress(self) -> bool:
+        if not self.compress or self._compress_failures >= 3:
+            return False
+        used = (self.last_usage or {}).get("prompt_tokens", 0)
+        return used > self.context_window * self.compress_threshold
+
+    def _try_compress(self, query: str) -> list[dict] | None:
+        """压缩历史（发生在两次 API 调用之间，书 2.7 的时机定义）。
+
+        压缩失败不能拖垮主任务：计数并继续用原历史，连续 3 次后熔断。
+        """
+        try:
+            compacted = compact_messages(self.llm, self.history, self.keep_recent, query)
+        except Exception:  # noqa: BLE001 - 摘要调用失败不该让任务失败
+            self._compress_failures += 1
+            logger.warning(
+                "上下文压缩失败（连续第 %d 次，达到 3 次后本次 Agent 不再尝试）",
+                self._compress_failures,
+            )
+            return None
+        if compacted is None:
+            return None
+        self._compress_failures = 0
+        logger.info(
+            "上下文已压缩：%d 条消息 → %d 条（旧 tool 结果替换为摘要，旧状态栏已清理）",
+            len(self.history),
+            len(compacted),
+        )
+        return compacted
+
     def run(self, user_input: str) -> str:
         """处理一条用户输入，返回最终答案；对话历史会被保留以便多轮对话。"""
         # 工具定义位于上下文前部，首次请求后必须保持字节级不变（KV Cache 前缀
@@ -129,6 +173,14 @@ class Agent:
         schemas = self.tools.schemas() or None
 
         for step in range(1, self.max_steps + 1):
+            if self._should_compress():
+                compacted = self._try_compress(user_input)
+                if compacted is not None:
+                    self.history[:] = compacted
+                    messages = [
+                        {"role": "system", "content": self.system_prompt},
+                        *self.history,
+                    ]
             if self.status_bar is not None:
                 # 状态栏：以 user 角色追加在末尾（书 2.6）。持久追加模式——
                 # 旧状态留在轨迹里不删改，前缀保持字节稳定。

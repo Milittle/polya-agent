@@ -46,7 +46,9 @@ uv run mi-z -p "修复 pytest 失败的测试" --plan -y   # 单任务模式：�
 
 常用参数：`--root DIR` 工作目录（默认 `.`，文件操作被限制在内）、`--plan` 启动进入
 规划模式、`--yes` 自动批准一切审批、`--max-steps N`（默认 25）、`--model/--base-url/
---api-key` 覆盖环境变量。
+--api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启，用量超窗口 80%
+时批量压缩旧工具结果）、`--context-window N`（默认 128000）、`--keep-recent N`
+（压缩保留区，默认 30）。
 
 REPL 斜杠命令：
 
@@ -116,6 +118,15 @@ agent = Agent(
   危险工具在分发层被拒（带指引），模型探查后调用 `exit_plan_mode(plan=...)` 提交计划，
   `approve_plan(plan) -> bool` 决定放行（缺省自动批准）；状态栏会显示当前模式。
   工具数组全程不变（中途增删 tools 会破坏 KV Cache 前缀），模式切换只是运行时状态。
+- **上下文压缩**：`Agent(compress=True)`（CLI 默认开启，`--no-compress` 关闭）。最近一次
+  请求的 prompt tokens 超过 `context_window × compress_threshold`（默认 128K × 80%）时，
+  在两次 API 调用之间**批量压缩**保留区（最近 `keep_recent=30` 条）之外的旧 tool 结果：
+  一次 LLM 调用（合并式，注入当前任务做任务感知压缩）把它们原地替换为带 `[COMPRESSED]`
+  标记的摘要（防重复处理），消息条数与 tool_call_id 配对不变，对话脉络完整；同区的旧
+  状态栏消息直接删除（噪声不做摘要）。替换点之后的 KV Cache 会失效——这是有意识的
+  权衡，所以阈值高、批量压、低频次。触发判据必须是**最近一次**调用的 prompt_tokens，
+  不能用累计用量（每轮重复计入共享前缀，二次增长会过早触发）。连续 3 次压缩失败自动
+  熔断（压缩失败不影响主任务，保留完整信息继续跑）。
 - 不传 `system_prompt` 时使用内置的通用提示词；`default_tools` 建议搭配
   `mi_z.builtin.CODING_SYSTEM_PROMPT`（围绕内置工具的工作流：任务拆解 → 探查 →
   小步修改 → 验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是改写提示词。
@@ -163,6 +174,7 @@ mi_z/
   web.py      # web_fetch：抓取 + HTML 转文本 + 来源标记
   status.py   # 状态栏快照与默认渲染器
   todos.py    # TODO 清单存储（外部记忆）
+  compact.py  # 上下文压缩：批量压 tool 结果 + 任务感知摘要 + 熔断
 demo.py       # 可运行示例（库用法）
 tests/        # 用假 LLM 验证循环 + 内置工具/会话/抓取的沙箱测试
 ```
