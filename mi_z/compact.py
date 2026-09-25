@@ -88,6 +88,85 @@ def _parse_numbered(text: str, targets: list[int]) -> dict[int, str] | None:
     return result or None
 
 
+def render_conversation(messages: list[dict]) -> str:
+    """把一段对话渲染成喂给压缩调用的文本（状态栏跳过，单条超长截断保头尾）。"""
+    lines = []
+    for message in messages:
+        if _is_status_message(message):
+            continue
+        role = message.get("role", "?")
+        content = message.get("content") or ""
+        if message.get("tool_calls"):
+            calls = ", ".join(
+                f"{c['function']['name']}({c['function']['arguments']})"
+                for c in message["tool_calls"]
+            )
+            content = f"[调用工具: {calls}]" if not content else f"{content}\n[调用工具: {calls}]"
+        if len(content) > MAX_PIECE:
+            half = MAX_PIECE // 2
+            content = f"{content[:half]}\n...[中段截断]...\n{content[-half:]}"
+        lines.append(f"[{role}] {content}")
+    return "\n\n".join(lines)
+
+
+def find_restart_split(history: list[dict], keep: int) -> int | None:
+    """摘要重启的安全切点：history[:i] 压成一条摘要，history[i:] 原样保留。
+
+    切点必须是 user 消息（我们的循环总是回填完所有 tool_call 才进下一轮，
+    中断也有补齐，故「下一条是 user」保证之前是完整轮结束，tool 链不悬空）。
+    从目标位置向后找，保留更多、压得更少（保守侧）。历史太短（保留区盖住
+    几乎全部）时返回 None，不做无意义的折叠。
+    """
+    target = len(history) - keep
+    if target < 1:
+        return None
+    for i in range(target, len(history)):
+        if history[i].get("role") == "user":
+            return i
+    return None
+
+
+def compact_restart(
+    llm: _Chat,
+    history: list[dict],
+    keep: int,
+    query: str,
+) -> list[dict] | None:
+    """摘要重启（书 2.7 对 thinking 绑定模型的推荐方案）。
+
+    thinking/reasoning 与产生它的前缀绑定（签名校验），原地替换旧 tool 内容
+    会让保留区的全部 thinking 失效。正解：把切点之前的整段历史压成**一条**
+    摘要消息，模型从摘要冷启动重新推理，保留区作为干净的前缀基线。
+    """
+    split = find_restart_split(history, keep)
+    if split is None or split == 0:
+        return None
+    request = [
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"当前任务：{query}\n\n以下是一段 Agent 对话历史，"
+                f"请压缩成一份结构化摘要（保留关键决策、约束及其理由、已排除的"
+                f"失败路径、文件路径与结论性输出）。\n\n{render_conversation(history[:split])}"
+            ),
+        },
+    ]
+    response = llm.chat(request, tools=None)
+    summary = (response.choices[0].message.content or "").strip()
+    if not summary:
+        raise RuntimeError("压缩调用返回空摘要")
+    summary_message = {
+        "role": "user",
+        "content": (
+            "<session_summary>\n"
+            f"[此前对话的压缩摘要（原始 {split} 条消息已折叠）]\n{summary}\n"
+            "</session_summary>"
+        ),
+    }
+    return [summary_message, *history[split:]]
+
+
 def compact_messages(
     llm: _Chat,
     history: list[dict],

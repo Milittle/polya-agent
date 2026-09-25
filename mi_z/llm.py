@@ -24,7 +24,7 @@ class LLM:
         model: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = 0.0,
         timeout: float = 120.0,
         max_retries: int = 2,
         **client_kwargs,
@@ -33,6 +33,8 @@ class LLM:
         if not resolved_key:
             raise ValueError("缺少 API key：请设置环境变量 OPENAI_API_KEY，或传入 api_key 参数。")
         self.model = model or os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
+        # temperature=None 表示该模型不接受自定义温度（o 系列只允许默认 1），
+        # 请求时不携带该参数
         self.temperature = temperature
         self.client = OpenAI(
             api_key=resolved_key,
@@ -51,8 +53,9 @@ class LLM:
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
-            "temperature": self.temperature,
         }
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         if tools:
             kwargs["tools"] = tools
         try:

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from collections import Counter
 from collections.abc import Callable
 
-from .compact import compact_messages
+from .compact import compact_messages, compact_restart
+from .providers import ModelProfile
 from .status import StatusSnapshot, render_status
 from .todos import TodoStore
 from .tools import Tool, ToolRegistry, tool
@@ -55,9 +57,11 @@ class Agent:
         plan_capable: bool = False,
         approve_plan: Callable[[str], bool] | None = None,
         compress: bool = False,
-        context_window: int = 128_000,
-        compress_threshold: float = 0.8,
+        context_window: int | None = None,
+        compress_threshold: float | None = None,
         keep_recent: int = 30,
+        profile: ModelProfile | None = None,
+        prefix_check: bool = False,
     ):
         self.llm = llm
         self.tools = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
@@ -85,15 +89,29 @@ class Agent:
         self.last_usage: dict | None = None
         self.total_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.tool_counts: Counter[str] = Counter()
-        # 上下文压缩（书 2.7）：80% 阈值触发、批量压 tool 结果、原地替换。
-        # 触发判据是**最近一次调用**的 prompt_tokens——绝不能用 total_usage：
-        # 累计 counter 每轮重复计入共享前缀，随轮数二次增长，会过早触发。
-        # 连续 3 次压缩失败熔断（对齐 Claude Code 生产值，书 5 章）。
+        # 上下文压缩（书 2.7）：80% 阈值触发、批量压 tool 结果。压缩策略由
+        # 模型能力决定（providers.ModelProfile）：支持原地替换 tool content 的
+        # 用 compact_messages；thinking 签名绑定前缀的用 compact_restart
+        # （整段历史压成一条摘要，从摘要冷启动）。触发判据是**最近一次调用**
+        # 的 prompt_tokens——绝不能用 total_usage：累计 counter 每轮重复计入
+        # 共享前缀，随轮数二次增长，会过早触发。连续 3 次失败熔断（书 5 章）。
+        self.profile = profile or ModelProfile()
         self.compress = compress
-        self.context_window = context_window
-        self.compress_threshold = compress_threshold
+        self.context_window = (
+            context_window if context_window is not None else self.profile.context_window
+        )
+        self.compress_threshold = (
+            compress_threshold
+            if compress_threshold is not None
+            else self.profile.compress_threshold
+        )
         self.keep_recent = keep_recent
         self._compress_failures = 0
+        # 运行时前缀不变量（可选）：两次压缩点之间请求序列必须严格 append-only。
+        # 破坏前缀对纯 KV Cache 只是缓存变贵（2.3）；对回传 thinking 的模型是
+        # 推理连续性断裂（2.7）——所以提供可开启的运行时断言。
+        self.prefix_check = prefix_check
+        self._last_prefix: list[dict] | None = None
 
     def reset(self) -> None:
         self.history.clear()
@@ -101,6 +119,27 @@ class Agent:
         self.total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.tool_counts.clear()
         self.todos.rewrite([])  # 清单随会话一起重置
+        self._last_prefix = None  # 前缀基线随之失效
+
+    def _check_prefix(self, messages: list[dict]) -> None:
+        """前缀不变量的运行时断言：本次请求必须是上一次的严格扩展。
+
+        基线用深拷贝保存（浅引用会与被改写的消息同源，检测不到篡改）；
+        比较用 ==。开销随上下文增长（每轮一次全量内容比较），因此默认关闭，
+        需要抓前缀回归时开启。压缩/重启/reset 后基线清空——压缩点是合法的
+        推理重启点（checkpoint），不变量只在两个压缩点之间成立。
+        """
+        if self._last_prefix is None:
+            self._last_prefix = copy.deepcopy(messages)
+            return
+        shared = len(self._last_prefix)
+        if len(messages) < shared or messages[:shared] != self._last_prefix:
+            raise RuntimeError(
+                "前缀不变量被破坏：本次请求不是上一次的严格扩展。两次压缩点之间"
+                "历史必须 append-only——改写旧消息会破坏 KV Cache 前缀（2.3），"
+                "并使回传的 thinking 全部失效（2.7）。"
+            )
+        self._last_prefix = copy.deepcopy(messages)
 
     def _record_usage(self, response) -> None:
         """从响应中提取 usage（可能缺失），累计到 total_usage。"""
@@ -145,7 +184,10 @@ class Agent:
         压缩失败不能拖垮主任务：计数并继续用原历史，连续 3 次后熔断。
         """
         try:
-            compacted = compact_messages(self.llm, self.history, self.keep_recent, query)
+            if self.profile.supports_inplace_tool_edit:
+                compacted = compact_messages(self.llm, self.history, self.keep_recent, query)
+            else:
+                compacted = compact_restart(self.llm, self.history, self.keep_recent, query)
         except Exception:  # noqa: BLE001 - 摘要调用失败不该让任务失败
             self._compress_failures += 1
             logger.warning(
@@ -181,6 +223,11 @@ class Agent:
                         {"role": "system", "content": self.system_prompt},
                         *self.history,
                     ]
+                    # 压缩点是合法的推理重启点：前缀基线清空，下一轮重新起算
+                    self._last_prefix = None
+
+            if self.prefix_check:
+                self._check_prefix(messages)
             if self.status_bar is not None:
                 # 状态栏：以 user 角色追加在末尾（书 2.6）。持久追加模式——
                 # 旧状态留在轨迹里不删改，前缀保持字节稳定。
@@ -205,6 +252,12 @@ class Agent:
             message = response.choices[0].message
 
             assistant = {"role": "assistant", "content": message.content}
+            reasoning = getattr(message, "reasoning_content", None)
+            if reasoning and self.profile.reasoning_passthrough:
+                # DeepSeek interleaved thinking 等扩展字段：原样保存并随消息回传
+                # （只追加不改写）。回传的 thinking 与产生它的前缀绑定——这是
+                # 「两个压缩点之间必须 append-only」的根源。
+                assistant["reasoning_content"] = reasoning
             if message.tool_calls:
                 assistant["tool_calls"] = [
                     {

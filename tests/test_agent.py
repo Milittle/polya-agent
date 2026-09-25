@@ -374,3 +374,75 @@ def test_interrupt_backfills_pending_tool_results():
 
     # 中断后历史仍合法：下一次 run() 正常收尾（残缺序列会在 API 侧 400）
     assert agent.run("继续") == "继续"
+
+
+def test_reasoning_content_passthrough():
+    """interleaved thinking：reasoning_content 原样保存并随消息回传（只追加不改写）。"""
+    thinking_reply = make_message(
+        content=None,
+        tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')],
+    )
+    thinking_reply.reasoning_content = "用户要算术，我调用 add 工具……"
+    llm = ScriptedLLM([thinking_reply, make_message(content="2")])
+    agent = Agent(llm=llm, tools=[add])
+    agent.run("1+1")
+
+    assistant = agent.history[1]
+    assert assistant["reasoning_content"] == "用户要算术，我调用 add 工具……"
+    # 下一次请求原样回传
+    assert llm.calls[1]["messages"][2] is assistant  # [0]=system [1]=user [2]=assistant
+
+
+def test_reasoning_passthrough_disabled_by_profile():
+    from mi_z.providers import ModelProfile
+
+    reply = make_message(content="好的")
+    reply.reasoning_content = "内心戏"
+    llm = ScriptedLLM([reply])
+    agent = Agent(llm=llm, profile=ModelProfile(reasoning_passthrough=False))
+    agent.run("hi")
+    assert "reasoning_content" not in agent.history[1]
+
+
+def test_profile_provides_defaults_and_explicit_wins():
+    from mi_z.providers import profile_for
+
+    claude_like = Agent(llm=ScriptedLLM([]), profile=profile_for("claude-opus-4-5"))
+    assert claude_like.context_window == 200_000  # 档案默认
+
+    tuned = Agent(
+        llm=ScriptedLLM([]),
+        profile=profile_for("claude-opus-4-5"),
+        context_window=1000,
+    )
+    assert tuned.context_window == 1000  # 显式参数覆盖档案
+
+
+def test_prefix_check_passes_on_append_only():
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')]),
+            make_message(content="2"),
+            make_message(content="好的"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add], status_bar=True, prefix_check=True)
+    assert agent.run("1+1") == "2"  # 状态栏注入 + 工具回填全部是合法追加
+    agent.run("再会")  # 多轮 run 同样通过
+
+
+def test_prefix_check_catches_history_mutation():
+    import pytest
+
+    llm = ScriptedLLM(
+        [
+            make_message(content="第一轮"),
+            make_message(content="第二轮"),
+            make_message(content="第三轮"),
+        ]
+    )
+    agent = Agent(llm=llm, prefix_check=True)
+    agent.run("hi")
+    agent.history[0]["content"] = "被篡改的前缀"  # 模拟未来代码违规改写历史
+    with pytest.raises(RuntimeError, match="前缀不变量"):
+        agent.run("再来")

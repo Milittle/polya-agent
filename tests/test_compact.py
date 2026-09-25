@@ -8,7 +8,9 @@ from mi_z import Agent, tool
 from mi_z.compact import (
     COMPRESS_MARKER,
     compact_messages,
+    compact_restart,
     compressible_indices,
+    find_restart_split,
     stale_status_indices,
 )
 
@@ -54,7 +56,11 @@ def sample_history():
     return [
         {"role": "user", "content": "任务"},  # 0
         {"role": "user", "content": "<agent_status>\n第1轮\n</agent_status>"},  # 1
-        {"role": "assistant", "content": None, "tool_calls": [{"id": "a"}]},  # 2
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "a", "function": {"name": "read_file", "arguments": "{}"}}],
+        },  # 2
         {"role": "tool", "tool_call_id": "a", "content": "x" * 5000},  # 3
         {"role": "user", "content": "<agent_status>\n第2轮\n</agent_status>"},  # 4
         {"role": "assistant", "content": "中间结论"},  # 5
@@ -215,3 +221,64 @@ def test_agent_circuit_breaker_after_three_failures():
     failed = [c for c in llm.calls if c.get("failed")]
     assert len(failed) == 3  # 连续 3 次后熔断，第 4/5 轮不再尝试
     assert agent._compress_failures == 3
+
+
+# ---------- 摘要重启（thinking 绑定模型的压缩路径） ----------
+
+
+def test_find_restart_split_lands_on_user_boundary():
+    history = sample_history()  # 8 条，末尾 tool 在下标 7
+    split = find_restart_split(history, keep=3)  # 目标位置 5，向后找到 user[6]
+    assert split == 6
+    assert history[split]["role"] == "user"
+
+    assert find_restart_split(history, keep=9) is None  # 历史太短，保留区盖全
+
+
+def test_compact_restart_folds_history_into_summary():
+    llm = ScriptedLLM([make_message(content="任务进行到一半：已读 agent.py，核心是 run() 循环")])
+    history = sample_history()
+    new = compact_restart(llm, history, keep=3, query="理解代码库")
+
+    request = llm.calls[0]["messages"][1]["content"]
+    assert "理解代码库" in request
+    assert "[assistant] 中间结论" in request  # 对话全段进入压缩请求
+    assert "agent_status" not in request  # 状态栏噪声不进
+
+    assert new[0]["role"] == "user"
+    assert new[0]["content"].startswith("<session_summary>")
+    assert "已读 agent.py" in new[0]["content"]
+    assert new[1:] == history[6:]  # 保留区原样（user 状态栏起的完整尾部）
+    assert history == sample_history() or len(history) == 8  # 原列表不动
+
+
+def test_agent_uses_restart_for_thinking_bound_models():
+    from mi_z.providers import ModelProfile
+
+    llm = ScriptedLLM(
+        # keep_recent=4：第 3 轮开头历史 7 条，切点落在第 3 轮状态栏（user 边界）
+        [
+            make_message(tool_calls=[make_tool_call("c1", "echo", '{"text": "一"}')]),
+            make_message(tool_calls=[make_tool_call("c2", "echo", '{"text": "二"}')]),
+            make_message(content="重启摘要：已完成两步探查"),  # 压缩调用消费这条
+            make_message(content="完成"),
+        ],
+        usages=[usage(prompt=200), usage(prompt=200), usage(prompt=0), usage(prompt=50)],
+    )
+    agent = Agent(
+        llm=llm,
+        tools=[echo],
+        status_bar=True,
+        compress=True,
+        context_window=100,
+        keep_recent=4,
+        max_steps=4,
+        profile=ModelProfile(supports_inplace_tool_edit=False),
+    )
+    assert agent.run("干活") == "完成"
+
+    assert llm.calls[2]["tools"] is None  # 压缩调用发生
+    # thinking 绑定模型：历史折叠为 [摘要消息, 保留区...]，而非原地替换
+    first = llm.calls[3]["messages"][1]
+    assert first["content"].startswith("<session_summary>")
+    assert "重启摘要" in first["content"]

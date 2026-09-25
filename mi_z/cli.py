@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from .agent import Agent
 from .builtin import CODING_SYSTEM_PROMPT, default_tools
 from .llm import LLM
+from .providers import profile_for
 from .todos import TodoStore
 from .tools import Tool
 
@@ -161,14 +162,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--context-window",
         type=int,
-        default=128_000,
-        help="上下文窗口大小（token），用量超过 80%% 触发压缩（默认 128000）",
+        default=None,
+        help="上下文窗口（token），超过 80%% 触发压缩（默认取模型档案，如 128000）",
     )
     parser.add_argument(
         "--keep-recent",
         type=int,
         default=30,
         help="压缩保留区：最近 N 条消息内的工具结果不压缩、状态栏不删除（默认 30）",
+    )
+    parser.add_argument(
+        "--prefix-check",
+        action="store_true",
+        help="开启前缀不变量断言：每次请求必须是上一次的严格扩展（调试用，有比较开销）",
     )
     return parser.parse_args(argv)
 
@@ -177,7 +183,17 @@ def build_agent(args: argparse.Namespace, llm=None) -> Agent:
     """按 CLI 参数构建 Agent。``llm`` 参数供测试注入假实现。"""
     todos = TodoStore()
     if llm is None:
-        llm = LLM(model=args.model, base_url=args.base_url, api_key=args.api_key)
+        # 模型档案决定温度等默认参数（o 系列不接受自定义温度），Agent 侧再用
+        # 同一份档案决定压缩策略与前缀纪律
+        profile = profile_for(args.model or os.getenv("OPENAI_MODEL"))
+        llm = LLM(
+            model=args.model,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            temperature=profile.temperature,
+        )
+    else:
+        profile = profile_for(getattr(llm, "model", None))
     interactive = sys.stdin.isatty()
     return Agent(
         llm=llm,
@@ -193,6 +209,8 @@ def build_agent(args: argparse.Namespace, llm=None) -> Agent:
         compress=not args.no_compress,
         context_window=args.context_window,
         keep_recent=args.keep_recent,
+        profile=profile,
+        prefix_check=args.prefix_check,
     )
 
 
