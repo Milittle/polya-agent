@@ -16,6 +16,7 @@ import sys
 from dotenv import load_dotenv
 
 from mi_z import LLM, Agent, default_tools
+from mi_z.builtin import CODING_SYSTEM_PROMPT
 
 load_dotenv()
 
@@ -38,8 +39,14 @@ def approve(tool, arguments) -> bool:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
-    agent = Agent(llm=LLM(), tools=default_tools(), approve=approve)
+    agent = Agent(
+        llm=LLM(),
+        tools=default_tools(),
+        system_prompt=CODING_SYSTEM_PROMPT,
+        approve=approve,
+    )
     print(agent.run(QUESTION))
+    print(f"\n[token 用量] {agent.total_usage}")
 
 
 if __name__ == "__main__":

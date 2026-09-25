@@ -58,14 +58,33 @@ class Tool:
 
 
 class ToolRegistry:
-    """按名字索引一组工具，负责生成 schema 和分发调用。"""
+    """按名字索引一组工具，负责生成 schema 和分发调用。
+
+    工具定义位于上下文最前部（紧跟系统提示词），中途增删会让 KV Cache
+    从首个变动处全部失效（参见《深入理解 AI Agent》2.3 节）。因此
+    Agent 首次运行后会调用 :meth:`freeze`，之后修改注册表直接报错。
+    """
 
     def __init__(self, tools: list[Tool] | None = None):
         self._tools: dict[str, Tool] = {}
+        self._frozen = False
         for item in tools or []:
             self.add(item)
 
+    def freeze(self) -> None:
+        """锁定注册表：此后任何修改都会抛错。"""
+        self._frozen = True
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
+
     def add(self, item: Tool) -> Tool:
+        if self._frozen:
+            raise RuntimeError(
+                "工具注册表已冻结：对话开始后增删工具会使 KV Cache 失效，"
+                "请在构建 Agent 前配置好全部工具。"
+            )
         self._tools[item.name] = item
         return item
 

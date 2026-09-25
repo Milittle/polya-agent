@@ -57,10 +57,12 @@ print(agent.run("北京今天天气怎么样？"))
 
 ```python
 from mi_z import Agent, LLM, default_tools
+from mi_z.builtin import CODING_SYSTEM_PROMPT
 
 agent = Agent(
     llm=LLM(),
     tools=default_tools(root="./my-project"),  # 工具被限制在这个目录内
+    system_prompt=CODING_SYSTEM_PROMPT,  # 编码代理专用提示词（推荐搭配 default_tools）
     approve=lambda tool, args: tool.dangerous is False,  # 拒绝一切副作用工具
 )
 ```
@@ -74,6 +76,11 @@ agent = Agent(
 - 同一个 `Agent` 实例会保留对话历史，可直接连续调用 `run()` 进行多轮对话；需要重新开始时调用
   `agent.reset()`。
 - `max_steps` 限制单次 `run()` 内最多循环多少轮，防止模型陷入反复调用工具的循环。
+- `agent.total_usage` / `agent.last_usage` 累计/记录每次请求的 token 用量（响应里没有
+  usage 字段时保持为 0 / `None`，不会报错）；只做统计，不进消息历史，不影响缓存前缀。
+- 不传 `system_prompt` 时使用内置的通用提示词；`default_tools` 建议搭配
+  `mi_z.builtin.CODING_SYSTEM_PROMPT`（围绕六个内置工具的工作流：探查 → 小步修改 →
+  验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是改写提示词。
 
 ## 内置工具
 

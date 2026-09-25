@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from types import SimpleNamespace
 
 import pytest
@@ -22,17 +23,22 @@ def make_tool_call(call_id, name, arguments):
 
 
 class ScriptedLLM:
-    """按脚本依次返回预设回复，并记录每次收到的消息。"""
+    """按脚本依次返回预设回复，并记录每次收到的消息。
 
-    def __init__(self, replies):
+    usages 可选，与 replies 一一对应；缺省用 None 模拟不带 usage 的响应。
+    """
+
+    def __init__(self, replies, usages=None):
         self._replies = list(replies)
+        self._usages = list(usages) if usages is not None else [None] * len(replies)
         self.calls: list[dict] = []
 
     def chat(self, messages, tools=None):
         # 做一次浅拷贝，避免后续对 messages 的修改影响断言
         self.calls.append({"messages": list(messages), "tools": tools})
         message = self._replies.pop(0)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        usage = self._usages.pop(0) if self._usages else None
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
 
 
 @tool
@@ -150,3 +156,90 @@ def test_approve_hook_can_allow_tool_call():
 
     assert agent.run("加一下") == "5"
     assert llm.calls[1]["messages"][-1]["content"] == "5"
+
+
+# ---------------------------------------------------------------- KV Cache 前缀稳定性
+# 以下测试把《深入理解 AI Agent》2.3 节的三条铁律钉死：
+# 前缀字节级不变（只追加、不改写）是 KV Cache / Prompt Cache 复用的前提。
+
+
+def test_messages_only_grow_append_only():
+    """每次请求的消息序列必须是上一次的严格扩展：旧消息一个字节都不能变。"""
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 2, "b": 3}')]),
+            make_message(content="5"),
+            make_message(content="第二次答复"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add])
+    agent.run("2 + 3？")
+    agent.run("再会")  # 第二轮 run 也要保持前缀稳定
+
+    for earlier, later in pairwise(llm.calls):
+        assert later["messages"][: len(earlier["messages"])] == earlier["messages"]
+
+
+def test_tool_schemas_are_stable_across_calls():
+    """工具 schema 的内容与顺序必须确定：工具定义位于上下文前部，顺序抖动会让缓存失效。"""
+    registry = ToolRegistry([add])
+    first = registry.schemas()
+
+    @tool
+    def echo(text: str) -> str:
+        """原样返回。"""
+        return text
+
+    registry_before_run = ToolRegistry([add, echo])
+    assert registry_before_run.schemas() == registry_before_run.schemas()
+    assert first == ToolRegistry([add]).schemas()
+
+
+def test_registry_freezes_after_first_run():
+    """对话开始后增删工具必须报错：这是 2.3 节「工具定义定了就不改」的代码化。"""
+    llm = ScriptedLLM([make_message(content="好的")])
+    agent = Agent(llm=llm, tools=[add])
+    assert agent.tools.frozen is False
+
+    agent.run("你好")
+    assert agent.tools.frozen is True
+
+    @tool
+    def echo(text: str) -> str:
+        """原样返回。"""
+        return text
+
+    with pytest.raises(RuntimeError):
+        agent.tools.add(echo)
+
+
+def test_usage_is_accumulated_and_reset_clears_it():
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    llm = ScriptedLLM(
+        [make_message(content="好")],
+        usages=[usage],
+    )
+    agent = Agent(llm=llm)
+
+    agent.run("你好")
+
+    assert agent.last_usage == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert agent.total_usage == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+
+    agent.reset()
+    assert agent.last_usage is None
+    assert agent.total_usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+def test_missing_usage_is_tolerated():
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')]),
+            make_message(content="2"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add])
+
+    assert agent.run("1+1") == "2"
+    assert agent.last_usage is None
+    assert agent.total_usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

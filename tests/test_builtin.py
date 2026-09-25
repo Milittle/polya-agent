@@ -89,3 +89,19 @@ def test_dangerous_flags():
     assert by_name["read_file"].dangerous is False
     assert by_name["list_dir"].dangerous is False
     assert by_name["grep"].dangerous is False
+
+
+def test_tool_descriptions_carry_usage_guidance():
+    """描述不是摆设：关键的使用边界和协作关系要在（书实验 2-4：去掉描述 → 错误率 +45%）。"""
+    by_name = {item.name: item for item in default_tools(".")}
+    keywords = {
+        "read_file": "编辑",  # 提示「编辑前必读」
+        "write_file": "覆盖",  # 提示整文件覆盖的边界
+        "edit_file": "唯一",  # 提示唯一性约束
+        "run_shell": "验证",  # 提示用途定位
+        "grep": "正则",  # 提示 pattern 是正则
+        "list_dir": "不递归",  # 提示只列一层
+    }
+    for name, word in keywords.items():
+        assert word in by_name[name].description, f"{name} 的描述缺少关键信息「{word}」"
+        assert len(by_name[name].description) >= 30
