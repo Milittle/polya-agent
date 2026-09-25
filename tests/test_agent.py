@@ -326,3 +326,51 @@ def test_custom_status_renderer_and_reset_clears_counts():
 
     agent.reset()
     assert agent.tool_counts == Counter()
+
+
+def test_interrupt_backfills_pending_tool_results():
+    """工具循环中被打断时，未回填的 tool_call 要补上结果——残缺序列会被 API 拒绝。"""
+
+    @tool
+    def ok1() -> str:
+        """正常返回的工具。"""
+        return "ok1"
+
+    @tool
+    def boom() -> str:
+        """模拟用户在它执行时按下 Ctrl+C。"""
+        raise KeyboardInterrupt
+
+    @tool
+    def ok2() -> str:
+        """排在中断点之后、来不及执行的工具。"""
+        return "ok2"
+
+    llm = ScriptedLLM(
+        [
+            make_message(
+                tool_calls=[
+                    make_tool_call("c1", "ok1", "{}"),
+                    make_tool_call("c2", "boom", "{}"),
+                    make_tool_call("c3", "ok2", "{}"),
+                ]
+            ),
+            make_message(content="继续"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[ok1, boom, ok2])
+
+    with pytest.raises(KeyboardInterrupt):
+        agent.run("做事")
+
+    # 三个 tool_call 全部有回填：ok1 是真实结果；中断点起的 boom/ok2 由补齐逻辑
+    # 统一填「用户中断」（KeyboardInterrupt 是 BaseException，不会被 except Exception
+    # 转成错误文本，而是直接传播，其后的调用根本不会执行）
+    tool_messages = [m for m in agent.history if m["role"] == "tool"]
+    assert len(tool_messages) == 3
+    assert tool_messages[0]["content"] == "ok1"
+    assert "中断" in tool_messages[1]["content"]
+    assert "中断" in tool_messages[2]["content"]
+
+    # 中断后历史仍合法：下一次 run() 正常收尾（残缺序列会在 API 侧 400）
+    assert agent.run("继续") == "继续"

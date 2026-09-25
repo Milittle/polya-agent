@@ -51,6 +51,7 @@ class Agent:
         status_bar: bool | Callable[[StatusSnapshot], str] | None = None,
         todos: TodoStore | None = None,
         plan_mode: bool = False,
+        plan_capable: bool = False,
         approve_plan: Callable[[str], bool] | None = None,
     ):
         self.llm = llm
@@ -65,9 +66,11 @@ class Agent:
         # tools 会破坏 KV Cache 前缀，书 2.3 的纪律），exit_plan_mode 提交计划、
         # approve_plan 决定是否放行进入执行模式。approve_plan 缺省自动批准：
         # 开发者启用规划模式即接受该流程，写操作仍受 approve 钩子约束。
+        # plan_mode 是初始状态（运行时可切换），plan_capable 只控制 exit_plan_mode
+        # 工具的注册（构造时一次）——两者解耦后，CLI 可以随时切换模式而不动工具数组。
         self.plan_mode = plan_mode
         self.approve_plan = approve_plan
-        if plan_mode:
+        if plan_mode or plan_capable:
             self._register_exit_plan_mode()
         # TODO 存储：todo_write 工具写入（default_tools(todos=...) 接同一个实例），
         # 状态栏每轮把它渲染到上下文末尾——外部记忆，不靠模型回忆。
@@ -168,44 +171,68 @@ class Agent:
             if not message.tool_calls:
                 return message.content or ""
 
-            for call in message.tool_calls:
-                name = call.function.name
-                try:
-                    arguments = json.loads(call.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-                logger.info("调用工具 %s(%s)", name, arguments)
+            try:
+                for call in message.tool_calls:
+                    name = call.function.name
+                    try:
+                        arguments = json.loads(call.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        arguments = {}
+                    logger.info("调用工具 %s(%s)", name, arguments)
 
-                item = self.tools.get(name)
-                if item is not None and self.plan_mode and item.dangerous:
-                    # 规划模式：写操作在分发层拒绝，指引模型先提交计划。
-                    # 不增删 tools 数组（缓存纪律），模式只是运行时状态。
-                    result = (
-                        f"Error: 规划模式下只能使用只读工具（{name} 被拒绝）。"
-                        "完成计划后调用 exit_plan_mode 提交，批准后进入执行模式。"
-                    )
-                elif (
-                    item is not None
-                    and self.approve is not None
-                    and not self.approve(item, arguments)
-                ):
-                    result = f"Error: 用户拒绝了工具调用 {name}"
-                else:
-                    result = self.tools.call(name, arguments)
+                    item = self.tools.get(name)
+                    if item is not None and self.plan_mode and item.dangerous:
+                        # 规划模式：写操作在分发层拒绝，指引模型先提交计划。
+                        # 不增删 tools 数组（缓存纪律），模式只是运行时状态。
+                        result = (
+                            f"Error: 规划模式下只能使用只读工具（{name} 被拒绝）。"
+                            "完成计划后调用 exit_plan_mode 提交，批准后进入执行模式。"
+                        )
+                    elif (
+                        item is not None
+                        and self.approve is not None
+                        and not self.approve(item, arguments)
+                    ):
+                        result = f"Error: 用户拒绝了工具调用 {name}"
+                    else:
+                        result = self.tools.call(name, arguments)
 
-                self.tool_counts[name] += 1
-                if self.status_bar is not None:
-                    # 调用计数标注（书实验 2-9）：显式次数触发模型的模式识别——
-                    # 第 3 次失败后主动换路，而不是无限重试。
-                    result = f"（{name} 第 {self.tool_counts[name]} 次调用）\n{result}"
+                    self.tool_counts[name] += 1
+                    if self.status_bar is not None:
+                        # 调用计数标注（书实验 2-9）：显式次数触发模型的模式识别——
+                        # 第 3 次失败后主动换路，而不是无限重试。
+                        result = f"（{name} 第 {self.tool_counts[name]} 次调用）\n{result}"
 
-                logger.info("工具 %s 返回: %s", name, result)
-                tool_message = {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": result,
+                    # 返回值可能很长（截断后仍有 8000 字符），日志里只留开头
+                    logger.info("工具 %s 返回: %.200s", name, result)
+                    tool_message = {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": result,
+                    }
+                    messages.append(tool_message)
+                    self.history.append(tool_message)
+            except KeyboardInterrupt:
+                # 中断可能落在工具循环中间：assistant 已声明 N 个 tool_call，
+                # 只回填一部分的话，下一轮请求的序列残缺会被 API 拒绝（每个
+                # tool_call_id 都必须有对应的 tool 消息）。给尚未回填的调用
+                # 补上中断结果，让历史保持合法，再向上传播中断。
+                answered = {
+                    m["tool_call_id"]
+                    for m in messages
+                    if m.get("role") == "tool"
+                    and m["tool_call_id"] in {c.id for c in message.tool_calls}
                 }
-                messages.append(tool_message)
-                self.history.append(tool_message)
+                for call in message.tool_calls:
+                    if call.id in answered:
+                        continue
+                    interrupted = {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": "Error: 用户中断了本次任务。",
+                    }
+                    messages.append(interrupted)
+                    self.history.append(interrupted)
+                raise
 
         raise RuntimeError(f"超过最大步数 {self.max_steps}，仍未得到最终答案")
