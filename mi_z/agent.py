@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from collections.abc import Callable
 
+from .status import StatusSnapshot, render_status
 from .tools import Tool, ToolRegistry
 
 logger = logging.getLogger("mi_z.agent")
@@ -45,21 +47,27 @@ class Agent:
         system_prompt: str | None = None,
         max_steps: int = 10,
         approve: Callable[[Tool, dict], bool] | None = None,
+        status_bar: bool | Callable[[StatusSnapshot], str] | None = None,
     ):
         self.llm = llm
         self.tools = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self.max_steps = max_steps
         self.approve = approve
+        # 状态栏渲染器：True 用默认渲染，callable 自定义，None/False 关闭。
+        # 状态以 user 消息追加在上下文末尾（书 2.6），绝不修改已有消息。
+        self.status_bar = render_status if status_bar is True else status_bar or None
         self.history: list[dict] = []
         # token 用量统计：只做记录，不进消息历史（保持前缀字节稳定）
         self.last_usage: dict | None = None
         self.total_usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.tool_counts: Counter[str] = Counter()
 
     def reset(self) -> None:
         self.history.clear()
         self.last_usage = None
         self.total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.tool_counts.clear()
 
     def _record_usage(self, response) -> None:
         """从响应中提取 usage（可能缺失），累计到 total_usage。"""
@@ -80,7 +88,24 @@ class Agent:
         messages = [{"role": "system", "content": self.system_prompt}, *self.history]
         schemas = self.tools.schemas() or None
 
-        for _ in range(self.max_steps):
+        for step in range(1, self.max_steps + 1):
+            if self.status_bar is not None:
+                # 状态栏：以 user 角色追加在末尾（书 2.6）。持久追加模式——
+                # 旧状态留在轨迹里不删改，前缀保持字节稳定。
+                status_message = {
+                    "role": "user",
+                    "content": self.status_bar(
+                        StatusSnapshot(
+                            iteration=step,
+                            max_steps=self.max_steps,
+                            tool_calls=dict(self.tool_counts),
+                            usage=dict(self.total_usage),
+                        )
+                    ),
+                }
+                messages.append(status_message)
+                self.history.append(status_message)
+
             response = self.llm.chat(messages, tools=schemas)
             self._record_usage(response)
             message = response.choices[0].message
@@ -121,6 +146,12 @@ class Agent:
                     result = f"Error: 用户拒绝了工具调用 {name}"
                 else:
                     result = self.tools.call(name, arguments)
+
+                self.tool_counts[name] += 1
+                if self.status_bar is not None:
+                    # 调用计数标注（书实验 2-9）：显式次数触发模型的模式识别——
+                    # 第 3 次失败后主动换路，而不是无限重试。
+                    result = f"（{name} 第 {self.tool_counts[name]} 次调用）\n{result}"
 
                 logger.info("工具 %s 返回: %s", name, result)
                 tool_message = {

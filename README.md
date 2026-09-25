@@ -76,6 +76,11 @@ agent = Agent(
 - 同一个 `Agent` 实例会保留对话历史，可直接连续调用 `run()` 进行多轮对话；需要重新开始时调用
   `agent.reset()`。
 - `max_steps` 限制单次 `run()` 内最多循环多少轮，防止模型陷入反复调用工具的循环。
+- `status_bar=True` 开启 Agent 状态栏：每轮迭代以 user 消息在上下文**末尾**追加
+  `<agent_status>` 元信息（迭代号、各工具累计调用次数、token 用量、时间），工具结果
+  也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易
+  数错——状态栏用代码提前算好。更新采用持久追加（旧状态留在轨迹里，不删改），KV Cache
+  前缀始终稳定。也可传入自定义渲染函数 `status_bar=lambda snapshot: ...`。
 - `agent.total_usage` / `agent.last_usage` 累计/记录每次请求的 token 用量（响应里没有
   usage 字段时保持为 0 / `None`，不会报错）；只做统计，不进消息历史，不影响缓存前缀。
 - 不传 `system_prompt` 时使用内置的通用提示词；`default_tools` 建议搭配
@@ -102,10 +107,11 @@ agent = Agent(
 
 ```
 mi_z/
-  agent.py    # 核心循环 + 审批钩子
+  agent.py    # 核心循环 + 审批钩子 + 状态栏注入
   llm.py      # OpenAI 兼容接口封装
   tools.py    # @tool 装饰器与工具注册表（框架层）
-  builtin.py  # 内置编码工具（内容层）
+  builtin.py  # 内置编码工具 + 编码代理提示词（内容层）
+  status.py   # 状态栏快照与默认渲染器
 demo.py       # 可运行示例
 tests/        # 用假 LLM 验证循环 + 内置工具沙箱测试
 ```

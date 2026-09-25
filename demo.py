@@ -44,6 +44,7 @@ def main() -> None:
         tools=default_tools(),
         system_prompt=CODING_SYSTEM_PROMPT,
         approve=approve,
+        status_bar=True,  # 每轮迭代在上下文末尾注入 <agent_status> 元信息（书 2.6）
     )
     print(agent.run(QUESTION))
     print(f"\n[token 用量] {agent.total_usage}")

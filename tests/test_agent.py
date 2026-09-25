@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from itertools import pairwise
 from types import SimpleNamespace
 
@@ -243,3 +244,72 @@ def test_missing_usage_is_tolerated():
     assert agent.run("1+1") == "2"
     assert agent.last_usage is None
     assert agent.total_usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+
+# ---------------------------------------------------------------- 状态栏（书 2.6）
+
+
+def test_status_bar_appends_user_message_each_iteration():
+    """状态栏以 user 消息出现在每次请求的末尾，含迭代号与工具计数；只追加不改写。"""
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 2, "b": 3}')]),
+            make_message(content="5"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add], status_bar=True)
+    agent.run("2+3")
+
+    first_status = llm.calls[0]["messages"][-1]
+    assert first_status["role"] == "user"
+    assert "<agent_status>" in first_status["content"]
+    assert "第 1/" in first_status["content"]  # 迭代号
+    assert "尚未调用工具" in first_status["content"]  # 第一轮还没有调用
+
+    second_status = llm.calls[1]["messages"][-1]
+    assert "<agent_status>" in second_status["content"]
+    assert "第 2/" in second_status["content"]
+    assert "add: 1 次" in second_status["content"]  # 计数已累计
+
+    # 持久追加：第二次请求的消息序列仍是第一次的严格扩展（KV Cache 纪律不被破坏）
+    earlier, later = llm.calls
+    assert later["messages"][: len(earlier["messages"])] == earlier["messages"]
+
+
+def test_tool_results_annotated_with_call_count_when_status_enabled():
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')]),
+            make_message(content="2"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add], status_bar=True)
+    agent.run("1+1")
+
+    tool_message = llm.calls[1]["messages"][-2]  # 倒数第二是工具结果，最后是新一轮状态
+    assert tool_message["content"].startswith("（add 第 1 次调用）")
+    assert agent.tool_counts == {"add": 1}
+
+
+def test_status_bar_off_by_default():
+    llm = ScriptedLLM([make_message(content="好")])
+    agent = Agent(llm=llm)
+    agent.run("hi")
+    assert all("<agent_status>" not in str(m.get("content")) for m in llm.calls[0]["messages"])
+
+
+def test_custom_status_renderer_and_reset_clears_counts():
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')]),
+            make_message(content="2"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add], status_bar=lambda snap: f"<x>第{snap.iteration}轮</x>")
+    agent.run("1+1")
+
+    assert llm.calls[0]["messages"][-1]["content"] == "<x>第1轮</x>"
+    assert llm.calls[1]["messages"][-1]["content"] == "<x>第2轮</x>"
+
+    agent.reset()
+    assert agent.tool_counts == Counter()
