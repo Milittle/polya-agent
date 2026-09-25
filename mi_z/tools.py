@@ -21,13 +21,21 @@ _JSON_TYPES: dict[Any, str] = {
 }
 
 
-def _json_type(annotation: Any) -> str:
-    """把 Python 类型注解映射成 JSON Schema 的 type 字段。"""
+def _json_schema(annotation: Any) -> str | dict:
+    """把 Python 类型注解映射成 JSON Schema（type 字符串或完整 schema 对象）。"""
     origin = get_origin(annotation)
     if origin is Union or origin is types.UnionType:
         inner = [a for a in get_args(annotation) if a is not type(None)]
         if len(inner) == 1:
-            return _json_type(inner[0])
+            return _json_schema(inner[0])
+    if origin is list:
+        (item,) = get_args(annotation) or (str,)
+        item_schema = _json_schema(item)
+        if isinstance(item_schema, str):
+            item_schema = {"type": item_schema}
+        return {"type": "array", "items": item_schema}
+    if origin is dict or annotation is dict:
+        return {"type": "object"}
     return _JSON_TYPES.get(annotation, "string")
 
 
@@ -131,7 +139,8 @@ def tool(
         properties: dict[str, dict] = {}
         required: list[str] = []
         for param_name, param in signature.parameters.items():
-            properties[param_name] = {"type": _json_type(hints.get(param_name, str))}
+            schema = _json_schema(hints.get(param_name, str))
+            properties[param_name] = {"type": schema} if isinstance(schema, str) else schema
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
         parameters = {"type": "object", "properties": properties, "required": required}

@@ -70,6 +70,19 @@ def test_optional_parameter_is_not_required():
     assert schema["function"]["parameters"]["properties"]["greeting"]["type"] == "string"
 
 
+def test_array_parameter_schema_is_generated():
+    @tool
+    def multi_edit(edits: list[dict], name: str) -> str:
+        """多编辑。"""
+        return name
+
+    schema = ToolRegistry([multi_edit]).schemas()[0]
+    params = schema["function"]["parameters"]
+    assert params["properties"]["edits"] == {"type": "array", "items": {"type": "object"}}
+    assert params["properties"]["name"] == {"type": "string"}
+    assert params["required"] == ["edits", "name"]
+
+
 def test_agent_runs_tool_then_answers():
     llm = ScriptedLLM(
         [

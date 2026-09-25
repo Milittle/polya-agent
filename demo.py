@@ -21,7 +21,7 @@ from mi_z.builtin import CODING_SYSTEM_PROMPT
 load_dotenv()
 
 QUESTION = (
-    "先列出当前目录，再读一下 mi_z/agent.py，"
+    "先用 glob 找出所有测试文件，再读一下 mi_z/agent.py，"
     "然后用三五句话说明这个文件负责什么、核心循环是怎么跑的。"
 )
 
