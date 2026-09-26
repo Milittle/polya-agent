@@ -1,120 +1,155 @@
-"""Claude Code 风格输入框：多行编辑、补全、粘贴折叠、双击 Ctrl+C 退出。
+"""常驻多行输入：编辑、补全、粘贴折叠和自适应状态栏。
 
-对外只暴露 :class:`InputBox` 的 ``ask(state)``：渲染一轮输入并返回提交文本
-（粘贴占位符已展开）。退出走异常通道——空框 2 秒内双击 Ctrl+C 抛
-``KeyboardInterrupt``、Ctrl+D 抛 ``EOFError``，与 REPL 现行退出路径一致。
-
-状态栏数据（模式 / 模型 / 上下文占比 / 规则数）由驱动层经 ``state`` 注入，
-本模块不反取 agent 状态（依赖单向，spec「模块划分」）。
+同步 ask() 用于独立输入，ask_async()/suspend() 支持后台任务与审批让位。
+草稿以 Document 保留光标，粘贴登记直到提交才清空。状态由驱动注入。
 """
 
 from __future__ import annotations
 
-import shutil
 import time
 from collections.abc import Iterable
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import (
-    Completer,
-    Completion,
-    PathCompleter,
-    merge_completers,
-)
+from prompt_toolkit.buffer import CompletionState
+from prompt_toolkit.completion import Completer, Completion, merge_completers
 from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition, to_filter
+from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
+from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu, CompletionsMenuControl
 from prompt_toolkit.styles import Style
+from prompt_toolkit.utils import get_cwidth
 
-# 斜杠命令表：(命令, 说明)——补全菜单的说明列与 cli 的 /help 同源
-SLASH_COMMANDS: list[tuple[str, str]] = [
-    ("/help", "显示本帮助"),
-    ("/todos", "显示当前 TODO 清单"),
-    ("/status", "显示会话状态（模式 / 用量 / 工具计数）"),
-    ("/plan", "开启/关闭规划模式（on|off）"),
-    ("/expand", "展开最近 N 块工具结果 / 思考全文"),
-    ("/reset", "清空对话历史、TODO 与统计"),
-    ("/exit", "退出"),
-    ("/quit", "退出"),
-]
+from .commands import BUSY_HINTS, COMMANDS, command_error, parse_command
+from .filefind import ProjectFiles
 
 PASTE_FOLD_THRESHOLD = 10  # 粘贴超过此行数即折叠为占位符
 QUIT_WINDOW_S = 2.0  # 空框双击 Ctrl+C 的判定窗口（秒）
-KEY_HINTS = "Enter 发送 · Alt+Enter/Ctrl+J 换行 · /help 命令"
+KEY_HINTS = "Enter 发送 · /help"
 
 
 def _display_width(text: str) -> int:
-    """粗略显示宽度：CJK 记 2 列（横线填充用，不追求精确 wcwidth）。"""
-    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
+    """使用终端列宽计算，涵盖中文与组合字符。"""
+    return get_cwidth(text)
 
 
 def _rule(label: str, width: int) -> str:
-    """一条 ─ 横线，label 嵌在开头（Claude Code 输入框的上下框线）。"""
-    label = f" {label} " if label else ""
-    fill = max(0, width - _display_width(label) - 2)
-    return "──" + label + "─" * fill
+    text = _fit(f"── {label} " if label else "", width)
+    return text + "─" * max(0, width - get_cwidth(text))
+
+
+def _fit(text: str, width: int) -> str:
+    if get_cwidth(text) <= width:
+        return text
+    result = ""
+    for char in text:
+        if get_cwidth(result + char) > max(0, width - 1):
+            break
+        result += char
+    return result + ("…" if width else "")
 
 
 def prompt_message(state: dict) -> list:
-    """输入框顶线 + ``❯`` 提示符；主题已知时嵌在顶线（``── ✳ topic ──``）。"""
-    width = shutil.get_terminal_size((100, 24)).columns
-    topic = state.get("topic")
-    rule = _rule(f"✳ {topic}" if topic else "", width)
-    return [("", "\n"), ("class:rule", rule), ("class:rule", "\n"), ("class:prompt", "❯ ")]
+    """主题留在终端标题中，输入区只有提示符。"""
+    return [("class:prompt", "❯ ")]
+
+
+class InputSuspended(Exception):
+    """审批临时取得终端输入权；草稿和粘贴登记继续保留。"""
 
 
 class SlashCompleter(Completer):
-    """补全开头的斜杠命令（带说明列）；整行不是命令时不给任何建议。
+    """Complete a leading command or its enumerated argument, never prompt prose.
 
-    一旦出现空格（如 ``/plan on`` 的参数部分）即停止——命令名补全到此为止。
+    Codex 式过滤：大小写不敏感，精确命中排前缀命中前；别名不单列——命中即补主名。
     """
 
     def get_completions(self, document: Document, complete_event) -> Iterable[Completion]:
         text = document.text_before_cursor
-        if not text.startswith("/") or " " in text:
+        if not text.startswith("/") or "\n" in document.text or document.text_after_cursor:
             return
-        for command, description in SLASH_COMMANDS:
-            if command.startswith(text):
-                yield Completion(command, start_position=-len(text), display_meta=description)
+        if not any(char.isspace() for char in text):
+            query = text.lower()
+
+            def bucket(command) -> int:
+                names = [command.name.lower(), *(alias.lower() for alias in command.aliases)]
+                if query in names:
+                    return 0  # 精确命中（含别名）
+                if any(name.startswith(query) for name in names):
+                    return 1  # 前缀命中
+                return 2
+
+            matched = [c for c in COMMANDS if bucket(c) < 2]
+            matched.sort(key=bucket)  # 稳定排序：桶内保持声明序
+            for entry in matched:
+                yield Completion(
+                    entry.name,
+                    start_position=-len(text),
+                    display=entry.name,
+                    display_meta=_command_meta(entry),
+                )
+            return
+        command, argument = parse_command(text)
+        if command is None or len(text.split()) > 2 or (argument and text[-1].isspace()):
+            return
+        for value, label in command.effective_choices():
+            if value.startswith(argument):
+                yield Completion(value, start_position=-len(argument), display_meta=label)
+
+
+def _command_meta(command) -> str:
+    parts = [p for p in (command.argument_hint, command.description) if p]
+    if command.aliases:
+        parts.append(f"别名 {'、'.join(command.aliases)}")
+    return " · ".join(parts)
 
 
 class AtPathCompleter(Completer):
-    """``@`` 触发的文件路径补全：对光标前 ``@`` 开头的词做相对路径补全。"""
+    """``@`` 触发的全项目模糊文件补全：光标前 ``@`` 开头的词整词替换插入。"""
 
-    def __init__(self) -> None:
-        self._paths = PathCompleter()
+    def __init__(self, files: ProjectFiles) -> None:
+        self._files = files
 
     def get_completions(self, document: Document, complete_event) -> Iterable[Completion]:
         text = document.text_before_cursor
         token = text.rsplit(None, 1)[-1] if text.split() else ""
-        if not token.startswith("@") or len(token) < 2:
+        if not token.startswith("@"):
             return
         fragment = token[1:]
-        probe = Document(fragment, len(fragment))
-        for completion in self._paths.get_completions(probe, complete_event):
-            # PathCompleter 的语义是「后缀插入」（start_position 通常为 0），
-            # 原样透传，勿改成替换——否则拼出的路径会丢前半段。
-            yield Completion(
-                completion.text,
-                start_position=completion.start_position,
-                display=completion.display,
-                display_meta=completion.display_meta,
-            )
+        # 整词替换（start_position=-len(fragment)）接管 @ 后的全部已输入，
+        # 与旧 PathCompleter 的后缀插入不同：模糊命中的是完整相对路径。
+        for path in self._files.search(fragment):
+            yield Completion(path, start_position=-len(fragment))
 
 
 class InputBox:
     """多行输入框。``ask(state)`` 渲染一轮输入并返回提交文本（粘贴已展开）。"""
 
-    def __init__(self, history_path: Path | None = None, *, input=None, output=None):
+    def __init__(
+        self,
+        history_path: Path | None = None,
+        *,
+        input=None,
+        output=None,
+        files: ProjectFiles | None = None,
+    ):
         self._state: dict = {}
+        self.on_interrupt = lambda: None
+        self.preview = lambda width, max_lines: ""
+        self._draft = Document("")
         self._pastes: list[str] = []  # 折叠登记：原文按序号存取
         self._tokens: list[str] = []
         self._last_cancel = 0.0
         self._hint = ""
         self._hint_until = 0.0
+        # rg 索引懒构建：不触发 @ 补全的会话不会运行子进程（测试与非交互路径零成本）。
+        self._files = files or ProjectFiles(Path.cwd())
         self._session = self._build(history_path, input, output)
 
     # ---- 对外接口 ----
@@ -123,6 +158,27 @@ class InputBox:
         """渲染一轮输入。退出信号以异常上行（KeyboardInterrupt / EOFError）。"""
         self._state = state
         text = self._session.prompt(self._message)
+        return self._submitted(text)
+
+    async def ask_async(self, state: dict) -> str:
+        self._state = state
+        try:
+            text = await self._session.prompt_async(self._message, default=self._draft)
+        except KeyboardInterrupt as exc:
+            raise EOFError from exc
+        return self._submitted(text)
+
+    def refresh_file_index(self) -> None:
+        """任务结束后由驱动调用：agent 可能刚写过文件，后台重建 @ 索引。"""
+        self._files.refresh_soon()
+
+    def suspend(self) -> None:
+        if self._session.app.is_running and not self._session.app.is_done:
+            self._draft = self._session.default_buffer.document
+            self._session.app.exit(exception=InputSuspended())
+
+    def _submitted(self, text: str) -> str:
+        self._draft = Document("")
         expanded = self._expand_pastes(text)
         self._pastes.clear()
         self._tokens.clear()
@@ -146,12 +202,33 @@ class InputBox:
         def _enter(event):
             self._submit(event.current_buffer)
 
+        @bindings.add("c-i")
+        def _tab(event):
+            buffer = event.current_buffer
+            state = buffer.complete_state
+            if state is not None and state.completions:
+                buffer.apply_completion(state.current_completion or state.completions[0])
+            else:
+                # select_first=True：Tab 打开菜单即预选中第一项（对齐 CC/Codex）。
+                # 勿用 on_completions_changed 钩子做自动弹出的预选中——加载期设
+                # complete_index 会废掉库的「唯一无增量补全重置」，留下僵尸菜单。
+                buffer.start_completion(select_first=True)
+
         @bindings.add("c-c")
         def _cancel(event):
             try:
                 self._on_cancel(event.current_buffer)
+            except KeyboardInterrupt:
+                event.app.exit(exception=KeyboardInterrupt())
             finally:
                 event.app.invalidate()
+
+        @bindings.add("escape")
+        def _escape(event):
+            if event.current_buffer.complete_state:
+                event.current_buffer.cancel_completion()
+            else:
+                self.on_interrupt()
 
         @bindings.add(Keys.BracketedPaste)
         def _paste(event):
@@ -162,13 +239,14 @@ class InputBox:
             state_dir.mkdir(parents=True, exist_ok=True)
             history_path = state_dir / "history"
 
-        return PromptSession(
+        session: PromptSession = PromptSession(
             input=input,
             output=output,
             multiline=True,
-            prompt_continuation=lambda width, number, soft: [("class:continuation", "… ")],
-            bottom_toolbar=self._bottom_bar,
-            placeholder=[("class:placeholder", "输入任务（Alt+Enter 换行），/help 命令，@ 补路径")],
+            prompt_continuation=lambda width, number, soft: [("class:continuation", "  ")],
+            erase_when_done=True,
+            refresh_interval=0.5,
+            placeholder=[("class:placeholder", "输入任务，或用 @ 引用文件")],
             style=Style.from_dict(
                 {
                     "prompt": "bold cyan",
@@ -179,29 +257,182 @@ class InputBox:
                 }
             ),
             history=FileHistory(str(history_path)),
-            completer=merge_completers(SlashCompleter(), AtPathCompleter()),
-            auto_suggest=AutoSuggestFromHistory(),
+            completer=merge_completers([SlashCompleter(), AtPathCompleter(self._files)]),
             key_bindings=bindings,
         )
+
+        # 复用 PromptSession 的编辑、历史与搜索控件；边线和状态同属一个布局。
+        window = session.layout.current_window
+        window.height = Dimension(min=1, max=6)
+        window.dont_extend_height = to_filter(True)
+        container = session.layout.container
+
+        # 3.0.53 的补全菜单是输入窗下方的浮层；输入窗限高（1–6 行、不占满）后
+        # 下方没有可画的行，菜单整体消失。改为把菜单做成输入区上方的实体行、
+        # 向上生长（CC/Codex 同款形态），原浮层永不渲染。
+        main = container.children[0].alternative_content  # type: ignore[attr-defined]
+        main.floats[0].content = CompletionsMenu(extra_filter=to_filter(False))
+        buffer = session.default_buffer
+
+        def menu_visible() -> bool:
+            state = buffer.complete_state
+            return state is not None and bool(state.completions)
+
+        menu = ConditionalContainer(
+            Window(
+                content=CompletionsMenuControl(),
+                height=Dimension(min=1, max=6),
+                style="class:completion-menu",
+                dont_extend_height=to_filter(True),
+            ),
+            filter=Condition(menu_visible),
+        )
+
+        def rule():
+            return [("class:rule", "─" * session.output.get_size().columns)]
+
+        session.app.layout = Layout(
+            HSplit(
+                [
+                    ConditionalContainer(
+                        Window(
+                            FormattedTextControl(self._live_preview),
+                            dont_extend_height=True,
+                            height=Dimension(min=1, max=9),
+                        ),
+                        filter=Condition(lambda: bool(self._state.get("preview_active"))),
+                    ),
+                    ConditionalContainer(
+                        Window(FormattedTextControl(self._working_bar), height=1),
+                        filter=Condition(lambda: bool(self._state.get("busy"))),
+                    ),
+                    menu,
+                    Window(FormattedTextControl(rule), height=1),
+                    container,
+                    Window(FormattedTextControl(rule), height=1),
+                    Window(FormattedTextControl(self._environment_bar), height=1),
+                    Window(FormattedTextControl(self._bottom_bar), height=1),
+                ]
+            ),
+            focused_element=window,
+        )
+        session.app.timeoutlen = 0.5
+        return session
 
     # ---- 渲染 ----
 
     def _message(self) -> list:
         return prompt_message(self._state)
 
-    def _bottom_bar(self) -> list:
-        """底线状态栏：左会话状态（state 注入），右快捷键提示 / 临时提示。"""
+    def _live_preview(self):
+        size = self._session.output.get_size()
+        # Leave room for the editor, its borders, status and completion menu.
+        max_lines = max(1, min(8, (size.rows - 11) // 2))
+        return ANSI(self.preview(size.columns, max_lines))
+
+    def _working_bar(self) -> list:
+        """Task-wide status remains above the editor, independent of individual tools."""
+        started_at = self._state.get("started_at")
+        elapsed = max(0, int(time.monotonic() - started_at)) if started_at is not None else 0
+        minutes, seconds = divmod(elapsed, 60)
+        duration = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+        if self._state.get("stopping"):
+            label = "Stopping"
+            hint = "waiting: " + self._state.get("status", "current operation")
+        else:
+            label = self._state.get("status", "Waiting for model")
+            hint = (
+                "esc to close completions"
+                if self._session.default_buffer.complete_state
+                else "esc to interrupt"
+            )
+        width = self._session.output.get_size().columns
+        text = f"  {label} · {duration} ({hint})"
+        # Keep the action legible on narrow terminals before adding a timer.
+        if get_cwidth(text) > width:
+            text = f"  {label} ({hint})"
+        return [("class:rule", _fit(text, width))]
+
+    def _environment_bar(self) -> list:
+        """Keep model and project identity visible before optional context usage."""
+        width = max(0, self._session.output.get_size().columns - 2)
+        model = self._state.get("model") or "—"
+        project = self._state.get("project") or "—"
+        home = str(Path.home())
+        if project == home or project.startswith(home + "/"):
+            project = "~" + project[len(home) :]
+        context = self._state.get("context")
+        full = f"{model} · {project}"
+        if context and get_cwidth(full + " · " + context) <= width:
+            full += " · " + context
+        if get_cwidth(full) > width:
+            available = max(0, width - 3)
+            basename_width = get_cwidth(Path(project).name or project)
+            reserved_project = min(basename_width, max(1, available // 2))
+            model_width = min(get_cwidth(model), max(1, available - reserved_project))
+            project_width = max(0, available - model_width)
+            # Keep the project basename/suffix when its parents don't fit.
+            if get_cwidth(project) > project_width:
+                tail = ""
+                for char in reversed(project):
+                    if get_cwidth(char + tail) > max(0, project_width - 1):
+                        break
+                    tail = char + tail
+                project = ("…" + tail) if project_width else ""
+            full = f"{_fit(model, model_width)} · {project}"
+        return [("class:rule", "  " + _fit(full, width))]
+
+    def session_footer(self) -> list:
+        """Reuse session identity while an approval selector owns the terminal."""
+        return self._environment_bar() + [("", "\n")] + self._bottom_bar(action="等待审批")
+
+    def _bottom_bar(self, action: str | None = None) -> list:
+        """Session identity on the left, mode and context-sensitive actions on the right."""
         state = self._state
-        left = []
-        for key in ("mode", "model", "context"):
-            if state.get(key):
-                left.append(str(state[key]))
-        if state.get("rules") is not None:
-            left.append(f"规则 {state['rules']}")
-        hint = self._hint if time.monotonic() < self._hint_until else KEY_HINTS
-        label = " · ".join([*left, hint])
-        width = shutil.get_terminal_size((100, 24)).columns
-        return [("class:rule", _rule(label, width))]
+        width = max(0, self._session.output.get_size().columns - 2)
+        busy = state.get("busy", False)
+        mode = state.get("mode", "normal")
+        if state.get("queue_paused"):
+            mode += f" · 队列暂停 {state.get('queued', 0)}"
+        elif state.get("queued"):
+            mode += f" · 已排队 {state['queued']} 条"
+        hint = "Enter to queue" if busy else KEY_HINTS
+        buffer = self._session.default_buffer
+        if buffer.complete_state:
+            hint = "Tab / Enter 选择 · Esc 关闭"
+        elif buffer.text.lstrip().startswith("/"):
+            command, _ = parse_command(buffer.text)
+            if command is not None:
+                hint = BUSY_HINTS[command.busy] if busy else command.usage
+        elif buffer.text and not busy:
+            hint = "Alt+Enter 换行"
+        elif state.get("queue_paused"):
+            hint = "/resume 恢复"
+        flashed = time.monotonic() < self._hint_until
+        if flashed:
+            hint = self._hint
+        if action is not None:
+            hint = action
+            flashed = True
+        topic = state.get("topic") or "新会话"
+        right = mode + " · " + hint
+        # Keep both session identity and an action visible on narrow terminals.
+        if not flashed and get_cwidth(right) + min(get_cwidth(topic), 12) + 2 > width:
+            hint = (
+                "Esc 关闭"
+                if buffer.complete_state
+                else "/resume"
+                if state.get("queue_paused")
+                else "Enter 排队"
+                if busy
+                else "/help"
+            )
+            right = mode + " · " + hint
+        reserve = 0 if flashed else min(8, width // 3) + 2
+        right = _fit(right, max(0, width - reserve))
+        left = _fit(topic, max(0, width - get_cwidth(right) - 2))
+        gap = max(0, width - get_cwidth(left + right))
+        return [("class:rule", "  " + left + " " * gap + right)]
 
     def _flash_hint(self, message: str) -> None:
         """临时提示占据状态栏右侧一小段时间。"""
@@ -211,11 +442,14 @@ class InputBox:
     # ---- 按键语义（抽出为方法，便于单测直接驱动 Buffer）----
 
     def _submit(self, buffer) -> None:
-        """Enter：补全菜单打开时选中补全项；否则末行提交、行中/续行换行。"""
+        """Enter：命令高亮补全直接执行；文件补全只插入；否则末行提交、行中换行。"""
         state = buffer.complete_state
         if state is not None and state.completions:
+            before = state.original_document.text
             buffer.apply_completion(state.current_completion or state.completions[0])
-            return
+            # 对齐 Claude Code：命令补全落到下方直接执行；文件等补全只插入。
+            if buffer.text != before and not before.startswith("/"):
+                return
         document = buffer.document
         if not (document.is_cursor_at_the_end and document.on_last_line):
             buffer.insert_text("\n")  # 光标在行中间/非末行：Enter 当换行用
@@ -224,12 +458,48 @@ class InputBox:
             buffer.delete_before_cursor(1)  # 经典续行：去掉反斜杠换行
             buffer.insert_text("\n")
             return
+        text = self._expand_pastes(buffer.text).strip()
+        if text.startswith("/"):
+            error = command_error(text, allow_picker=True)
+            if error:
+                self._flash_hint(error)
+                return
+            command, argument = parse_command(text)
+            choices = command.effective_choices() if command is not None else ()
+            if command is not None and choices and not argument:
+                # A picker inside the existing editor: no terminal handoff or
+                # session mutation until the user submits a complete command.
+                buffer.document = Document(command.name + " ")
+                completions = [
+                    Completion(
+                        value,
+                        display_meta=label
+                        + (" · 当前" if value == self._current_choice(command.name) else ""),
+                    )
+                    for value, label in choices
+                ]
+                # CompletionState 公开构造替掉 buffer._set_completions 私有 API
+                # （prompt_toolkit 3.0.53 验证）；complete_index=0 预选首项。
+                buffer.complete_state = CompletionState(buffer.document, completions, 0)
+                buffer.on_completions_changed.fire()
+                self._flash_hint("选择选项后 Enter 执行 · Esc 关闭")
+                return
         buffer.validate_and_handle()
+
+    def _current_choice(self, name: str) -> str:
+        if name == "/plan":
+            return "on" if self._state.get("mode") == "plan" else "off"
+        if name == "/models":
+            return self._state.get("profile") or ""
+        return self._state.get("permissions", "ask")
 
     def _on_cancel(self, buffer) -> None:
         """Ctrl+C：有文本先清空；空框 2 秒内双击退出（KeyboardInterrupt 上行）。"""
         if buffer.text:
             buffer.reset()
+            self._pastes.clear()
+            self._tokens.clear()
+            self._last_cancel = 0.0
             self._flash_hint("已清空（空框双击 Ctrl+C 退出）")
             return
         now = time.monotonic()
@@ -240,6 +510,7 @@ class InputBox:
 
     def _on_paste(self, data: str, buffer) -> None:
         """大段粘贴折叠为 ``[Pasted #N +M lines]``，提交时展开（见 ask）。"""
+        data = data.replace("\r\n", "\n").replace("\r", "\n")
         lines = len(data.splitlines())
         if lines <= PASTE_FOLD_THRESHOLD:
             buffer.insert_text(data)

@@ -1,35 +1,47 @@
-"""持久 shell 会话：跨多次工具调用保持环境状态（cwd、环境变量、后台进程）。
-
-一次性的 ``subprocess.run`` 每次调用都是全新进程——上次 ``cd`` 的目录、
-``export`` 的变量全部丢失，也无法启动 dev server 后回头读输出。持久会话
-维持一个常驻 bash 进程，命令通过 stdin 写入、输出经哨兵标记定界读回。
-
-实现要点：
-- 读线程把 stdout 逐行放进队列，命令执行以 ``echo <marker> $?`` 结尾定界；
-- ``output()`` 只取队列里现成的行（不等待），用于读后台/慢速输出；
-- 超时视为命令失控：终止整个会话（环境状态随之丢失），下次调用自动重启；
-- 命令必须是非交互的（不能等 stdin 输入），交互命令会一直等到超时。
-"""
+"""串行持久 bash：等待期限只控制返回，命令继续运行；完整输出保存在会话临时目录。"""
 
 from __future__ import annotations
 
+import os
 import queue
+import signal
 import subprocess
+import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 
-_MARKER_PREFIX = "__polya_done_"
+
+def preview(text: str, limit: int = 8000) -> str:
+    """保留头尾，尤其是测试结论与退出码；完整内容由日志入口回查。"""
+    if len(text) <= limit:
+        return text
+    half = (limit - 100) // 2
+    return text[:half] + "\n... [中段省略；用 bash_output 按行读取完整输出] ...\n" + text[-half:]
+
+
+@dataclass
+class Command:
+    id: int
+    marker: str
+    log: Path
+    code: str | None = None
 
 
 class ShellSession:
-    """一个常驻 bash 进程。线程不安全：同一会话的命令串行执行。"""
+    """同一会话只允许一个前台命令；run/output 由工具驱动串行调用。"""
 
     def __init__(self, cwd: str):
         self.cwd = cwd
         self._proc: subprocess.Popen | None = None
-        self._queue: queue.Queue[str] = queue.Queue()
+        self._queue: queue.Queue[str | None] = queue.Queue()
         self._reader: threading.Thread | None = None
+        self._directory: tempfile.TemporaryDirectory | None = None
+        self._commands: dict[int, Command] = {}
+        self._active: Command | None = None
 
     @property
     def alive(self) -> bool:
@@ -47,83 +59,162 @@ class ShellSession:
             text=True,
             errors="replace",
             bufsize=1,
+            start_new_session=os.name == "posix",
         )
         self._queue = queue.Queue()
-        self._reader = threading.Thread(target=self._drain, daemon=True)
+        # 捕获本次进程和队列，旧 reader 不得向重启后的新队列写 EOF。
+        self._reader = threading.Thread(
+            target=self._drain, args=(self._proc, self._queue), daemon=True
+        )
         self._reader.start()
 
-    def _drain(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
-        for line in self._proc.stdout:
-            self._queue.put(line)
-        # 进程退出时放一个 None 哨兵，让等待者不会永远阻塞
-        self._queue.put(None)
+    @staticmethod
+    def _drain(proc, sink) -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                sink.put(line)
+        finally:
+            sink.put(None)
+            proc.stdout.close()
 
     def run(
-        self,
-        command: str,
-        timeout: float = 10.0,
-        on_line: Callable[[str], None] | None = None,
+        self, command: str, timeout: float = 10.0, on_line: Callable[[str], None] | None = None
     ) -> str:
-        """执行命令并等待完成，返回 `输出\\n退出码 N` 格式的结果。
-
-        输出在前、退出码殿后（Claude Code 同序）：命令输出是主要信息，退出码
-        是收尾确认——模型与终端渲染（⎿ 树形块）都先看到正文。
-        ``on_line``：每收到一行输出就同步回调（在本方法调用者的线程里），供 UI
-        在命令运行期间实时展示；None 时零开销。
-        """
+        if not 0 <= timeout <= 300:
+            raise ValueError("timeout 应在 0–300 秒之间（只控制本次等待时间）")
+        if self._active is not None and self._active.code is None:
+            return f"Error: 命令 {self._active.id} 仍在运行；先 bash_output 等待或 kill_bash 终止。"
         self._ensure_started()
+        if self._directory is None:
+            self._directory = tempfile.TemporaryDirectory(prefix="polya-shell-")
+        identifier = len(self._commands) + 1
+        record = Command(
+            identifier,
+            f"\x1epolya_{uuid.uuid4().hex}",
+            Path(self._directory.name) / f"{identifier}.log",
+        )
+        record.log.touch(mode=0o600)
+        self._commands[identifier] = self._active = record
         assert self._proc is not None and self._proc.stdin is not None
-        marker = f"{_MARKER_PREFIX}{uuid.uuid4().hex[:8]}"
-        self._proc.stdin.write(f"{command}\necho {marker} $?\n")
+        # 随机哨兵可跟在无换行输出之后；不强行给真实输出加空行。
+        self._proc.stdin.write(f"{command}\nprintf '{record.marker} %s\\n' \"$?\"\n")
         self._proc.stdin.flush()
+        return self._collect(record, timeout, on_line)
 
-        lines: list[str] = []
-        exit_code: str | None = None
+    def _collect(
+        self, record: Command, timeout: float, on_line: Callable[[str], None] | None = None
+    ) -> str:
+        deadline = time.monotonic() + max(timeout, 0.02)
+        output = ""
+        with record.log.open("a", encoding="utf-8") as log:
+            while record.code is None:
+                try:
+                    wait = max(0, deadline - time.monotonic()) if timeout else 0
+                    line = self._queue.get(timeout=wait)
+                except queue.Empty:
+                    break
+                if line is None:
+                    assert self._proc is not None
+                    record.code = str(self._proc.wait())
+                    break
+                before, marker, after = line.partition(record.marker)
+                if before:
+                    log.write(before)
+                    output = preview(output + before)
+                    if on_line is not None:
+                        on_line(before.rstrip("\n"))
+                if marker:
+                    record.code = after.strip()
+                    break
+                if time.monotonic() >= deadline:
+                    break
+        status = (
+            f"退出码 {record.code}"
+            if record.code is not None
+            else "仍在运行；用 bash_output 等待，或 kill_bash 终止"
+        )
+        return f"[命令 {record.id}]\n{output.strip() or '(无新输出)'}\n{status}"
+
+    def output(
+        self,
+        timeout: float = 0,
+        command_id: int | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        offset: int = 0,
+    ) -> str:
+        if not 0 <= timeout <= 300:
+            raise ValueError("timeout 应在 0–300 秒之间")
+        record = self._commands.get(command_id) if command_id is not None else self._active
+        if record is None:
+            if command_id is not None:
+                raise ValueError("未知命令编号")
+            return "(暂无新输出)"
+        update = ""
+        if record.code is None:
+            update = self._collect(record, timeout)
+        if start_line is not None:
+            if start_line < 1 or offset < 0 or (end_line is not None and end_line < start_line):
+                raise ValueError("行号范围无效")
+            end = min(end_line or start_line + 199, start_line + 199)
+            lines = []
+            with record.log.open(encoding="utf-8") as log:
+                for i, line in enumerate(log, 1):
+                    if i > end:
+                        break
+                    if i >= start_line:
+                        lines.append(f"{i:>6}\t{line.rstrip()}")
+            status = f"退出码 {record.code}" if record.code is not None else "仍在运行"
+            text = "\n".join(lines)
+            more = (
+                f"\n[此行范围未读完；保持行范围并用 offset={offset + 8000} 继续]"
+                if len(text) > offset + 8000
+                else ""
+            )
+            return (
+                f"[命令 {record.id}; 行 {start_line}–{end}]\n"
+                f"{text[offset : offset + 8000]}{more}\n{status}"
+            )
+        if update:
+            return update
+        if command_id is not None:
+            return f"[命令 {record.id}]\n用 start_line=1 回查输出\n退出码 {record.code}"
+        # 已完成前台命令后仍支持显式后台进程的增量输出。
+        output = ""
         while True:
             try:
-                line = self._queue.get(timeout=timeout)
-            except queue.Empty:
-                self.kill()
-                return (
-                    f"[命令超时（{timeout:.0f} 秒），会话已终止；环境状态丢失，下次调用将自动重启。"
-                    "命令可能正在等待交互输入——请改用非交互命令]\n退出码 -"
-                )
-            if line is None:  # bash 进程已退出
-                output = "".join(lines).strip()
-                code = self._proc.returncode
-                return f"{output}\n退出码 {code}" if output else f"退出码 {code}"
-            if line.startswith(marker):
-                exit_code = line[len(marker) :].strip()
-                break
-            lines.append(line)
-            if on_line is not None:
-                on_line(line.rstrip("\n"))
-
-        output = "".join(lines).strip()
-        return f"{output}\n退出码 {exit_code}" if output else f"(无输出)\n退出码 {exit_code}"
-
-    def output(self) -> str:
-        """不等待地取走目前已产生的输出（后台/慢速命令的增量读取）。"""
-        lines: list[str] = []
-        while True:
-            try:
-                line = self._queue.get_nowait()
+                pending = self._queue.get_nowait()
             except queue.Empty:
                 break
-            if line is None:
-                lines.append("[会话进程已退出]")
+            if pending is None:
                 break
-            lines.append(line)
-        return "".join(lines).strip() or "(暂无新输出)"
+            output = preview(output + pending)
+        return output.strip() or "(暂无新输出)"
 
     def kill(self) -> None:
-        """终止会话进程（不影响下次 run 自动重启）。"""
+        """POSIX 下终止整个会话进程组（含子进程）；随后可重启。"""
         if self._proc is not None:
-            self._proc.kill()
             try:
-                self._proc.wait(timeout=2)  # 收尸，避免僵尸进程堆积
-            except subprocess.TimeoutExpired:  # pragma: no cover - kill 后几乎不会发生
+                if os.name == "posix":
+                    os.killpg(self._proc.pid, signal.SIGKILL)
+                else:
+                    self._proc.kill()
+            except ProcessLookupError:
                 pass
+            self._proc.wait(timeout=2)
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+            if self._active is not None and self._active.code is None:
+                self._collect(self._active, 1)
+                self._active.code = self._active.code or str(self._proc.returncode)
             self._proc = None
             self._reader = None
+
+    def __del__(self):
+        try:
+            self.kill()
+            if self._directory is not None:
+                self._directory.cleanup()
+        except Exception:
+            pass  # 解释器关闭时模块可能已卸载；显式 kill 仍报告错误。
