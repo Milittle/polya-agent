@@ -240,7 +240,6 @@ def test_kinds():
     by_name = {item.name: item for item in default_tools(".")}
     for name, kind in expected.items():
         assert by_name[name].kind == kind, name
-        assert by_name[name].dangerous == (kind != "read"), name  # 兼容视图随分类走
     # todo_write 可选启用，归类 read（外部记忆，无文件系统副作用）
     with_todos = {item.name: item.kind for item in default_tools(".", todos=TodoStore())}
     assert with_todos["todo_write"] == "read"
@@ -271,3 +270,16 @@ def test_tool_descriptions_carry_usage_guidance():
     for name, word in keywords.items():
         assert word in by_name[name].description, f"{name} 的描述缺少关键信息「{word}」"
         assert len(by_name[name].description) >= 30
+
+
+def test_read_only_tools_is_read_subset_without_shell():
+    """票 02：只读子集是真子集、全 kind=read、不含 shell 工具。"""
+    from polya.builtin import read_only_tools
+
+    readonly = read_only_tools(".")
+    names = {item.name for item in readonly}
+    full = {item.name for item in default_tools(".")}
+    assert names < full  # 真子集
+    assert all(item.kind == "read" for item in readonly)
+    assert not names & {"bash", "bash_output", "kill_bash", "write_file", "edit_file"}
+    assert names == {"read_file", "list_dir", "glob", "grep", "web_fetch"}

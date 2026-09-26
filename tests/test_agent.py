@@ -200,7 +200,12 @@ def test_usage_event_only_when_response_carries_usage():
     usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
     llm = ScriptedLLM([make_message(content="好")], usages=[usage])
     _, events = collect(Agent(llm=llm, tools=[add]), "hi")
-    expected = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    expected = {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "cached_tokens": 0,
+    }
     assert [event_payload(e) for e in events if e.event == "usage"] == [
         {"last": expected, "total": expected}
     ]
@@ -364,12 +369,27 @@ def test_usage_is_accumulated_and_reset_clears_it():
 
     agent.run("你好")
 
-    assert agent.last_usage == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-    assert agent.total_usage == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert agent.last_usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "cached_tokens": 0,
+    }
+    assert agent.total_usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "cached_tokens": 0,
+    }
 
     agent.reset()
     assert agent.last_usage is None
-    assert agent.total_usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    assert agent.total_usage == {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+    }
 
 
 def test_missing_usage_is_tolerated():
@@ -383,7 +403,12 @@ def test_missing_usage_is_tolerated():
 
     assert agent.run("1+1") == "2"
     assert agent.last_usage is None
-    assert agent.total_usage == {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    assert agent.total_usage == {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+    }
 
 
 # ---------------------------------------------------------------- 状态栏（书 2.6）

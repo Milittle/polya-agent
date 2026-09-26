@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from polya import Agent, tool
 from polya.cli import build_agent, main, parse_args
 from polya.loop import handle_command, terminal_approve
+from polya.models import ModelsConfig, Profile
 from polya.render import TerminalRenderer
 from polya.todos import TodoStore
 
@@ -83,12 +84,16 @@ def test_plan_toggle_without_registered_tool_warns():
     assert "未注册 exit_plan_mode" in result
 
 
-def test_reset_clears_session():
-    agent = make_agent(ScriptedLLM([make_message("好")]))
+def test_clear_new_and_reset_alias_clear_session():
+    agent = make_agent(ScriptedLLM([make_message("好"), make_message("好")]))
     agent.run("hi")
     agent.todos.rewrite([{"content": "任务", "status": "pending"}])
-    assert "已清空" in handle_command("/reset", agent)
+    assert "已清空" in handle_command("/clear", agent)
     assert agent.history == [] and len(agent.todos) == 0
+    agent.run("again")
+    assert "新会话" in handle_command("/new", agent)  # 非交互无会话级状态，仅清空
+    assert agent.history == []
+    assert "已清空" in handle_command("/reset", agent)  # 别名保持兼容
 
 
 def test_unknown_command():
@@ -99,13 +104,13 @@ def test_unknown_command():
 
 
 def test_terminal_approve_yes_no_always(monkeypatch):
-    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: 0)
+    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: 0)
     approve = terminal_approve(interactive=True)
     assert approve(add, {}) is True  # 只读工具直接放行，不询问
 
     # 选择列表下标：0 允许 / 1 总是允许 / 2 拒绝
-    answers = iter([2, 1])
-    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: next(answers))
+    answers = iter([3, 1])
+    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: next(answers))
     approve = terminal_approve(interactive=True)
     assert approve(write_thing, {"content": "x"}) is False  # 拒绝
     assert approve(write_thing, {"content": "y"}) is True  # 总是允许 → 放行
@@ -179,7 +184,7 @@ def test_expand_command_dispatches_to_renderer():
         {"name": "bash", "call_id": "c1", "result": "完整输出", "duration_s": 0.1, "error": False},
     )
     assert "完整输出" in handle_command("/expand", make_agent(), renderer)
-    assert "⏺ bash 结果全文" in handle_command("/expand 1", make_agent(), renderer)
+    assert "Ran Bash" in handle_command("/expand 1", make_agent(), renderer)
     # 无渲染器（非终端会话）：给出解释而不是炸
     assert "非终端" in handle_command("/expand", make_agent())
     assert "用法" in handle_command("/expand x", make_agent(), renderer)
@@ -194,20 +199,21 @@ def test_input_box_builds_multiline_session(tmp_path):
     assert isinstance(box._session, PromptSession)  # 多行/按键/占位由 pty 冒烟端到端验证
 
 
-def test_slugify_keeps_kebab_case_only():
-    from polya.loop import _slugify
+def test_topic_is_bounded_readable_and_has_no_control_characters():
+    from polya.loop import _topic_from
 
-    assert _slugify("`Fix-Login-Bug`\n") == "fix-login-bug"
-    assert _slugify("Count  README_words!") == "count-readme-words"
-    assert _slugify("中文输入无英文") == ""
+    assert _topic_from("Fix 输入框 / footer") == "Fix 输入框 / footer"
+    assert len(_topic_from("长" * 100)) == 48
+    assert all(char.isprintable() for char in _topic_from("hello\x1b\x07\nworld"))
 
 
 def test_topic_from_local_fallbacks():
     from polya.loop import _topic_from
 
-    assert _topic_from("Count README words") == "count-readme-words"
-    assert _topic_from("统计单词数") == "统计单词数"  # 纯中文退化为截断原文
-    assert _topic_from("") == "new-session"
+    assert _topic_from("Count README words") == "Count README words"
+    assert _topic_from("统计单词数") == "统计单词数"  # 中文与英文都保留自然语言
+    assert _topic_from("") == "新会话"
+    assert _topic_from("fix\n  输入框") == "fix 输入框"
 
 
 def test_rule_and_prompt_message_lay_out():
@@ -217,7 +223,7 @@ def test_rule_and_prompt_message_lay_out():
     assert _rule("", 6) == "──────"
     message = prompt_message({"topic": "count-readme-words"})
     text = "".join(fragment for _, fragment in message)
-    assert "✳ count-readme-words" in text and text.endswith("❯ ")
+    assert text == "❯ "
 
 
 def test_approve_cooperates_with_renderer_pause(monkeypatch):
@@ -227,7 +233,7 @@ def test_approve_cooperates_with_renderer_pause(monkeypatch):
     renderer.pause()
     renderer.resume()
 
-    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: 0)
+    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: 0)
     approve = terminal_approve(interactive=True, renderer=renderer)
     assert approve(write_thing, {"content": "x"}) is True
 
@@ -237,8 +243,8 @@ def test_approve_cooperates_with_renderer_pause(monkeypatch):
 
 def approve_and_capture(monkeypatch, capsys, root, name, arguments, choice=0):
     kind = "exec" if name == "bash" else "write"
-    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: choice)
-    monkeypatch.setattr("polya.loop._ask_line", lambda label, default=None: "")
+    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: choice)
+    monkeypatch.setattr("polya.approval._ask_line", lambda label, default=None: "")
     approve = terminal_approve(interactive=True, root=root)
     approved = approve(
         SimpleNamespace(name=name, kind=kind, dangerous=True, fn=None),
@@ -280,19 +286,19 @@ def test_approval_bash_shows_full_command(monkeypatch, tmp_path, capsys):
 def test_approval_reject_and_always(monkeypatch, tmp_path, capsys):
     # 四选项下标：bash = 0 允许 / 1 前缀授权 / 2 修改后执行 / 3 拒绝
     approved, _ = approve_and_capture(
-        monkeypatch, capsys, tmp_path, "bash", {"command": "ls"}, choice=3
+        monkeypatch, capsys, tmp_path, "bash", {"command": "ls -la"}, choice=4
     )
     assert approved is False
 
     approved, err = approve_and_capture(
-        monkeypatch, capsys, tmp_path, "bash", {"command": "ls"}, choice=1
+        monkeypatch, capsys, tmp_path, "bash", {"command": "ls -la"}, choice=1
     )
     assert approved is True
-    assert "不再询问" in err
+    assert "will not prompt again" in err
 
 
 def test_diff_lines_truncates_with_note():
-    from polya.loop import _diff_lines
+    from polya.approval import _diff_lines
 
     old = "\n".join(f"old{i}" for i in range(60))
     new = "\n".join(f"new{i}" for i in range(60))
@@ -302,7 +308,7 @@ def test_diff_lines_truncates_with_note():
 
 
 def test_apply_edits_draft_flags_future_failures():
-    from polya.loop import _apply_edits_draft
+    from polya.approval import _apply_edits_draft
 
     text = "alpha beta\n"
     draft, error = _apply_edits_draft(text, [{"old_string": "alpha", "new_string": "gamma"}])
@@ -313,3 +319,38 @@ def test_apply_edits_draft_flags_future_failures():
 
     draft, error = _apply_edits_draft("a a a", [{"old_string": "a", "new_string": "b"}])
     assert "不唯一" in error
+
+
+# ---------- 启动解析（票 14）：active profile 与旗标覆盖 ----------
+
+
+def test_build_agent_resolves_active_profile(tmp_path, monkeypatch):
+    path = tmp_path / "models.json"
+    config = ModelsConfig()
+    config.add(Profile("p", "https://x.example/v1", "sk-profile-key-1234", "m-x"))
+    config.save(path)
+    monkeypatch.setattr("polya.models.default_path", lambda: path)
+    agent = build_agent(parse_args(["--root", str(tmp_path)]))
+    assert agent.llm.model == "m-x" and agent.llm.profile_name == "p"
+    assert "x.example" in str(agent.llm.client.base_url)
+    assert agent.context_window == agent.profile.context_window
+
+
+def test_build_agent_flags_override_active_profile_fieldwise(tmp_path, monkeypatch):
+    path = tmp_path / "models.json"
+    config = ModelsConfig()
+    config.add(Profile("p", "https://x.example/v1", "sk-profile-key-1234", "m-x"))
+    config.save(path)
+    monkeypatch.setattr("polya.models.default_path", lambda: path)
+    agent = build_agent(parse_args(["--root", str(tmp_path), "--model", "flag-model"]))
+    assert agent.llm.model == "flag-model"
+    assert agent.llm.profile_name == "p"  # base_url/key 仍来自 profile
+    assert "x.example" in str(agent.llm.client.base_url)
+
+
+def test_main_reports_corrupt_models_config(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "models.json"
+    path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr("polya.models.default_path", lambda: path)
+    assert main(["--root", str(tmp_path)]) == 2
+    assert "配置错误" in capsys.readouterr().err

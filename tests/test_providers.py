@@ -28,3 +28,20 @@ def test_openai_style_models_allow_inplace_edit():
     """不回传 reasoning 的模型原地替换安全。"""
     for name in ("deepseek-chat", "gpt-4o", "qwen-max"):
         assert profile_for(name).supports_inplace_tool_edit is True, name
+
+
+def test_glm_prefix_splits_by_generation():
+    # glm-5 系 1M（z.ai 官方，2026-09 核实）；glm-4 系 200K。前缀表按代分层，
+    # "glm-5" 须声明在 "glm" 前（profile_for 按声明序首个命中）
+    assert profile_for("glm-5.3").context_window == 1_000_000
+    assert profile_for("glm-5.3-flash").context_window == 1_000_000
+    assert profile_for("glm-4.7").context_window == 200_000
+    assert profile_for("glm-4.6-air").context_window == 200_000
+
+
+def test_deepseek_flash_gets_1m_window_and_conservative_compaction():
+    # deepseek-flash（V4.1-Flash）：1M 窗口（官方 pricing 页）；thinking 默认开，
+    # 压缩保守走摘要重启（同 reasoner 档，宁保守不赌原地替换）
+    flash = profile_for("deepseek-flash")
+    assert flash.context_window == 1_000_000
+    assert flash.supports_inplace_tool_edit is False

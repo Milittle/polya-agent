@@ -22,23 +22,76 @@ tool content 的用 compact_messages，thinking 绑定前缀的用 compact_resta
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Protocol
 
+from .i18n import t
+
 COMPRESS_MARKER = "[COMPRESSED]"
+MICROCLEAR_MARKER = "[CLEARED]"
+MICRO_MIN_CHARS = 2000  # 微压缩只清理大于此长度的旧工具结果，避免噪声
 MAX_PIECE = 4000  # 单条 tool 内容进压缩请求前的截断阈值（保头尾）
 
-SUMMARY_SYSTEM_PROMPT = """\
-你负责压缩 Agent 对话历史中的工具结果。压缩原则：
 
-- 信息价值非均匀：关键决策、事实结论、文件路径、命令及其结果的价值高于过程
-  细节，高于冗余噪声（导航栏、重复提示语等直接舍弃）。
-- 语义完整性：名字、时间、数字、路径等关键信息一个都不能丢——"Sutskever 于
-  2024 年 5 月离开 OpenAI"不能压成"Sutskever 离开"。
-- 任务相关性：围绕当前任务取舍，对任务推进有用的细节保留，无关的舍去。
+def estimate_tokens(parts) -> int:
+    """轻量 token 估算：UTF-8 字节数 / 3，配合服务器 usage 校准实际用量。
 
-输出格式：对每一条输入，输出一段以 `#编号: ` 开头的摘要；多条输入涉及同一
-事实时，在最早出现的编号下合并表述。直接输出结果，不要寒暄与解释。"""
+    压缩的保留区预算按 token 计（消息条数是伪单位：一条 tool 结果可以是 100
+    也可以是 4 万 token），估算函数集中在这里，方便日后替换为真实 tokenizer。
+    """
+    payload = json.dumps(parts, ensure_ascii=False)
+    return len(payload.encode("utf-8")) // 3
+
+
+def effective_keep(history: list[dict], keep: int, keep_tokens: int | None) -> int:
+    """把 token 预算换算成保留区的消息条数（从末尾向前累积到预算为止）。
+
+    ``keep_tokens`` 为 None 时退回消息条数 ``keep``（兼容旧语义）。换算结果
+    不超过 ``keep`` 与历史长度，且至少保留 1 条（历史非空时）。
+    """
+    if keep_tokens is None or keep_tokens <= 0 or not history:
+        return keep
+    budget = 0
+    kept = 0
+    for message in reversed(history):
+        size = estimate_tokens(message)
+        if kept > 0 and budget + size > keep_tokens:
+            break
+        budget += size
+        kept += 1
+    return max(1, kept)
+
+
+def extract_file_operations(messages: list[dict]) -> tuple[set[str], set[str]]:
+    """从消息里的工具调用提取 (已读文件, 已改文件)，供压缩摘要累积追踪。
+
+    只认参数的 ``path`` 字段；解析失败或参数不是对象时跳过。read_file 计入
+    已读，write_file / edit_file / multi_edit 计入已改。
+    """
+    read_files: set[str] = set()
+    modified_files: set[str] = set()
+    writers = {"write_file", "edit_file", "multi_edit"}
+    for message in messages:
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            name = function.get("name")
+            if name not in (writers | {"read_file"}):
+                continue
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(arguments, dict):
+                continue
+            path = arguments.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            (modified_files if name in writers else read_files).add(path)
+    return read_files, modified_files
+
+
+SUMMARY_SYSTEM_PROMPT = t("prompt.summary")
 
 
 class _Chat(Protocol):
@@ -56,14 +109,17 @@ def _is_status_message(message: dict) -> bool:
 
 
 def compressible_indices(history: list[dict], keep: int) -> list[int]:
-    """可压缩的 tool 消息下标：保留区外、未带压缩标记（防重复处理）。"""
+    """可压缩的 tool 消息下标：保留区外、未带压缩标记（防重复处理）。
+
+    微压缩过的指针（``MICROCLEAR_MARKER``）不再进全量摘要——它已经是结论。
+    """
     boundary = len(history) - keep
     return [
         i
         for i, message in enumerate(history)
         if message.get("role") == "tool"
         and i < boundary
-        and not (message.get("content") or "").startswith(COMPRESS_MARKER)
+        and not (message.get("content") or "").startswith((COMPRESS_MARKER, MICROCLEAR_MARKER))
     ]
 
 
@@ -71,6 +127,63 @@ def stale_status_indices(history: list[dict], keep: int) -> list[int]:
     """可删除的旧状态栏下标：每轮重复的元信息是噪声，对噪声做摘要只是浪费。"""
     boundary = len(history) - keep
     return [i for i, message in enumerate(history) if _is_status_message(message) and i < boundary]
+
+
+def clearable_indices(
+    history: list[dict], keep: int, min_chars: int = MICRO_MIN_CHARS
+) -> list[int]:
+    """可微压缩的 tool 下标：保留区外、未带任何压缩标记、且内容足够长。
+
+    微压缩不调 LLM：直接把旧工具结果换成回查指针（读原文用 history_read）。
+    已在保留区、已压缩或过短的都不动。
+    """
+    boundary = len(history) - keep
+    targets: list[int] = []
+    for index, message in enumerate(history):
+        if message.get("role") != "tool" or index >= boundary:
+            continue
+        content = message.get("content") or ""
+        if content.startswith((MICROCLEAR_MARKER, COMPRESS_MARKER)):
+            continue
+        if len(content) >= min_chars:
+            targets.append(index)
+    return targets
+
+
+def microcompact(
+    history: list[dict],
+    keep: int,
+    snapshot: str,
+    min_chars: int = MICRO_MIN_CHARS,
+) -> tuple[list[dict], int] | None:
+    """微压缩：把大块旧工具结果换成 ``history_read`` 回查指针（无 LLM 调用）。
+
+    返回 ``(新历史, 清理字符数)``；没有候选时返回 None。指针文本含回查参数
+    （快照编号 + 消息编号，从 1 起）；纯替换——消息条数与 tool_call_id 配对不变。
+    原列表不动。
+    """
+    targets = clearable_indices(history, keep, min_chars)
+    if not targets:
+        return None
+    target_set = set(targets)
+    cleared_chars = 0
+    new_history: list[dict] = []
+    for index, message in enumerate(history):
+        if index in target_set:
+            original = message.get("content") or ""
+            cleared_chars += len(original)
+            new_history.append(
+                {
+                    **message,
+                    "content": (
+                        f"{MICROCLEAR_MARKER} 原始输出 {len(original)} 字符已清理；"
+                        f"回查原文：history_read(snapshot={snapshot!r}, message={index + 1})"
+                    ),
+                }
+            )
+        else:
+            new_history.append(message)
+    return new_history, cleared_chars
 
 
 def _parse_numbered(text: str, targets: list[int]) -> dict[int, str] | None:
@@ -118,17 +231,24 @@ def render_conversation(messages: list[dict]) -> str:
 def find_restart_split(history: list[dict], keep: int) -> int | None:
     """摘要重启的安全切点：history[:i] 压成一条摘要，history[i:] 原样保留。
 
-    切点必须是 user 消息（我们的循环总是回填完所有 tool_call 才进下一轮，
-    中断也有补齐，故「下一条是 user」保证之前是完整轮结束，tool 链不悬空）。
-    从目标位置向后找，保留更多、压得更少（保守侧）。历史太短（保留区盖住
-    几乎全部）时返回 None，不做无意义的折叠。
+    切点之前至少有一条 assistant，且全部工具调用已回填；尾部不以 tool 开始。
+    从目标位置向后找完整轮边界，避免在同批工具结果中间切断；没有合适边界则跳过。
     """
     target = len(history) - keep
     if target < 1:
         return None
-    for i in range(target, len(history)):
-        if history[i].get("role") == "user":
+    pending: set[str] = set()
+    seen_assistant = False
+    for i, message in enumerate(history):
+        if i >= target and seen_assistant and not pending and message.get("role") != "tool":
             return i
+        if message.get("role") == "assistant":
+            seen_assistant = True
+            pending.update(c["id"] for c in message.get("tool_calls", []))
+        elif message.get("role") == "tool":
+            pending.discard(message.get("tool_call_id", ""))
+    if keep == 0 and seen_assistant and not pending:
+        return len(history)
     return None
 
 
@@ -137,6 +257,7 @@ def compact_restart(
     history: list[dict],
     keep: int,
     query: str,
+    previous_summary: str | None = None,
 ) -> list[dict] | None:
     """摘要重启（书 2.7 对 thinking 绑定模型的推荐方案）。
 
@@ -152,9 +273,18 @@ def compact_restart(
         {
             "role": "user",
             "content": (
-                f"当前任务：{query}\n\n以下是一段 Agent 对话历史，"
+                f"当前任务：{query}\n\n"
+                + (
+                    f"上一版摘要（迭代压缩：请在其基础上合并更新，不要丢失其中仍然有效的信息）：\n"
+                    f"{previous_summary}\n\n"
+                    if previous_summary
+                    else ""
+                )
+                + f"以下是一段 Agent 对话历史，"
                 f"请压缩成一份结构化摘要（保留关键决策、约束及其理由、已排除的"
-                f"失败路径、文件路径与结论性输出）。\n\n{render_conversation(history[:split])}"
+                f"失败路径、文件路径与结论性输出）。按目标与验收、用户约束、已改文件、"
+                f"验证证据、失败路径、技能、未完成事项与下一步组织。\n\n"
+                f"{render_conversation(history[:split])}"
             ),
         },
     ]
@@ -170,7 +300,9 @@ def compact_restart(
             "</session_summary>"
         ),
     }
-    return [summary_message, *history[split:]]
+    # 重启后尾部 reasoning 也不再具有原前缀，保留正文与工具链，丢弃旧推理字段。
+    tail = [{k: v for k, v in m.items() if k != "reasoning_content"} for m in history[split:]]
+    return [summary_message, *tail]
 
 
 def compact_messages(
@@ -178,6 +310,7 @@ def compact_messages(
     history: list[dict],
     keep: int,
     query: str,
+    previous_summary: str | None = None,
 ) -> list[dict] | None:
     """压缩历史并返回新列表（原列表不动）；没有可压消息时返回 None。
 
@@ -203,13 +336,21 @@ def compact_messages(
             "role": "user",
             "content": (
                 f"当前任务：{query}\n\n"
-                f"以下是 Agent 历史中的 {len(targets)} 条工具结果，请逐条压缩：\n\n"
+                + (
+                    f"上一版摘要（迭代压缩：并入仍需保留的信息，不要重复已丢弃的细节）：\n"
+                    f"{previous_summary}\n\n"
+                    if previous_summary
+                    else ""
+                )
+                + f"以下是 Agent 历史中的 {len(targets)} 条工具结果，请逐条压缩：\n\n"
                 + "\n\n".join(pieces)
             ),
         },
     ]
     response = llm.chat(request, tools=None)
     summary_text = response.choices[0].message.content or ""
+    if not summary_text.strip():
+        raise RuntimeError("压缩调用返回空摘要，保留原始历史")
 
     summaries = _parse_numbered(summary_text, targets)
     merged_into_earliest: set[int] = set()

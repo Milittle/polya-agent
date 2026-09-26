@@ -6,459 +6,123 @@
 - 工具执行权在本层（executor 共用）；bash 实时输出经 ``default_tools(
   on_shell_output=)`` 的 tap 直喂渲染器（装配在 cli.build_agent）——执行期流是
   驱动层事务，不是引擎旁路。
-- 中断分级：任务执行中 Ctrl+C 捕获后 ``gen.close()``，agent 在 GeneratorExit
-  路径回填未决 ToolCall（历史完整可续）；输入处 Ctrl+C 双击 / Ctrl+D 退出。
+- 常驻交互：Esc 在事件边界关闭生成器并回填未决工具；Ctrl+C 专职输入框。
+  审批通过握手借用输入，完成后恢复草稿；非交互仍走内置驱动。
 """
 
 from __future__ import annotations
 
-import difflib
+import asyncio
 import os
-import re
 import subprocess
 import sys
+import threading
+import time
+from collections import deque
+from collections.abc import Callable
+from importlib.metadata import version
 from pathlib import Path
 
-from prompt_toolkit.application import Application
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout, Window
-from prompt_toolkit.layout.controls import FormattedTextControl
-from prompt_toolkit.styles import Style
-from rich.console import Group
+from prompt_toolkit.patch_stdout import patch_stdout
+from rich.console import Console
 from rich.markdown import Markdown
-from rich.panel import Panel
 from rich.text import Text
 
-from .agent import Agent, PlanSubmitted, ToolCall, event_payload
+from .agent import Agent, Iteration, PlanSubmitted, ToolCall, event_payload
+from .approval import (
+    ApprovalGate,
+    ApprovalOutcome,  # noqa: F401 - compatibility import
+    ApprovalRejected,
+    terminal_approve,  # noqa: F401 - compatibility import
+    terminal_approve_plan,  # noqa: F401 - compatibility import
+)
+from .commands import (
+    BUSY_HINTS,
+    HELP_TEXT,  # noqa: F401 - compatibility import
+    CommandContext,
+    command_error,
+    dispatch_command,
+    handle_command,  # noqa: F401 - compatibility import
+    parse_command,
+)
 from .executor import execute
-from .input import InputBox
-from .permissions import Context, Rule, decide, rule_for
-from .render import TerminalRenderer, console, ui
-from .todos import _STATUS_LABELS
-from .tools import Tool
-
-HELP_TEXT = """\
-命令：
-  /help            显示本帮助
-  /todos           显示当前 TODO 清单
-  /status          显示会话状态（模式 / 历史 / 工具计数 / token 用量）
-  /plan on|off     开启/关闭规划模式（只读约束 + 计划审批）
-  /expand [N]      展开最近 N 块（默认 5）的工具结果 / 思考全文
-  /reset           清空对话历史、TODO 与统计
-  /exit, /quit     退出（输入处 Ctrl+D / Ctrl+C 双击同效）"""
-
-
-def handle_command(cmd: str, agent: Agent, renderer: TerminalRenderer | None = None) -> str | None:
-    """处理一条斜杠命令，返回要打印的文本；返回 ``None`` 表示退出 REPL。"""
-    name, _, arg = cmd.partition(" ")
-    arg = arg.strip()
-    if name in ("/exit", "/quit"):
-        return None
-    if name == "/help":
-        return HELP_TEXT
-    if name == "/todos":
-        items = agent.todos.as_dicts()
-        if not items:
-            return "（TODO 清单为空）"
-        # 状态标签与状态栏（status.py）同源中文，两处展示不打架
-        return "\n".join(
-            f"[{index}] [{_STATUS_LABELS[item['status']]}] {item['content']}"
-            for index, item in enumerate(items, 1)
-        )
-    if name == "/status":
-        mode = "规划中（只读）" if agent.plan_mode else "执行"
-        calls = dict(agent.tool_counts)
-        return "\n".join(
-            [
-                f"模式: {mode}",
-                f"历史消息: {len(agent.history)} 条",
-                f"工具调用: {calls if calls else '（无）'}",
-                f"token 用量: {agent.total_usage}",
-            ]
-        )
-    if name == "/plan":
-        if arg == "on":
-            agent.plan_mode = True
-            if agent.tools.get("exit_plan_mode") is None:
-                return "已进入规划模式（注意：未注册 exit_plan_mode 工具，计划无法提交批准）。"
-            return "已进入规划模式：只读探查，模型完成计划后会调用 exit_plan_mode 提交。"
-        if arg == "off":
-            agent.plan_mode = False
-            return "已退出规划模式。"
-        return "用法: /plan on|off"
-    if name == "/expand":
-        try:
-            count = int(arg) if arg else 5
-        except ValueError:
-            return "用法: /expand [N]（N 为块数，默认 5）"
-        if renderer is None:
-            return "（非终端会话不记录块，无法展开）"
-        return renderer.expand_blocks(count)
-    if name == "/reset":
-        agent.reset()
-        return "已清空对话历史、TODO 与统计。"
-    return f"未知命令 {name}，/help 查看可用命令。"
-
-
-def _select_option(
-    options: list[tuple[str, str]], *, cancel_index: int, initial: int | None = None
-) -> int:
-    """渲染一个 ``❯`` 单选列表：↑/↓ 移动、Enter 确认、数字键直达、Esc 取消。
-
-    与主输入框同为 prompt_toolkit，同一套 ``❯`` 视觉语言。每个选项是
-    ``(标签, 说明)``；``cancel_index`` 是 Esc/EOF 的落点。Ctrl+C 照旧抛
-    KeyboardInterrupt（沿 run 循环的中断分级）。
-    """
-    state = {"index": cancel_index if initial is None else initial}
-
-    def fragments():
-        rows = []
-        for index, (label, desc) in enumerate(options):
-            selected = index == state["index"]
-            marker = "❯ " if selected else "  "
-            rows.append(
-                ("class:selected" if selected else "class:option", f"{marker}{index + 1}. {label}")
-            )
-            if desc:
-                rows.append(("class:desc", f" — {desc}"))
-            rows.append(("", "\n"))
-        rows.append(("class:desc", "↑/↓ 选择 · Enter 确认 · 数字直达 · Esc 取消"))
-        return rows
-
-    bindings = KeyBindings()
-
-    def choose(index: int):
-        def handler(event):
-            state["index"] = index
-            event.app.exit(result=index)
-
-        return handler
-
-    for index in range(len(options)):
-        bindings.add(str(index + 1))(choose(index))
-
-    @bindings.add("up")
-    def _up(event):
-        state["index"] = (state["index"] - 1) % len(options)
-
-    @bindings.add("down")
-    def _down(event):
-        state["index"] = (state["index"] + 1) % len(options)
-
-    @bindings.add("enter")
-    def _enter(event):
-        event.app.exit(result=state["index"])
-
-    @bindings.add("escape")
-    def _escape(event):
-        state["index"] = cancel_index
-        event.app.exit(result=cancel_index)
-
-    app = Application(
-        layout=Layout(Window(FormattedTextControl(fragments, show_cursor=False))),
-        key_bindings=bindings,
-        style=Style.from_dict(
-            {"selected": "bold cyan", "option": "", "desc": "fg:ansibrightblack"}
-        ),
-        full_screen=False,
-    )
-    try:
-        return app.run()
-    except EOFError:
-        return cancel_index
-
-
-def _apply_edits_draft(text: str, edits: list[dict]) -> tuple[str, str | None]:
-    """在内存里模拟 multi_edit（语义与 builtin 一致）：返回 (草稿, 失败原因)。
-
-    失败原因非 None 时真实执行也会失败——预览照给（diff 仍展示已可确定的部分），
-    但把失败处明确标出，不制造「批准了却没执行」的错觉。
-    """
-    draft = text
-    for index, edit in enumerate(edits, 1):
-        old = str(edit.get("old_string", ""))
-        new = str(edit.get("new_string", ""))
-        if not old:
-            return draft, f"第 {index} 处编辑缺少 old_string"
-        count = draft.count(old)
-        if count == 0:
-            return draft, f"第 {index} 处编辑未找到 old_string（执行将失败）"
-        if count > 1 and not edit.get("replace_all"):
-            return draft, f"第 {index} 处 old_string 出现 {count} 次，不唯一（执行将失败）"
-        draft = draft.replace(old, new) if edit.get("replace_all") else draft.replace(old, new, 1)
-    return draft, None
-
-
-def _diff_lines(old: str, new: str, path: str, max_lines: int = 40) -> list[str]:
-    """行级 unified diff（上下文 2 行）：红删绿增的原料，超长截断并标注。"""
-    diff = list(
-        difflib.unified_diff(
-            old.splitlines(),
-            new.splitlines(),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            lineterm="",
-            n=2,
-        )
-    )
-    if not diff:
-        return ["（内容无变化）"]
-    if len(diff) > max_lines:
-        diff = diff[:max_lines] + [f"… 还有 {len(diff) - max_lines} 行未显示（批准后执行完整变更）"]
-    return diff
-
-
-def _approval_body(name: str, arguments: dict, root: Path | None) -> list[Text]:
-    """审批面板正文：写类工具给 diff、bash 给完整命令、其余兜底参数预览。"""
-    if name == "bash" and arguments.get("command") is not None:
-        lines = [f"$ {part}" for part in str(arguments["command"]).splitlines() or [""]]
-        if len(lines) > 8:
-            lines = lines[:8] + [f"… 还有 {len(lines) - 8} 行"]
-        return [Text(line, style="yellow") for line in lines]
-    if name in ("write_file", "edit_file", "multi_edit") and root is not None:
-        path = str(arguments.get("path", ""))
-        body: list[Text] = []
-        try:
-            target = (root / path).resolve()
-            if not target.is_relative_to(root):
-                return [Text(f"路径越界，将被拒绝：{path}", style="red")]
-            old = target.read_text(encoding="utf-8") if target.is_file() else ""
-        except (OSError, UnicodeDecodeError):
-            return [Text("（无法读取原文件，diff 预览不可用）", style="dim")]
-        error = None
-        if name == "write_file":
-            new = str(arguments.get("content", ""))
-        elif name == "edit_file":
-            new, error = _apply_edits_draft(
-                old,
-                [
-                    {
-                        "old_string": arguments.get("old_string", ""),
-                        "new_string": arguments.get("new_string", ""),
-                        "replace_all": arguments.get("replace_all", False),
-                    }
-                ],
-            )
-        else:
-            edits = arguments.get("edits") if isinstance(arguments.get("edits"), list) else []
-            new, error = _apply_edits_draft(old, edits)
-        if error:
-            body.append(Text(error, style="red"))
-        diff = _diff_lines(old, new, path)
-        body.extend(
-            Text(
-                line,
-                style="green"
-                if line.startswith("+")
-                else "red"
-                if line.startswith("-")
-                else "cyan"
-                if line.startswith("@")
-                else None,
-            )
-            for line in diff
-        )
-        return body
-    preview = str(arguments)
-    if len(preview) > 120:
-        preview = preview[:120] + "…"
-    return [Text(f"{name}({preview})")]
-
-
-def _ask_line(label: str, default: str | None = None) -> str:
-    """审批辅助输入行（拒绝理由 / 修改命令）。独立函数便于测试替身。"""
-    from prompt_toolkit import prompt
-
-    try:
-        return prompt(label, default=default or "")
-    except (EOFError, KeyboardInterrupt):
-        return default or ""
-
-
-class ApprovalOutcome:
-    """一次审批的结果：放行与否 + 可能的规则 / 改写命令 / 拒绝理由。"""
-
-    def __init__(
-        self,
-        approved: bool,
-        rule: Rule | None = None,
-        command: str | None = None,
-        reason: str | None = None,
-    ):
-        self.approved = approved
-        self.rule = rule
-        self.command = command
-        self.reason = reason
-
-
-class ApprovalGate:
-    """会话审批闸门（spec「审批交互」）：四选项、默认拒绝、会话级授权规则累积。
-
-    光标默认停在「拒绝」——Enter 单按绝不放行；高危不给前缀授权出口（Q9）；
-    修改后执行仅 bash（Q13）；复合命令 / 无法取前缀的工具不给选项 2（Q14/Q18）。
-    """
-
-    def __init__(
-        self,
-        interactive: bool,
-        renderer: TerminalRenderer | None = None,
-        root: str | os.PathLike[str] | None = None,
-    ):
-        self.interactive = interactive
-        self.renderer = renderer
-        self.root_path = Path(root).resolve() if root is not None else None
-        self.rules: list[Rule] = []
-
-    def screen(self, tool: Tool, arguments: dict, high_risk: bool = False) -> ApprovalOutcome:
-        """渲染变更预览并弹四选项；非交互环境预览后直接拒绝。"""
-        if not self.interactive:
-            ui.print(
-                Panel(
-                    Group(*_approval_body(tool.name, arguments, self.root_path)),
-                    title="非交互环境，默认拒绝",
-                    border_style="red",
-                )
-            )
-            return ApprovalOutcome(approved=False)
-
-        rule = None if high_risk else rule_for(tool, arguments)
-        can_modify = tool.kind == "exec" and isinstance(arguments.get("command"), str)
-        # 动态选项表：高危不给授权出口（Q9）；取不出前缀不给（Q14/Q18）
-        options: list[tuple[str, str]] = [("允许", "执行本次调用")]
-        if rule is not None:
-            options.append(("本会话前缀授权", f"{rule} 起不再询问"))
-        if can_modify:
-            options.append(("修改后执行", "预填原命令，改完执行（仅 bash）"))
-        deny_index = len(options)
-        options.append(("拒绝", "不执行，让模型调整方案（可附理由）"))
-
-        if self.renderer is not None:
-            self.renderer.pause()
-        try:
-            ui.print(
-                Panel(
-                    Group(*_approval_body(tool.name, arguments, self.root_path)),
-                    title="危险工具执行审批",
-                    border_style="yellow",
-                )
-            )
-            choice = _select_option(options, cancel_index=deny_index, initial=deny_index)
-        finally:
-            if self.renderer is not None:
-                self.renderer.resume()
-
-        if choice == 0:
-            return ApprovalOutcome(approved=True)
-        if rule is not None and choice == 1:
-            return ApprovalOutcome(approved=True, rule=rule)
-        if can_modify and choice == (2 if rule is not None else 1):
-            modified = _ask_line("修改命令: ", default=str(arguments["command"]))
-            return ApprovalOutcome(approved=bool(modified.strip()), command=modified.strip())
-        reason = _ask_line("拒绝理由（回车跳过）: ").strip() or None
-        return ApprovalOutcome(approved=False, reason=reason)
-
-    def as_approve(self):
-        """兼容 approve(tool, arguments) -> bool 钩子（内置驱动 run() 用）：
-        非交互即预览+拒绝，交互路径正常四选项（规则入会话集）。"""
-
-        def approve(tool: Tool, arguments: dict) -> bool:
-            if not tool.dangerous:
-                return True
-            if any(r.matches(tool, arguments) for r in self.rules):
-                return True
-            outcome = self.screen(tool, arguments)
-            if outcome.rule is not None:
-                self.rules.append(outcome.rule)
-                ui.print(f"本会话内 {outcome.rule} 起不再询问", style="dim")
-            if not outcome.approved and outcome.reason:
-                ui.print(f"理由：{outcome.reason}", style="dim")
-            return outcome.approved
-
-        return approve
-
-
-def terminal_approve(
-    interactive: bool,
-    renderer: TerminalRenderer | None = None,
-    root: str | os.PathLike[str] | None = None,
-):
-    """构建终端审批回调（旧签名兼容，内置驱动 run() / -p 模式用）。
-
-    询问前 ``renderer.pause()``、结束后 ``resume()``：阻塞输入期间若刷新
-    线程仍在重绘，状态行会盖住用户正在交互的那一行。
-    """
-    return ApprovalGate(interactive, renderer, root).as_approve()
-
-
-def terminal_approve_plan(interactive: bool, renderer: TerminalRenderer | None = None):
-    """构建计划审批回调：打印计划全文后弹出选择列表。非交互环境默认拒绝（--yes 可全自动）。"""
-
-    def approve_plan(plan: str) -> bool:
-        if not interactive:
-            ui.print("非交互环境，默认拒绝计划；用 --yes 自动批准", style="red")
-            return False
-        if renderer is not None:
-            renderer.pause()
-        try:
-            ui.print(Panel(Markdown(plan), title="执行计划", border_style="cyan"))
-            choice = _select_option(
-                [
-                    ("批准", "按计划进入执行模式（写操作仍受审批）"),
-                    ("拒绝", "继续规划，修改后重新提交"),
-                ],
-                cancel_index=1,
-            )
-        finally:
-            if renderer is not None:
-                renderer.resume()
-        return choice == 0
-
-    return approve_plan
-
+from .filefind import ProjectFiles
+from .input import InputBox, InputSuspended
+from .render import TerminalRenderer, console
 
 # ---------- 生成器驱动 ----------
+
+
+def _result_summary(result: str, duration: float, limit: int = 80) -> str:
+    first = result.strip().splitlines()[0] if result.strip() else ""
+    if len(first) > limit:
+        first = first[: limit - 1] + "…"
+    return f"{first} · {round(duration, 2)}s"
+
+
+def run_tool_call(
+    agent: Agent,
+    renderer: TerminalRenderer | None,
+    ev: ToolCall,
+    interactive: bool,
+    gate: ApprovalGate,
+    *,
+    unrestricted: bool | None = None,
+    origin: str | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> str:
+    """一次工具调用的驱动侧处理：渲染 → decide → 审批 → 执行 → 渲染结果。
+
+    ``progress`` 为 None（父会话）：三个渲染事件全发，与旧行为逐字节相同。非 None
+    （子代理路径）：不发渲染事件（不抢单槽、不进滚动区），改用 ``progress`` 输出
+    进度行与结果摘要；审批仍走同一 gate，``unrestricted`` 由调用方显式传父会话取值。
+    """
+    if unrestricted is None:
+        unrestricted = agent.approve is None
+    if progress is None and renderer is not None:
+        renderer.update("tool_review", event_payload(ev))
+    item = agent.tools.get(ev.name)
+    approved = False
+    if item is None:
+        result, duration = f"Error: unknown tool '{ev.name}'", 0.0
+    else:
+        outcome = gate.authorize(
+            item,
+            ev.arguments,
+            plan=agent.plan_mode,
+            unrestricted=unrestricted,
+            interactive=interactive,
+            origin=origin,
+        )
+        approved = outcome.approved
+        if outcome.approved:
+            if progress is None and renderer is not None:
+                renderer.update("tool_call", {**event_payload(ev), "arguments": outcome.arguments})
+            result, duration = execute(item, outcome.arguments or {})
+        else:
+            result, duration = outcome.reason or "Error: Tool call denied", 0.0
+    if progress is not None:
+        progress(f"← {ev.name} {_result_summary(result, duration)}")
+    elif renderer is not None:
+        renderer.update(
+            "tool_result",
+            {
+                "name": ev.name,
+                "call_id": ev.call_id,
+                "result": result,
+                "duration_s": round(duration, 3),
+                "error": result.startswith("Error"),
+                "denied": item is not None and not approved,
+            },
+        )
+    return result
 
 
 def _run_tool(
     agent: Agent, renderer: TerminalRenderer, ev: ToolCall, interactive: bool, gate: ApprovalGate
 ) -> str:
-    """一次工具调用的驱动侧处理：渲染 → decide → 审批 → 执行 → 渲染结果。"""
-    renderer.update("tool_call", event_payload(ev))
-    item = agent.tools.get(ev.name)
-    if item is None:
-        result, duration = f"Error: unknown tool '{ev.name}'", 0.0
-    else:
-        decision = decide(
-            item, ev.arguments, Context(plan=agent.plan_mode, rules=tuple(gate.rules))
-        )
-        if decision.verdict == "deny":
-            result, duration = decision.reason, 0.0
-        elif decision.verdict == "ask" and interactive and item.dangerous:
-            outcome = gate.screen(item, ev.arguments, high_risk=(decision.reason == "high-risk"))
-            if outcome.rule is not None:
-                gate.rules.append(outcome.rule)
-                ui.print(f"本会话内 {outcome.rule} 起不再询问", style="dim")
-            if not outcome.approved:
-                suffix = f"：{outcome.reason}" if outcome.reason else ""
-                result, duration = f"Error: 用户拒绝了工具调用 {ev.name}{suffix}", 0.0
-            else:
-                arguments = dict(ev.arguments)
-                if outcome.command is not None:  # 修改后执行（Q13：仅 bash）
-                    arguments["command"] = outcome.command
-                result, duration = execute(item, arguments)
-        else:
-            result, duration = execute(item, ev.arguments)
-    renderer.update(
-        "tool_result",
-        {
-            "name": ev.name,
-            "call_id": ev.call_id,
-            "result": result,
-            "duration_s": round(duration, 3),
-            "error": result.startswith("Error"),
-        },
-    )
-    return result
+    """父会话薄包装：进度渲染走原有三事件路径（测试直接 import 本函数）。"""
+    return run_tool_call(agent, renderer, ev, interactive, gate)
 
 
 def run_task(
@@ -467,6 +131,9 @@ def run_task(
     text: str,
     interactive: bool,
     gate: ApprovalGate | None = None,
+    *,
+    stop: threading.Event | None = None,
+    on_boundary=None,
 ) -> None:
     """消费一次 ``steps()``：事件转发渲染器，ToolCall/PlanSubmitted 就地处理。
 
@@ -475,40 +142,50 @@ def run_task(
     """
     if gate is None:
         gate = ApprovalGate(interactive)
+    gate.rejected_reason = None
     gen = agent.steps(text)
     to_send = None
     try:
         with renderer:
             while True:
+                if stop is not None and stop.is_set() and to_send is None:
+                    raise InterruptedError("用户请求中断")
                 try:
                     ev = gen.send(to_send)
                 except StopIteration:
+                    if gate.rejected_reason is not None:
+                        raise ApprovalRejected(gate.rejected_reason) from None
                     return
+                except RuntimeError:
+                    if gate.rejected_reason is not None:
+                        raise ApprovalRejected(gate.rejected_reason) from None
+                    raise
                 to_send = None
-                if isinstance(ev, ToolCall):
+                if gate.rejected_reason is not None:
+                    raise ApprovalRejected(gate.rejected_reason)
+                if stop is not None and stop.is_set():
+                    raise InterruptedError("用户请求中断")
+                if isinstance(ev, Iteration) and on_boundary is not None:
+                    renderer.update(ev.event, event_payload(ev))
+                    to_send = on_boundary()
+                elif isinstance(ev, ToolCall):
                     to_send = _run_tool(agent, renderer, ev, interactive, gate)
                 elif isinstance(ev, PlanSubmitted):
+                    renderer.update("plan_approval", {})
                     to_send = agent._handle_plan(ev.plan)
+                    renderer.update("plan_result", {"approved": not agent.plan_mode})
+                    if agent.plan_mode:
+                        gate.rejected_reason = "用户拒绝了计划"
                 else:
                     renderer.update(ev.event, event_payload(ev))
     finally:
         gen.close()
 
 
-def _slugify(text: str, max_len: int = 48) -> str:
-    """压成 kebab-case slug：小写、只留 [a-z0-9-]、空白/标点归并为分隔符。"""
-    text = re.sub(r"[^a-z0-9\s-]", " ", text.lower())
-    text = re.sub(r"[\s-]+", "-", text).strip("-")
-    return text[:max_len].rstrip("-")
-
-
 def _topic_from(first_input: str) -> str:
-    """从首个任务**本地**推断会话主题：slug 化用户输入，纯中文退化为截断原文。
-
-    不为此调 LLM——发布级产品不在首任务里藏一次隐性额外请求（延迟与费用
-    都不可见）。主题只是装饰，绝不影响会话。
-    """
-    return _slugify(first_input) or first_input.strip().replace("\n", " ")[:24] or "new-session"
+    """A readable local provisional topic; never make an extra model request."""
+    text = " ".join(first_input.split())
+    return "".join(char for char in text if char.isprintable())[:48] or "新会话"
 
 
 def _run_shell_bang(agent: Agent, root: str, command: str, say) -> None:
@@ -539,74 +216,406 @@ def _append_project_memory(root: str, text: str, say) -> None:
     say(f"已记入 {path}", "dim")
 
 
-def run_repl(agent: Agent, root: str, renderer: TerminalRenderer) -> None:
-    """交互主循环：斜杠命令 / ``!`` shell / ``#`` 记忆本地处理，其余交给 agent。
+def print_welcome(root: str, model: str, output: Console) -> None:
+    path = str(Path(root).resolve())
+    home = str(Path.home())
+    if path == home or path.startswith(home + os.sep):
+        path = "~" + path[len(home) :]
+    output.set_window_title("polya")
+    output.print(Text(f"  polya · v{version('polya')}", style="bold cyan"))
+    output.print(Text("  和你一起理解问题、制定计划、完成验证", style="dim"))
+    output.print()
+    output.print(Text(f"  {path} · {model}", style="dim"), overflow="ellipsis", no_wrap=True)
+    output.print(Text("  /help 查看命令\n", style="dim"))
 
-    **tty 分流**：终端下渲染器消费 ``steps()`` 事件流实时渲染，滚动区与
-    live 区统一走 ``ui`` 控制台；非终端下走内置驱动 ``run()``，答案只走
-    stdout（``console``），可安全管道。异常兜底 ``Exception``：API/网络错误
-    只报本次任务，REPL 必须存活。
+
+class InteractiveSession:
+    """输入在主事件循环运行；一个 worker 独占 agent 和命令执行。
+
+    审批通过握手借用终端，主输入退出后才允许审批读 stdin。
+    普通消息在下一模型调用前注入；会重置或结束会话的命令等当前任务收尾。
     """
-    interactive = sys.stdin.isatty()
-    box = InputBox() if interactive else None
-    gate = ApprovalGate(interactive, renderer, root)
-    state: dict = {"topic": None, "model": agent.llm.model}  # 输入框状态栏数据
-    if interactive:
-        if ui.is_terminal:
-            ui.set_window_title("polya")
 
-    def say(message: str, style: str) -> None:
-        if interactive:
-            ui.print(message, style=style, markup=False)
-        else:
-            console.print(message, style=style, markup=False)
+    def __init__(self, agent: Agent, root: str, renderer: TerminalRenderer, box: InputBox):
+        self.agent, self.root, self.renderer, self.box = agent, root, renderer, box
+        self.pending: deque[str] = deque()
+        self.lock = threading.Lock()
+        self.stop = threading.Event()
+        self.closing = False
+        self.topic: str | None = None
+        self.queue_paused = False
+        self.state = {
+            "model": agent.llm.model,
+            "project": str(Path(root).resolve()),
+            "topic": None,
+            "mode": "normal",
+            "busy": False,
+        }
+        self.requests: asyncio.Queue = asyncio.Queue()
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.box.on_interrupt = self.interrupt
+        self.gate = ApprovalGate(True, renderer, root)
+        self._screen = self.gate.screen
+        self.gate.screen = lambda *args, **kwargs: self._borrow_terminal(  # type: ignore[method-assign]
+            lambda: self._screen(*args, **kwargs)
+        )
+        self._approve_plan: Callable[[str], bool] | None = agent.approve_plan
+        if self._approve_plan is not None:
+            agent.approve_plan = lambda plan: self._borrow_terminal(
+                lambda: bool(self._approve_plan and self._approve_plan(plan))
+            )
+        self.renderer.on_status = self._status
+        self.box.preview = self.renderer.preview
+        self.renderer.session_footer = self.box.session_footer
+        self._status(renderer)
+        # 子代理（票 04）：重绑到会话 gate（授权规则 / allow_all 共享），dispatch
+        # 走 run_tool_call（origin 标「子任务」、progress 进 task 尾窗），unrestricted
+        # 显式取父会话审批模式，避免子 approve=None 被当成 yolo。
+        runner = getattr(self.agent, "subagent", None)
+        if runner is not None:
+            runner.bind(self.gate, self.stop, True)
+            runner.progress = lambda line: self.renderer.update(
+                "task_progress", {"name": "task", "line": line}
+            )
+            runner.dispatch = lambda child, ev: run_tool_call(
+                child,
+                self.renderer,
+                ev,
+                True,
+                self.gate,
+                unrestricted=self.agent.approve is None,
+                origin="子任务",
+                progress=runner.progress,
+            )
 
-    say(f"polya（模型: {agent.llm.model}，工作目录: {os.path.abspath(root)}）", "none")
-    say(
-        "输入任务开始；/help 命令 · ! 跑 shell · # 记项目记忆；Ctrl+C 双击或 Ctrl+D 退出。\n",
-        "none",
-    )
-    while True:
-        state["mode"] = "规划" if agent.plan_mode else "执行"
-        state["rules"] = len(gate.rules)
-        try:
-            if box is not None:
-                user_input = box.ask(state).strip()
-            else:
-                user_input = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+    def say(self, text: str, style: str = "none") -> None:
+        self.renderer._console.print(text, style=style, markup=False)
+
+    def _status(self, renderer: TerminalRenderer) -> None:
+        # /models 切换后状态行跟随（llm 实例整个换掉，model/profile_name 都变）
+        self.state["model"] = self.agent.llm.model
+        self.state["topic"] = self.topic
+        self.state["profile"] = getattr(self.agent.llm, "profile_name", None)
+        self.state["permissions"] = (
+            "all" if self.gate.allow_all or self.agent.approve is None else "ask"
+        )
+        self.state["mode"] = (
+            "plan"
+            if self.agent.plan_mode
+            else "yolo"
+            if (self.gate.allow_all or self.agent.approve is None)
+            else "normal"
+        )
+        self.state["status"] = renderer._status_label()
+        self.state["preview_active"] = renderer.has_preview
+        if renderer.context_window and renderer._ctx_used is not None:
+            self.state["context"] = f"ctx {renderer._ctx_used * 100 // renderer.context_window}%"
+        self.box._session.app.invalidate()
+
+    def _start_task(self) -> None:
+        self.stop.clear()
+        self.state.update(
+            busy=True,
+            stopping=False,
+            status="Waiting for model",
+            started_at=time.monotonic(),
+        )
+
+    def interrupt(self) -> None:
+        if self.state["busy"]:
+            self.stop.set()
+            self.state["stopping"] = True
+            self._pause_queue()
+            self.box._session.app.invalidate()
+
+    def _pause_queue(self) -> None:
+        self.queue_paused = True
+        self.state["queue_paused"] = True
+
+    def enqueue(self, text: str) -> None:
+        command, _ = parse_command(text)
+        if command is not None and command.busy == "control":
+            self.say(dispatch_command(text, self._command_context()) or "")
             return
-        if not user_input:
-            continue
-        if user_input.startswith("/"):
-            output = handle_command(user_input, agent, renderer)
+        with self.lock:
+            self.pending.append(text)
+            self.state["queued"] = len(self.pending)
+        hint = f"（{BUSY_HINTS[command.busy]}）" if command else "（下一轮请求前交给模型）"
+        self.say("＋ 已排队" + hint + "：" + text.replace("\n", " ")[:60], "dim")
+
+    def _pop(self, *, boundary: bool = False) -> str | None:
+        with self.lock:
+            if not self.pending:
+                return None
+            # 重置和退出不能在仍存活的生成器内部执行。
+            command, _ = parse_command(self.pending[0])
+            if boundary and command is not None and command.busy == "task_end":
+                return None
+            text = self.pending.popleft()
+            self.state["queued"] = len(self.pending)
+            return text
+
+    def _resume_queue(self) -> str:
+        if self.state.get("stopping"):
+            return "正在停止当前操作；停止后用 /resume 恢复队列。"
+        if not self.queue_paused:
+            return "排队任务未暂停。"
+        self.queue_paused = False
+        self.state["queue_paused"] = False
+        return "已恢复排队任务。"
+
+    def _command_context(self) -> CommandContext:
+        return CommandContext(
+            self.agent,
+            self.renderer,
+            self.gate,
+            self._resume_queue,
+            self._restart,
+            in_terminal=self._borrow_terminal,  # /models add 向导借道审批的让位机制
+            rename=self._rename,
+        )
+
+    def _rename(self, topic: str) -> str:
+        self.topic = topic
+        self.state["topic"] = topic
+        self.renderer._console.set_window_title(f"polya · {topic}")
+        self.box._session.app.invalidate()
+        return f"已更新会话主题：{topic}"
+
+    def _restart(self) -> str:
+        """/new 的会话级重置：主题、窗口标题、授权规则与排队消息；返回丢弃附注。"""
+        self.topic = None
+        self.state["topic"] = None
+        self.queue_paused = False
+        self.state["queue_paused"] = False
+        self.renderer._console.set_window_title("polya")
+        self.gate.rules.clear()
+        with self.lock:
+            dropped = len(self.pending)
+            self.pending.clear()
+            self.state["queued"] = 0
+        print_welcome(self.root, self.agent.llm.model, self.renderer._console)
+        return f"（已丢弃 {dropped} 条排队消息）" if dropped else ""
+
+    def _local(self, text: str) -> bool:
+        if text.startswith("/"):
+            command, _ = parse_command(text)
+            output = dispatch_command(text, self._command_context())
             if output is None:
-                return
-            say(output, "none")
-            continue
-        if user_input.startswith("!") and len(user_input) > 1:
-            _run_shell_bang(agent, root, user_input[1:].strip(), say)
-            continue
-        if user_input.startswith("#") and len(user_input) > 1:
-            _append_project_memory(root, user_input[1:].strip(), say)
-            continue
-        try:
-            if interactive:
-                run_task(agent, renderer, user_input, interactive, gate)
-                ui.print(f"[用量] {agent.total_usage}", style="dim", markup=False)
+                self.closing = True
             else:
-                console.print(Markdown(agent.run(user_input)))
-                console.print(f"[用量] {agent.total_usage}", style="dim", markup=False)
-        except KeyboardInterrupt:
-            say(
-                "\n[已中断本次任务；已完成步骤保留在历史中，可继续对话或 /reset 重来]",
+                if (
+                    command is not None
+                    and command.name in ("/clear", "/new")
+                    and not command_error(text)
+                ):
+                    self.renderer._ctx_used = None
+                    self.state.pop("context", None)
+                self.say(output)
+            self._status(self.renderer)
+            return True
+        if text.startswith("!") and len(text) > 1:
+            self.state["status"] = "Running Bash"
+            _run_shell_bang(self.agent, self.root, text[1:].strip(), self.say)
+            return True
+        if text.startswith("#") and len(text) > 1:
+            _append_project_memory(self.root, text[1:].strip(), self.say)
+            return True
+        return False
+
+    def _boundary(self) -> None:
+        while not self.stop.is_set() and not self.queue_paused:
+            text = self._pop(boundary=True)
+            if text is None:
+                break
+            if not self._local(text):
+                self.agent.history.append({"role": "user", "content": text})
+                self.say("❯ " + text, "cyan")
+                self.say("＋ 补充已交给模型，将用于下一轮请求。", "dim")
+
+    def _borrow_terminal(self, callback):
+        if self.stop.is_set() or self.closing:
+            raise InterruptedError("审批已取消")
+        if self.loop is None:
+            # 事件循环尚未就绪（理论上不会走到）：直接跑回调，避免死等。
+            return callback()
+        ready, done = threading.Event(), threading.Event()
+        self.loop.call_soon_threadsafe(self.requests.put_nowait, (ready, done))
+        ready.wait()
+        try:
+            if self.closing or self.stop.is_set():
+                raise InterruptedError("审批已取消")
+            return callback()
+        except KeyboardInterrupt as exc:
+            raise InterruptedError("审批已取消") from exc
+        finally:
+            done.set()
+
+    def _work(self, text: str) -> None:
+        task = not text.startswith(("/", "!", "#"))
+        started = time.monotonic()
+        outcome = "本轮结束"
+        try:
+            if not self._local(text):
+                if self.topic is None:
+                    self.topic = _topic_from(text)
+                    self.state["topic"] = self.topic
+                    self.renderer._console.set_window_title(f"polya · {self.topic}")
+                self.say("❯ " + text, "cyan")
+                run_task(
+                    self.agent,
+                    self.renderer,
+                    text,
+                    True,
+                    self.gate,
+                    stop=self.stop,
+                    on_boundary=self._boundary,
+                )
+        except ApprovalRejected:
+            outcome = "本轮已拒绝"
+            self._pause_queue()
+            self.say("已拒绝并停止当前任务，等待新指令。排队任务已暂停，/resume 恢复。", "yellow")
+        except InterruptedError:
+            outcome = "本轮已中断"
+            self._pause_queue()
+            self.say(
+                "已中断本次任务；已完成步骤保留。排队任务已暂停，/resume 恢复；也可输入新任务。",
                 "yellow",
             )
-        except Exception as exc:  # noqa: BLE001 - REPL 必须存活：API/网络错误只报本次任务
-            say(f"[任务失败] {type(exc).__name__}: {exc}", "red")
-        if interactive and state["topic"] is None:
-            # Claude Code 同款：首个任务后定会话主题，嵌入输入框顶线并写终端标签页
-            state["topic"] = _topic_from(user_input)
-            if ui.is_terminal:
-                ui.set_window_title(f"✳ {state['topic']}")
+        except Exception as exc:  # noqa: BLE001 - 网络和工具错误不结束会话
+            outcome = "本轮失败"
+            self._pause_queue()
+            self.say(f"[任务失败] {type(exc).__name__}: {exc}", "red")
+            self.say("排队任务已暂停，/resume 恢复；也可输入新任务。", "yellow")
+        finally:
+            if task:
+                elapsed = max(0, int(time.monotonic() - started))
+                self.say(f"── {outcome} · {elapsed}s", "dim")
+
+    async def run(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        prompt = None
+        worker = None
+        request = asyncio.create_task(self.requests.get())
+        try:
+            while not self.closing:
+                if worker is None and not self.queue_paused:
+                    text = self._pop()
+                    if text is not None:
+                        self._start_task()
+                        worker = asyncio.create_task(asyncio.to_thread(self._work, text))
+                if prompt is None:
+                    prompt = asyncio.create_task(self.box.ask_async(self.state))
+                tasks = [prompt, request] + ([worker] if worker is not None else [])
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                if worker is not None and worker in done:
+                    await worker
+                    worker = None
+                    self.state.update(busy=False, stopping=False)
+                    self.state.pop("started_at", None)
+                    self.box.refresh_file_index()  # agent 可能刚写过文件
+                    self.box._session.app.invalidate()
+                if prompt in done:
+                    try:
+                        text = prompt.result().strip()
+                    except (EOFError, KeyboardInterrupt):
+                        self.closing = True
+                    else:
+                        command, _ = parse_command(text)
+                        if command is not None and command.busy == "control":
+                            self.say(dispatch_command(text, self._command_context()) or "")
+                        elif text:
+                            if self.queue_paused and worker is None:
+                                self._start_task()
+                                worker = asyncio.create_task(asyncio.to_thread(self._work, text))
+                            elif worker is None:
+                                with self.lock:
+                                    self.pending.append(text)
+                            else:
+                                self.enqueue(text)
+                    prompt = None
+                if request in done:
+                    ready, finished = request.result()
+                    if prompt is not None:
+                        self.box.suspend()
+                        try:
+                            submitted = await prompt
+                        except InputSuspended:
+                            pass
+                        except (EOFError, KeyboardInterrupt):
+                            self.closing = True
+                        else:
+                            if submitted.strip():
+                                self.enqueue(submitted.strip())
+                        prompt = None
+                    ready.set()
+                    await asyncio.to_thread(finished.wait)
+                    request = asyncio.create_task(self.requests.get())
+        finally:
+            self.closing = True
+            self.stop.set()
+            # 退出也完成借用握手，避免 worker 等待一个已经消失的输入框。
+            if prompt is not None and not prompt.done():
+                self.box.suspend()
+                try:
+                    await prompt
+                except (InputSuspended, EOFError, KeyboardInterrupt):
+                    pass
+            while worker is not None and not worker.done():
+                done, _ = await asyncio.wait([worker, request], return_when=asyncio.FIRST_COMPLETED)
+                if request in done:
+                    ready, finished = request.result()
+                    ready.set()
+                    await asyncio.to_thread(finished.wait)
+                    request = asyncio.create_task(self.requests.get())
+            request.cancel()
+            try:
+                await request
+            except asyncio.CancelledError:
+                pass
+            if worker is not None:
+                await worker
+            self.agent.approve_plan = self._approve_plan
+            self.renderer.on_status = lambda renderer: None
+            self.box.preview = lambda width, max_lines: ""
+            self.renderer.session_footer = None
+
+
+def run_repl(agent: Agent, root: str, renderer: TerminalRenderer) -> None:
+    if sys.stdin.isatty():
+        # stdout/stderr 都经同一个代理排在输入区上方；不使用全屏终端。
+        with patch_stdout(raw=True):
+            output = Console()
+            renderer.use_scrollback(output)
+            print_welcome(root, agent.llm.model, output)
+            box = InputBox(files=ProjectFiles(Path(root)))
+            asyncio.run(InteractiveSession(agent, root, renderer, box).run())
+        return
+
+    def say(message: str, style: str = "none") -> None:
+        console.print(message, style=style, markup=False)
+
+    while True:
+        try:
+            text = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not text:
+            continue
+        if text.startswith("/"):
+            result = handle_command(text, agent, renderer)
+            if result is None:
+                return
+            say(result)
+        elif text.startswith("!") and len(text) > 1:
+            _run_shell_bang(agent, root, text[1:].strip(), say)
+        elif text.startswith("#") and len(text) > 1:
+            _append_project_memory(root, text[1:].strip(), say)
+        else:
+            try:
+                console.print(Markdown(agent.run(text)))
+                say(f"[用量] {agent.total_usage}", "dim")
+            except KeyboardInterrupt:
+                say("已中断本次任务", "yellow")
+            except Exception as exc:  # noqa: BLE001
+                say(f"[任务失败] {type(exc).__name__}: {exc}", "red")

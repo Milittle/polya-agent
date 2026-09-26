@@ -146,14 +146,14 @@ def test_agent_triggers_compression_on_threshold():
             make_message(content="#3: 已压缩的回显"),
             make_message(content="完成"),
         ],
-        usages=[usage(prompt=200), usage(prompt=200), usage(prompt=50), usage(prompt=50)],
+        usages=[usage(prompt=8100), usage(prompt=8100), usage(prompt=50), usage(prompt=50)],
     )
     agent = Agent(
         llm=llm,
         tools=[echo],
         status_bar=True,
         compress=True,
-        context_window=100,
+        context_window=10000,
         keep_recent=2,
         max_steps=4,
     )
@@ -182,7 +182,7 @@ def test_agent_below_threshold_or_missing_usage_never_compresses():
         ],
         usages=[usage(prompt=50), usage(prompt=50)],  # 50 < 100*0.8
     )
-    agent = Agent(llm=llm, tools=[echo], compress=True, context_window=100)
+    agent = Agent(llm=llm, tools=[echo], compress=True, context_window=10000)
     agent.run("干活")
     assert all(call["tools"] is not None for call in llm.calls)
 
@@ -192,7 +192,7 @@ def test_agent_below_threshold_or_missing_usage_never_compresses():
             make_message(content="完成"),
         ]
     )  # usage 全 None
-    agent2 = Agent(llm=no_usage, tools=[echo], compress=True, context_window=100)
+    agent2 = Agent(llm=no_usage, tools=[echo], compress=True, context_window=10000)
     agent2.run("干活")
     assert all(call["tools"] is not None for call in no_usage.calls)
 
@@ -211,10 +211,10 @@ def test_agent_circuit_breaker_after_three_failures():
             for i in range(4)
         ]
         + [make_message(content="完成")],
-        usages=[usage(prompt=200)] * 5,
+        usages=[usage(prompt=8100)] * 5,
     )
     agent = Agent(
-        llm=llm, tools=[echo], compress=True, context_window=100, keep_recent=1, max_steps=5
+        llm=llm, tools=[echo], compress=True, context_window=10000, keep_recent=1, max_steps=5
     )
     assert agent.run("干活") == "完成"  # 压缩失败不拖垮主任务
 
@@ -226,11 +226,11 @@ def test_agent_circuit_breaker_after_three_failures():
 # ---------- 摘要重启（thinking 绑定模型的压缩路径） ----------
 
 
-def test_find_restart_split_lands_on_user_boundary():
+def test_find_restart_split_lands_on_complete_tool_boundary():
     history = sample_history()  # 8 条，末尾 tool 在下标 7
-    split = find_restart_split(history, keep=3)  # 目标位置 5，向后找到 user[6]
-    assert split == 6
-    assert history[split]["role"] == "user"
+    split = find_restart_split(history, keep=3)
+    assert split == 5  # assistant 也可作为完整工具轮之后的边界
+    assert history[split]["role"] == "assistant"
 
     assert find_restart_split(history, keep=9) is None  # 历史太短，保留区盖全
 
@@ -242,13 +242,13 @@ def test_compact_restart_folds_history_into_summary():
 
     request = llm.calls[0]["messages"][1]["content"]
     assert "理解代码库" in request
-    assert "[assistant] 中间结论" in request  # 对话全段进入压缩请求
+    assert "[assistant] [调用工具:" in request
     assert "agent_status" not in request  # 状态栏噪声不进
 
     assert new[0]["role"] == "user"
     assert new[0]["content"].startswith("<session_summary>")
     assert "已读 agent.py" in new[0]["content"]
-    assert new[1:] == history[6:]  # 保留区原样（user 状态栏起的完整尾部）
+    assert new[1:] == history[5:]  # 保留区始于已回填工具结果之后
     assert history == sample_history() or len(history) == 8  # 原列表不动
 
 
@@ -263,14 +263,14 @@ def test_agent_uses_restart_for_thinking_bound_models():
             make_message(content="重启摘要：已完成两步探查"),  # 压缩调用消费这条
             make_message(content="完成"),
         ],
-        usages=[usage(prompt=200), usage(prompt=200), usage(prompt=0), usage(prompt=50)],
+        usages=[usage(prompt=8100), usage(prompt=8100), usage(prompt=0), usage(prompt=50)],
     )
     agent = Agent(
         llm=llm,
         tools=[echo],
         status_bar=True,
         compress=True,
-        context_window=100,
+        context_window=10000,
         keep_recent=4,
         max_steps=4,
         profile=ModelProfile(supports_inplace_tool_edit=False),
@@ -282,3 +282,76 @@ def test_agent_uses_restart_for_thinking_bound_models():
     first = llm.calls[3]["messages"][1]
     assert first["content"].startswith("<session_summary>")
     assert "重启摘要" in first["content"]
+
+
+def test_empty_summary_preserves_original():
+    import pytest
+
+    original = sample_history()
+    for compact in (compact_messages, compact_restart):
+        llm = ScriptedLLM([make_message(content=" \n ")])
+        with pytest.raises(RuntimeError, match="空摘要"):
+            compact(llm, original, keep=3, query="q")
+        assert original == sample_history()
+
+
+def test_restart_without_status_never_splits_tool_batch():
+    history = [
+        {"role": "user", "content": "fix"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "b", "function": {"name": "read_file", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "a", "content": "A"},
+        {"role": "tool", "tool_call_id": "b", "content": "B"},
+        {"role": "assistant", "content": "next", "reasoning_content": "old thinking"},
+    ]
+    assert find_restart_split(history, keep=2) == 4
+    result = compact_restart(ScriptedLLM([make_message("read A and B")]), history, 2, "fix")
+    assert result[-1] == {"role": "assistant", "content": "next"}
+    assert "reasoning_content" in history[-1]
+    assert find_restart_split(history[:3], keep=0) is None  # b 尚未回填
+
+
+def test_compaction_checkpoint_preserves_skill_todo_and_raw_history(tmp_path):
+    from polya.skills import SkillCatalog
+    from tests.test_skills import make_skill
+
+    make_skill(tmp_path / ".polya/skills")
+    skills = SkillCatalog.discover(tmp_path, tmp_path / "empty")
+    skills.tool().run({"name": "develop"})
+    llm = ScriptedLLM([make_message("#3: read file")])
+    agent = Agent(llm=llm, compress=True, skills=skills, keep_recent=3)
+    agent.history[:] = sample_history()
+    agent.history[0]["content"] = "只改解析器，保持 API 不变"
+    agent.todos.rewrite([{"content": "验证解析器", "status": "in_progress"}])
+    compacted = agent._try_compress("原始任务")
+    checkpoint = compacted[-1]["content"]
+    assert "develop" in checkpoint and "验证解析器" in checkpoint
+    assert "只改解析器" in llm.calls[0]["messages"][1]["content"]
+    original = agent.tools.call("history_read", {"snapshot": "1", "message": 4})
+    assert "x" * 5000 in original
+    agent.reset()
+    assert agent.tools.call("history_read", {"snapshot": "1"}).startswith("Error:")
+    assert skills.checkpoint() == ""
+
+
+def test_missing_usage_large_new_result_triggers_preflight():
+    agent = Agent(llm=ScriptedLLM([]), compress=True, context_window=10000)
+    agent.history[:] = [{"role": "user", "content": "x" * 30000}]
+    assert agent._should_compress()
+
+
+def test_full_context_fails_locally_and_preserves_history():
+    import pytest
+
+    llm = ScriptedLLM([])
+    agent = Agent(llm=llm, compress=True, context_window=10000)
+    agent._compress_failures = 3
+    with pytest.raises(RuntimeError, match="上下文接近上限"):
+        agent.run("x" * 32000)
+    assert llm.calls == []
+    assert agent.history[0]["content"] == "x" * 32000

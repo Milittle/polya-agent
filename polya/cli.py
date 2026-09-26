@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -29,11 +28,15 @@ from rich.markdown import Markdown
 from rich_argparse import RichHelpFormatter
 
 from .agent import Agent
+from .approval import ApprovalGate, terminal_approve_plan
 from .builtin import CODING_SYSTEM_PROMPT, default_tools
 from .llm import LLM
-from .loop import run_repl, terminal_approve, terminal_approve_plan
+from .loop import run_repl, run_tool_call
+from .models import resolve_connection
 from .providers import profile_for
 from .render import TerminalRenderer, console, ui
+from .skills import SkillCatalog
+from .subagent import SubagentRunner
 from .todos import TodoStore
 
 
@@ -72,6 +75,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-compress", action="store_true", help="关闭上下文压缩（默认开启）")
     parser.add_argument(
+        "--no-microcompact",
+        action="store_true",
+        help="关闭微压缩（无 LLM 的旧工具结果指针清理，默认开启，阈值 60%%）",
+    )
+    parser.add_argument(
         "--context-window",
         type=int,
         default=None,
@@ -82,6 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=30,
         help="压缩保留区：最近 N 条消息内的工具结果不压缩、状态栏不删除（默认 30）",
+    )
+    parser.add_argument(
+        "--keep-recent-tokens",
+        type=int,
+        default=None,
+        help="压缩保留区的 token 预算（优先于 --keep-recent；按消息从末向前累积）",
     )
     parser.add_argument(
         "--prefix-check",
@@ -107,28 +121,32 @@ def build_agent(
     """按 CLI 参数构建 Agent。``llm`` 参数供测试注入假实现。"""
     todos = TodoStore()
     if llm is None:
+        # 启动解析（票 14）：旗标 > active profile（~/.polya/models.json）> 环境变量。
         # 模型档案决定温度等默认参数（o 系列不接受自定义温度），Agent 侧再用
         # 同一份档案决定压缩策略与前缀纪律
-        profile = profile_for(args.model or os.getenv("OPENAI_MODEL"))
+        model, base_url, api_key, profile_name = resolve_connection(
+            args.model, args.base_url, args.api_key
+        )
+        profile = profile_for(model)
         llm = LLM(
-            model=args.model,
-            base_url=args.base_url,
-            api_key=args.api_key,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
             temperature=profile.temperature,
+            profile_name=profile_name,
         )
     else:
         profile = profile_for(getattr(llm, "model", None))
     interactive = sys.stdin.isatty()
-    # 项目记忆（AGENTS.md）启动读一次、拼进系统提示词尾部——会话内不变，不违
-    # 「系统提示词静态」铁律的精神（铁律防的是逐轮变更破缓存；# 前缀写入后
-    # 下次会话生效）。缺失即跳过。
-    system_prompt = CODING_SYSTEM_PROMPT
+    # 项目记忆（AGENTS.md）启动读一次，作为独立的 <project_memory> section 注入
+    # ——会话内不变，不违「系统提示词静态」铁律的精神（铁律防的是逐轮变更破缓存；
+    # # 前缀写入后下次会话生效）。缺失即跳过。
     memory = _project_memory(args.root)
-    if memory:
-        system_prompt = f"{CODING_SYSTEM_PROMPT}\n\n# 项目记忆（AGENTS.md，启动时载入）\n\n{memory}"
-    return Agent(
-        llm=llm,
-        tools=default_tools(
+    # 一个 gate 同时服务父会话审批与子代理审批（会话规则 / allow_all 共享，Q4）
+    gate = ApprovalGate(interactive, renderer, root=args.root)
+    runner = SubagentRunner(root=args.root, memory=memory, renderer=renderer)
+    tools = [
+        *default_tools(
             root=args.root,
             todos=todos,
             # bash 运行中的实时输出直接喂渲染器（agent 线程内同步回调）。
@@ -139,8 +157,15 @@ def build_agent(
                 else None
             ),
         ),
-        system_prompt=system_prompt,
-        approve=None if args.yes else terminal_approve(interactive, renderer, root=args.root),
+        runner.task_tool(),  # 子代理（票 03/04）：kind=delegate，构建期注册先于 freeze
+    ]
+    agent = Agent(
+        llm=llm,
+        tools=tools,
+        system_prompt=CODING_SYSTEM_PROMPT,
+        project_memory=memory,
+        cwd=args.root,
+        approve=None if args.yes else gate.as_approve(),
         approve_plan=None if args.yes else terminal_approve_plan(interactive, renderer),
         status_bar=not args.no_status,
         todos=todos,
@@ -149,14 +174,39 @@ def build_agent(
         max_steps=args.max_steps,
         compress=not args.no_compress,
         context_window=args.context_window,
+        micro_threshold=None if args.no_microcompact else 0.6,
         keep_recent=args.keep_recent,
+        keep_recent_tokens=args.keep_recent_tokens,
         profile=profile,
         prefix_check=args.prefix_check,
         stream=not args.no_stream,
+        skills=SkillCatalog.discover(args.root),
     )
+    runner.attach(agent)
+    # 默认 runner（-p / 管道）：共享同一 gate；子审批走闸门（-p 无 --yes 时
+    # interactive=False 非交互默认拒绝，不旁路）。交互 REPL 会在 InteractiveSession
+    # 里重绑到会话 gate 并将 progress 接入渲染器。
+    runner.bind(gate, None, interactive)
+    parent_unrestricted = args.yes
+
+    def _child_dispatch(child, ev):
+        return run_tool_call(
+            child,
+            renderer,
+            ev,
+            interactive,
+            gate,
+            unrestricted=parent_unrestricted,
+            origin="子任务",
+            progress=None,
+        )
+
+    runner.dispatch = _child_dispatch
+    return agent
 
 
 def main(argv: list[str] | None = None) -> int:
+    # profile 的录入与管理全部在会话内 /models（add 交互向导），无外置子命令
     args = parse_args(argv)
     load_dotenv()  # 与 demo.py 一致：从项目 .env 读取 OPENAI_* 配置
     logging.basicConfig(
@@ -179,7 +229,11 @@ def main(argv: list[str] | None = None) -> int:
     # SDK 的 HTTP 明细日志（httpx2）会混进 live 区刷屏，抬到 WARNING 只留异常
     logging.getLogger("httpx2").setLevel(logging.WARNING)
     renderer = TerminalRenderer(ui)
-    agent = build_agent(args, renderer=renderer)
+    try:
+        agent = build_agent(args, renderer=renderer)
+    except ValueError as exc:  # models.json 坏配置：指到文件，不甩 traceback
+        print(f"[配置错误] {exc}", file=sys.stderr)
+        return 2
     renderer.context_window = agent.context_window  # 状态行的上下文占用展示用
     if args.prompt is not None:
         try:

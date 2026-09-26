@@ -45,6 +45,19 @@ PROFILES: dict[str, ModelProfile] = {
         supports_inplace_tool_edit=False,
         note="interleaved thinking：reasoning_content 回传绑定前缀",
     ),
+    # GLM-5 系（z.ai / bigmodel coding plan 的 glm-5.x）：1M 窗口（官方，2026-09 核实）。
+    # 前缀须排在 "glm" 前：profile_for 按声明序首个 startswith 命中
+    "glm-5": ModelProfile(context_window=1_000_000, note="1M 窗口（z.ai 官方）"),
+    # GLM-4 系：200K 窗口（官方，2026-09 核实）
+    "glm": ModelProfile(context_window=200_000, note="200K 窗口（z.ai 官方）"),
+    # DeepSeek V4.1 Flash（deepseek-flash）：1M 窗口 + 384K 输出（官方 pricing 页，
+    # 2026-09 核实；deepseek-chat/reasoner 已是遗留名）。thinking 默认开，按
+    # reasoner 同款保守档：摘要重启压缩（宁保守不赌原地替换）
+    "deepseek-flash": ModelProfile(
+        context_window=1_000_000,
+        supports_inplace_tool_edit=False,
+        note="1M 窗口；thinking 默认开，保守同 reasoner",
+    ),
     # Claude 系：thinking block 密码学签名绑定前缀；200K 窗口；温度 1 起步。
     # 原生 Messages API 需渲染层（content blocks），走 OpenAI 兼容端点时无 thinking
     "claude": ModelProfile(

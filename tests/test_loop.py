@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from polya.loop import ApprovalGate, _append_project_memory, _run_shell_bang
@@ -37,18 +38,18 @@ class OptionSpy:
 
 def screen_with(monkeypatch, choice, tool_obj, arguments, high_risk=False):
     spy = OptionSpy(choice)
-    monkeypatch.setattr("polya.loop._select_option", spy)
-    monkeypatch.setattr("polya.loop._ask_line", lambda label, default=None: "")
+    monkeypatch.setattr("polya.approval._select_option", spy)
+    monkeypatch.setattr("polya.approval._ask_line", lambda label, default=None: "")
     gate = ApprovalGate(interactive=True)
     return gate.screen(tool_obj, arguments, high_risk=high_risk), gate, spy
 
 
-def test_default_cursor_is_deny_and_enter_never_allows(monkeypatch):
+def test_low_risk_defaults_to_allow_but_escape_denies(monkeypatch):
     outcome, _, spy = screen_with(monkeypatch, choice=3, tool_obj=bash, arguments={"command": "ls"})
     assert outcome.approved is False
     deny_index = len(spy.seen_options) - 1
     assert spy.seen_kwargs["cancel_index"] == deny_index
-    assert spy.seen_kwargs["initial"] == deny_index  # Enter 确认的是拒绝
+    assert spy.seen_kwargs["initial"] == 0
 
 
 def test_bash_options_offer_prefix_and_modify(monkeypatch):
@@ -56,7 +57,13 @@ def test_bash_options_offer_prefix_and_modify(monkeypatch):
         monkeypatch, choice=0, tool_obj=bash, arguments={"command": "pytest tests/test_a.py -q"}
     )
     labels = [label for label, _ in spy.seen_options]
-    assert labels == ["允许", "本会话前缀授权", "修改后执行", "拒绝"]
+    assert labels == [
+        "Allow once",
+        "Allow prefix for session",
+        "Edit command",
+        "Allow all for session",
+        "Deny",
+    ]
 
 
 def test_high_risk_hides_prefix_option(monkeypatch):
@@ -68,7 +75,7 @@ def test_high_risk_hides_prefix_option(monkeypatch):
         high_risk=True,
     )
     labels = [label for label, _ in spy.seen_options]
-    assert labels == ["允许", "修改后执行", "拒绝"]  # 高危无授权出口（Q9）
+    assert labels == ["Allow once", "Edit command", "Deny"]  # 高危无授权出口（Q9）
     assert outcome.approved is False
     assert spy.seen_kwargs["cancel_index"] == 2
 
@@ -78,7 +85,12 @@ def test_compound_command_hides_prefix_option(monkeypatch):
         monkeypatch, choice=0, tool_obj=bash, arguments={"command": "cd tests && ls"}
     )
     labels = [label for label, _ in spy.seen_options]
-    assert labels == ["允许", "修改后执行", "拒绝"]  # Q14：复合命令不给前缀授权
+    assert labels == [
+        "Allow once",
+        "Edit command",
+        "Allow all for session",
+        "Deny",
+    ]  # Q14：复合命令不给前缀授权
 
 
 def test_prefix_choice_creates_rule_and_feed_decide(monkeypatch):
@@ -97,8 +109,8 @@ def test_prefix_choice_creates_rule_and_feed_decide(monkeypatch):
 
 
 def test_modify_choice_returns_command(monkeypatch):
-    monkeypatch.setattr("polya.loop._select_option", OptionSpy(2))
-    monkeypatch.setattr("polya.loop._ask_line", lambda label, default=None: default + " -q")
+    monkeypatch.setattr("polya.approval._select_option", OptionSpy(2))
+    monkeypatch.setattr("polya.approval._ask_line", lambda label, default=None: default + " -q")
     gate = ApprovalGate(interactive=True)
     outcome = gate.screen(bash, {"command": "pytest tests/"})
     assert outcome.approved is True
@@ -106,8 +118,8 @@ def test_modify_choice_returns_command(monkeypatch):
 
 
 def test_deny_with_reason_carries_it(monkeypatch):
-    monkeypatch.setattr("polya.loop._select_option", OptionSpy(3))
-    monkeypatch.setattr("polya.loop._ask_line", lambda label, default=None: "太危险")
+    monkeypatch.setattr("polya.approval._select_option", OptionSpy(4))
+    monkeypatch.setattr("polya.approval._ask_line", lambda label, default=None: "太危险")
     gate = ApprovalGate(interactive=True)
     outcome = gate.screen(bash, {"command": "reboot"})
     assert outcome.approved is False
@@ -116,7 +128,7 @@ def test_deny_with_reason_carries_it(monkeypatch):
 
 def test_noninteractive_screens_reject_with_preview(monkeypatch, capsys):
     monkeypatch.setattr(
-        "polya.loop._select_option", lambda *a, **k: (_ for _ in ()).throw(AssertionError)
+        "polya.approval._select_option", lambda *a, **k: (_ for _ in ()).throw(AssertionError)
     )
     gate = ApprovalGate(interactive=False)
     outcome = gate.screen(bash, {"command": "ls"})
@@ -151,11 +163,12 @@ def test_project_memory_append_creates_and_appends(tmp_path, capsys):
     assert "构建用 uv run pytest" in content and "发布走 gh" in content
 
 
-def test_build_agent_injects_project_memory(tmp_path):
+def test_build_agent_injects_project_memory(tmp_path, monkeypatch):
     from polya.agent import DEFAULT_SYSTEM_PROMPT  # noqa: F401 - 保持导入面一致
     from polya.builtin import CODING_SYSTEM_PROMPT
     from polya.cli import _project_memory, build_agent, parse_args
 
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")  # 隔离用户级技能目录
     (tmp_path / "AGENTS.md").write_text("测试锚点：polya-agent 项目记忆", encoding="utf-8")
     assert _project_memory(str(tmp_path)) == "测试锚点：polya-agent 项目记忆"
 
@@ -165,8 +178,10 @@ def test_build_agent_injects_project_memory(tmp_path):
     agent = build_agent(parse_args(["--root", str(tmp_path)]), llm=FakeLLM())
     assert agent.system_prompt.startswith(CODING_SYSTEM_PROMPT)
     assert "测试锚点：polya-agent 项目记忆" in agent.system_prompt
+    assert "<project_memory>" in agent.system_prompt  # 项目记忆是独立 section
 
     empty = tmp_path / "empty"
     empty.mkdir()
     agent2 = build_agent(parse_args(["--root", str(empty)]), llm=FakeLLM())
-    assert agent2.system_prompt == CODING_SYSTEM_PROMPT  # 缺失即跳过
+    assert agent2.system_prompt.startswith(CODING_SYSTEM_PROMPT)
+    assert "<project_memory>" not in agent2.system_prompt  # 缺失即不产生该段

@@ -57,10 +57,10 @@ def test_tool_block_header_and_collapsed_result():
     feed_tool_result(renderer, "\n".join(f"行{i}" for i in range(20)))
 
     out = buf.getvalue()
-    assert "⏺ bash" in out and "$ wc -w README.md" in out
-    assert "  ⎿ 行0" in out and "    行7" in out  # 首行 ⎿ 连接符、续行 4 空格
-    assert "行8" not in out  # 折叠到前 8 行
-    assert "还有 12 行未显示（/expand 查看全文） · 0.4s" in out
+    assert "Running Bash" in out and "$ wc -w README.md" in out
+    assert "  行0" in out and "  行2" in out  # 首行 ⎿ 连接符、续行 4 空格
+    assert "行3" not in out  # 折叠到前 8 行
+    assert "+ Show details: /details 1" in out
 
 
 def test_short_result_shows_all_lines_with_duration():
@@ -69,19 +69,21 @@ def test_short_result_shows_all_lines_with_duration():
     feed_tool_result(renderer, "5", duration_s=0.01)
 
     out = buf.getvalue()
-    assert "  ⎿ 5 · 0.01s" in out and "还有" not in out
+    assert "  5" in out and "0.01s" in out and "还有" not in out
 
 
 def test_empty_result_shows_placeholder_tail():
     renderer, buf = make_renderer()
     feed_tool_call(renderer)
     feed_tool_result(renderer, "", duration_s=0.2)
-    assert "  ⎿ （无输出） · 0.2s" in buf.getvalue()
+    assert "No output" in buf.getvalue() and "0.2s" in buf.getvalue()
 
 
 def test_error_result_is_printed_in_red():
     buf = StringIO()
-    console = Console(file=buf, force_terminal=True, width=120)  # 终端模式才输出 ANSI
+    console = Console(
+        file=buf, force_terminal=True, no_color=False, width=120
+    )  # 终端模式才输出 ANSI
     renderer = TerminalRenderer(console)
     feed_tool_call(renderer)
     feed_tool_result(renderer, "Error: 用户拒绝了工具调用 bash", error=True)
@@ -130,10 +132,10 @@ def test_header_arg_specializes_by_tool():
     assert _header_arg("read_file", {"path": "polya/ui.py", "start_line": 10, "end_line": 50}) == (
         "polya/ui.py:10-50"
     )
-    assert _header_arg("multi_edit", {"path": "a.py", "edits": [{}, {}]}) == "a.py（2 处）"
+    assert _header_arg("multi_edit", {"path": "a.py", "edits": [{}, {}]}) == "a.py (2 edits)"
     assert _header_arg("grep", {"pattern": "def run", "glob": "*.py"}) == "def run  ·  glob *.py"
     assert _header_arg("web_fetch", {"url": "https://example.com"}) == "https://example.com"
-    assert _header_arg("todo_write", {"items": [{}]}) == "1 项"
+    assert _header_arg("todo_write", {"items": [{}]}) == "1 items"
     # 兜底：陌生工具仍是紧凑 JSON
     assert _header_arg("custom", {"a": 1}) == '{"a": 1}'
 
@@ -148,13 +150,13 @@ def test_status_label_migrates_with_phase():
         return renderer.render().renderables[-1].text.plain
 
     renderer.update("iteration", {"step": 1, "max_steps": 25})
-    assert "思考中" in label() and "第 1/25 轮" in label()
+    assert "Waiting for model" in label() and "step 1/25" in label()
 
     renderer.update("text_delta", {"delta": "答案"})
-    assert "回复中" in label()
+    assert "Responding" in label()
 
     feed_tool_call(renderer)
-    assert "运行 bash" in label()
+    assert "Running Bash" in label()
 
 
 def test_reasoning_tail_visible_only_in_thinking_phase():
@@ -189,7 +191,7 @@ def test_usage_feeds_context_occupancy_in_status_line():
     renderer, _buf = make_renderer(context_window=128000)
     renderer.update("iteration", {"step": 1, "max_steps": 25})
     label = renderer.render().renderables[-1].text.plain
-    assert "/" not in label.split("轮")[-1]  # 未收到 usage 前不显示占用
+    assert "/" not in label.split("·")[-1]  # 未收到 usage 前不显示占用
 
     renderer.update("usage", {"last": {"prompt_tokens": 12800, "completion_tokens": 300}})
     label = renderer.render().renderables[-1].text.plain
@@ -237,7 +239,7 @@ def test_expand_blocks_outputs_full_content():
     )
 
     expanded = renderer.expand_blocks(5)
-    assert "⏺ bash 结果全文 · 0.4s" in expanded
+    assert "Ran Bash · 0.4s" in expanded
     assert "行19" in expanded  # 折叠隐藏的行在展开里可见
     assert "✻ 思考全文（6 字）" in expanded and "思考全文内容" in expanded
     assert renderer.expand_blocks(1).startswith("✻")  # count 只取最近 N 块
@@ -246,3 +248,78 @@ def test_expand_blocks_outputs_full_content():
 def test_expand_blocks_empty_hint():
     renderer, _buf = make_renderer()
     assert "暂无可展开" in renderer.expand_blocks()
+
+
+def test_live_tool_tail_keeps_advancing_after_preview_limit():
+    renderer, output = make_renderer(tool_output_tail_lines=3, min_render_interval=0)
+    renderer.use_scrollback(renderer._console)
+    feed_tool_call(renderer, arguments={"command": "pytest"})
+    for i in range(15):
+        renderer.update("tool_output_delta", {"line": f"progress-{i}"})
+    preview = renderer.preview(40, max_lines=2)
+    assert "progress-14" in preview and "progress-13" in preview
+    assert "progress-12" not in preview
+    assert len(preview.splitlines()) <= 3
+    assert output.getvalue() == ""
+    feed_tool_result(renderer, "all tests passed")
+    assert renderer.preview(40) == ""
+    assert "all tests passed" in output.getvalue()
+
+
+def test_streamed_markdown_keeps_table_and_code_structure():
+    renderer, output = make_renderer(min_render_interval=0)
+    renderer.use_scrollback(renderer._console)
+    content = "| Name | Value |\n| --- | --- |\n| answer | 42 |\n\n```python\nprint(42)\n```"
+    for fragment in (content[:17], content[17:50], content[50:]):
+        renderer.update("text_delta", {"delta": fragment})
+    assert "print" in renderer.preview(60, max_lines=8)
+    renderer.update("assistant_message", {"content": content})
+    final = output.getvalue()
+    assert (
+        "─" in final and "answer" in final and "|" not in final
+    )  # A table, not separate Markdown lines.
+    assert "print(42)" in final
+    assert "```" not in final
+    assert final.count("answer") == 1
+    assert renderer.preview(60) == ""
+
+
+def test_interrupted_live_text_is_retained_without_leaking_into_next_task():
+    renderer, output = make_renderer()
+    renderer.use_scrollback(renderer._console)
+    import pytest
+
+    with pytest.raises(InterruptedError), renderer:
+        renderer.update("text_delta", {"delta": "unfinished paragraph"})
+        assert "unfinished paragraph" in renderer.preview(80)
+        raise InterruptedError()
+    assert output.getvalue().count("unfinished paragraph") == 1
+    assert "Partial response" in output.getvalue()
+    assert not renderer.has_preview
+    with renderer:
+        renderer.update("iteration", {"step": 1})
+        renderer.update("assistant_message", {"content": "new answer"})
+    assert output.getvalue().count("unfinished paragraph") == 1
+
+
+def test_plan_approval_uses_shared_activity_and_receipt():
+    renderer, output = make_renderer()
+    renderer.update("plan_approval", {})
+    assert renderer._status_label() == "Awaiting approval"
+    renderer.update("plan_result", {"approved": True})
+    assert renderer._status_label() == "Waiting for model"
+    assert "计划已批准，继续执行" in output.getvalue()
+
+
+def test_pending_shell_result_does_not_claim_completion():
+    renderer, buf = make_renderer()
+    renderer.use_scrollback(renderer._console)
+    feed_tool_call(renderer)
+    feed_tool_result(renderer, "[命令 1]\n仍在运行；用 bash_output 等待，或 kill_bash 终止")
+    assert "Running Bash" in buf.getvalue()
+    assert "Ran Bash" not in buf.getvalue()
+    buf.truncate(0)
+    buf.seek(0)
+    feed_tool_call(renderer)
+    feed_tool_result(renderer, "日志中包含仍在运行这几个字\n退出码 0")
+    assert "Ran Bash" in buf.getvalue()

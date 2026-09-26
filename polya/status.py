@@ -66,6 +66,7 @@ def render_status(snapshot: StatusSnapshot) -> str:
         f"- 工具调用累计:\n{calls}\n"
         f"{todo_lines}"
         f"- token 用量: prompt {usage.get('prompt_tokens', 0)},"
-        f" completion {usage.get('completion_tokens', 0)}\n"
+        f" completion {usage.get('completion_tokens', 0)},"
+        f" cached {usage.get('cached_tokens', 0)}\n"
         "</agent_status>"
     )
