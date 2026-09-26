@@ -3,6 +3,8 @@ name = "polya"
 version = "0.1.0"
 description = "一个最小可运行的 LLM 工具调用 Agent"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0",

@@ -4,6 +4,8 @@
 自带一组本地编码工具，可以直接当编码代理用。内部（包名 / CLI 命令 / 品牌）一律叫 **polya**，
 取自波利亚（G. Pólya，《怎样解题》）——问题求解代理的祖师爷。
 
+[English README](./README.md)
+
 ## 安装
 
 需要 Python 3.10+，推荐用 [uv](https://docs.astral.sh/uv/)：
@@ -60,17 +62,28 @@ REPL 斜杠命令：
 | `/plan on\|off` | 随时切换规划模式（`exit_plan_mode` 构造时已注册，切换不动工具数组，缓存安全） |
 | `/expand [N]` | 展开最近 N 块（默认 5）的工具结果 / 思考全文——滚动区的折叠块在这里看全量 |
 | `/reset` | 清空对话历史、TODO 与统计 |
-| `/exit` `/quit` | 退出（输入处 Ctrl+D / Ctrl+C 同效） |
+| `/exit` `/quit` | 退出（输入处 Ctrl+D / 空框双击 Ctrl+C 同效） |
 
-**审批交互**：危险工具执行前先展示**变更预览**，再弹出选择列表——写类工具
+**输入前缀**：`!command` 本地跑 shell、输出进上下文（8000 字符截断）；`#note`
+追加一行到项目记忆 `AGENTS.md`（下节）；`@` 触发文件路径补全；`/` 补全命令并带说明列。
+大段粘贴自动折叠为 `[Pasted #1 +200 lines]`，提交时展开全文送模型。
+
+**项目记忆**：工作目录有 `AGENTS.md` 时，启动读一次、注入系统提示词尾部——会话内
+不变，不违「系统提示词静态」铁律的精神（铁律防的是逐轮变更破缓存）；`#` 前缀写入的
+内容下次会话生效。
+
+**审批交互**：危险工具执行前先展示**变更预览**，再弹出四选项列表——写类工具
 （`write_file`/`edit_file`/`multi_edit`）给出与磁盘现状比对的行级 diff（红删绿增，
-新文件整块标绿，超过 40 行折叠并标注），`bash` 展示完整命令。选项带说明：
-`允许`（执行本次调用）、`总是允许`（本会话内该工具不再询问）、`拒绝`（让模型
-调整方案）；↑/↓ + Enter 或数字键选择，Esc 拒绝，光标默认停在「拒绝」——Enter
-单按绝不放行。`--plan` 模式下计划全文展示后同样以选择列表批准。非交互环境
-（管道/CI）默认拒绝一切危险操作，`--yes` 才放行（仅在信任任务时使用）。
+新文件整块标绿，超过 40 行折叠并标注），`bash` 展示完整命令。选项：`1 允许`（执行
+本次调用）、`2 本会话前缀授权`（如 `bash(pytest tests/test_a.py:*)`，命中即不再询问；
+**含 `&&` `;` `|` 的复合命令不给此选项**，已有前缀规则也不覆盖复合命令）、
+`3 修改后执行`（仅 bash：预填原命令改完重跑）、`4 拒绝`（可附理由，回传给模型）。
+↑/↓ + Enter 或数字键选择，光标默认停在「拒绝」——**Enter 单按绝不放行**。命中高危
+启发式（`rm -rf`、`sudo`、`curl|sh`、`push -f`，只匹 bash 命令串）时不给授权出口。
+`--plan` 模式下计划全文展示后同样以选择列表批准。非交互环境（管道/CI）默认拒绝一切
+危险操作，`--yes` 才放行（但高危仍会询问）。
 **中断**：`run()` 执行中按 Ctrl+C 只终止本次任务（历史保留，未回填的工具结果自动补齐，
-对话可继续）；输入提示处按 Ctrl+C/Ctrl+D 直接退出。
+对话可继续）；输入框 Ctrl+C 先清空输入，空框 2 秒内双击退出，Ctrl+D 直接退出。
 
 ### 交互与显示
 
@@ -148,7 +161,8 @@ agent = Agent(
 - 工具执行抛出的异常不会中断循环，而是作为错误文本交回模型，让它自行调整——例如参数写错时
   模型有机会重试。
 - `approve(tool, arguments) -> bool` 是副作用工具的审批钩子：返回 `False` 时该次调用被跳过，
-  模型会收到「用户拒绝」并把结果纳入下一步推理。`Tool.dangerous` 标记了写文件、执行命令这类工具。
+  模型会收到「用户拒绝」并把结果纳入下一步推理。`Tool.kind`（read/write/exec）标记副作用
+  分类，`Tool.dangerous` 保留为兼容视图（`kind != "read"`）。
 - 同一个 `Agent` 实例会保留对话历史，可直接连续调用 `run()` 进行多轮对话；需要重新开始时调用
   `agent.reset()`。
 - `max_steps` 限制单次 `run()` 内最多循环多少轮，防止模型陷入反复调用工具的循环。
@@ -157,21 +171,26 @@ agent = Agent(
   也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易
   数错——状态栏用代码提前算好。更新采用持久追加（旧状态留在轨迹里，不删改），KV Cache
   前缀始终稳定。也可传入自定义渲染函数 `status_bar=lambda snapshot: ...`。
-- `on_event(event, payload)` 是可选观测钩子，CLI 的终端渲染（`polya/ui.py` 的
-  `TerminalRenderer`）就建立在它之上；不设钩子时零开销、核心逻辑不受影响，任何前端
-  （REPL、全屏 TUI、Web）都能接这条事件流。事件词表（时序：`iteration → [usage] →
-  *_delta* → assistant_message → (tool_call → tool_result)*`）：
+- **生成器协议**（ADR 0002，取代旧的 `on_event` 回调）：agent 是一个生成器，
+  `yield` 统一事件、`result = yield ToolCall(...)` 把工具的执行权与审批交给消费方
+  （驱动层）。`run()` 是**内置驱动**（消费生成器 + approve 策略 + 执行器），库用法、
+  `-p` 模式与测试复用；需要自定义审批或实时渲染的前端直接消费 `steps()`——CLI 的
+  交互驱动（`polya/loop.py`）就这么做。事件词表（`polya/agent.py`，时序：
+  `iteration → [usage] → *_delta* → assistant_message → (tool_call)*`，工具结果由
+  驱动层执行后回填）：
 
   | 事件 | 载荷 | 时机 |
   |---|---|---|
   | `iteration` | `{step, max_steps}` | 每轮迭代开头 |
-  | `reasoning_delta` / `text_delta` | `{delta}` | 流式片段（设置了钩子且未 `stream=False` 时，LLM 走流式） |
+  | `reasoning_delta` / `text_delta` | `{delta}` | 流式片段（LLM 走流式；`stream=False` 关闭） |
   | `assistant_message` | `{content, reasoning, tool_calls}` | 一轮完整消息落历史后 |
-  | `tool_call` | `{name, call_id, arguments}` | 工具分发前（参数已解析） |
-  | `tool_result` | `{name, call_id, result, duration_s, error}` | 结果回填历史后（`result` 为原始结果） |
+  | `tool_call` | `{name, call_id, arguments}` | 请求工具执行，期待 send 回结果字符串 |
   | `usage` | `{last, total}` | 仅当本次响应带 usage |
+  | `compaction` | `{before, after}` | 上下文压缩发生时 |
+  | `plan_submitted` | `{plan}` | 规划模式提交计划，期待驱动层审批后回填 |
 
-  注意它与 `status_bar` 不同：后者是给**模型**看的上下文内容，`on_event` 是给**人**看的进度信号。
+  注意它与 `status_bar` 不同：后者是给**模型**看的上下文内容，事件流是给**驱动层**看的
+  控制与进度信号。
 - `agent.total_usage` / `agent.last_usage` 累计/记录每次请求的 token 用量（响应里没有
   usage 字段时保持为 0 / `None`，不会报错）；只做统计，不进消息历史，不影响缓存前缀。
 - **两阶段模式**：`Agent(plan_mode=True, approve_plan=回调)` 启动时进入规划模式——
@@ -202,27 +221,30 @@ agent = Agent(
   重置（压缩点是合法的推理重启点）。
 - 不传 `system_prompt` 时使用内置的通用提示词；`default_tools` 建议搭配
   `polya.builtin.CODING_SYSTEM_PROMPT`（围绕内置工具的工作流：任务拆解 → 探查 →
-  小步修改 → 验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是改写提示词。
+  小步修改 → 验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是
+  改写提示词。唯一 sanctioned 例外：CLI 启动时把项目记忆 `AGENTS.md` 读一次注入系统提示词
+  尾部（准静态：会话内不变）。
 
 ## 内置工具
 
 `default_tools(root)` 返回以下工具，**所有文件操作都被限制在 `root` 目录内**——解析路径后校验，
-`../` 和绝对路径都会被拒绝：
+`../` 和绝对路径都会被拒绝。`kind` 是副作用分类（权限判定按它走）：`read` 无副作用直接放行、
+`write` 写文件、`exec` 执行命令：
 
-| 工具 | 副作用 | 说明 |
+| 工具 | kind | 说明 |
 |---|---|---|
-| `read_file` | — | 读文件，**输出带行号**；支持行号片段；拒绝二进制和超大文件 |
-| `list_dir` | — | 列目录（单层），子目录以 `/` 结尾 |
-| `glob` | — | 按文件名模式递归找文件（自动跳过 `.venv`/`.git` 等） |
-| `grep` | — | 正则搜索内容，支持**上下文行**、忽略大小写、`glob` 限定文件名 |
-| `write_file` | ⚠️ | 写/覆盖文件，自动创建父目录 |
-| `edit_file` | ⚠️ | 定点替换，默认要求匹配唯一 |
-| `multi_edit` | ⚠️ | 一次多处替换，**原子生效**（任一处失败全不落盘） |
-| `bash` | ⚠️ | **持久会话**执行命令：cwd/环境变量跨调用保持 |
-| `bash_output` | — | 非阻塞读取会话新输出（后台/慢速命令） |
-| `kill_bash` | ⚠️ | 终止持久会话 |
-| `web_fetch` | — | 抓取 URL，HTML 转文本，`<external_content>` 包裹防注入；**拒绝内网/localhost（SSRF 防护）** |
-| `todo_write` | — | 全量重写 TODO 清单（可选；需 `default_tools(todos=store)` + `Agent(todos=store)` 共享同一实例） |
+| `read_file` | read | 读文件，**输出带行号**；支持行号片段；拒绝二进制和超大文件 |
+| `list_dir` | read | 列目录（单层），子目录以 `/` 结尾 |
+| `glob` | read | 按文件名模式递归找文件（自动跳过 `.venv`/`.git` 等） |
+| `grep` | read | 正则搜索内容，支持**上下文行**、忽略大小写、`glob` 限定文件名 |
+| `write_file` | write | 写/覆盖文件，自动创建父目录 |
+| `edit_file` | write | 定点替换，默认要求匹配唯一 |
+| `multi_edit` | write | 一次多处替换，**原子生效**（任一处失败全不落盘） |
+| `bash` | exec | **持久会话**执行命令：cwd/环境变量跨调用保持 |
+| `bash_output` | read | 非阻塞读取会话新输出（后台/慢速命令） |
+| `kill_bash` | exec | 终止持久会话 |
+| `web_fetch` | read | 抓取 URL，HTML 转文本，`<external_content>` 包裹防注入；**拒绝内网/localhost（SSRF 防护）** |
+| `todo_write` | read | 全量重写 TODO 清单（可选；需 `default_tools(todos=store)` + `Agent(todos=store)` 共享同一实例） |
 
 工具结果会进上下文，因此输出统一截断到 8000 字符。`bash` 会话超时会终止并重启
 （环境状态丢失）；命令必须非交互。`web_fetch` 用标准库实现，零第三方依赖。
@@ -238,19 +260,24 @@ TODO 清单是状态栏的「任务规划」组件：`todo_write` 写入共享�
 
 ```
 polya/
-  agent.py    # 核心循环 + 审批钩子 + 状态栏注入 + on_event 进度钩子
-  cli.py      # 命令行入口：REPL + 单任务模式 + 终端审批 + rich/prompt_toolkit 显示层
-  llm.py      # OpenAI 兼容接口封装
-  tools.py    # @tool 装饰器与工具注册表（框架层）
-  builtin.py  # 内置编码工具 + 编码代理提示词（内容层）
-  shell.py    # 持久 bash 会话（读线程 + 哨兵标记协议）
-  web.py      # web_fetch：抓取 + HTML 转文本 + 来源标记
-  status.py   # 状态栏快照与默认渲染器
-  todos.py    # TODO 清单存储（外部记忆）
-  compact.py  # 上下文压缩：原地替换 + 摘要重启（按模型能力选择）
-  providers.py # 模型能力声明：只问能力不特判型号
-demo.py       # 可运行示例（库用法）
-tests/        # 用假 LLM 验证循环 + 内置工具/会话/抓取的沙箱测试
+  agent.py       # 生成器协议：事件联合类型 + steps() + run() 内置驱动（ADR 0002）
+  loop.py        # 交互驱动：渲染 / 权限判定 / 审批四选项 / 执行 / 输入分流（! # /）
+  input.py       # InputBox：多行编辑、@ 路径补全、粘贴折叠、Ctrl+C 双击退出、状态栏
+  render.py      # 滚动区 + live 区渲染器与共享 Console
+  permissions.py # decide() 六步判定 + 高危启发式表 + 前缀授权规则
+  executor.py    # 工具执行器（loop 与 run() 共用）
+  cli.py         # argparse + Agent 装配 + 单任务模式 + AGENTS.md 启动注入
+  llm.py         # OpenAI 兼容接口封装：chat(on_delta) 与 chat_iter 双形态
+  tools.py       # @tool 装饰器与工具注册表（kind 分类）
+  builtin.py     # 内置编码工具 + 编码代理提示词（内容层）
+  shell.py       # 持久 bash 会话（读线程 + 哨兵标记协议）
+  web.py         # web_fetch：抓取 + HTML 转文本 + 来源标记
+  status.py      # 状态栏快照与默认渲染器
+  todos.py       # TODO 清单存储（外部记忆）
+  compact.py     # 上下文压缩：原地替换 + 摘要重启（按模型能力选择）
+  providers.py   # 模型能力声明：只问能力不特判型号
+demo.py         # 可运行示例（库用法）
+tests/          # 用假 LLM 验证循环 + 内置工具/会话/抓取的沙箱测试
 ```
 
 ## 测试
