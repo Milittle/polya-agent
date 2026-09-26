@@ -27,6 +27,9 @@ from rich.markdown import Markdown
 from rich.spinner import Spinner
 from rich.text import Text
 
+console = Console()  # stdout：只承载答案与命令输出（-p 可安全重定向/管道）
+ui = Console(stderr=True)  # stderr：状态条 / 日志 / 审批面板等“界面”输出
+
 # 阶段标签：thinking=等待首个片段 / streaming=正文流入 / tool=工具执行中
 PHASE_THINKING = "thinking"
 PHASE_STREAMING = "streaming"

@@ -3,8 +3,9 @@
 所有文件操作都被限制在 :func:`default_tools` 传入的 ``root`` 目录内，
 解析后校验，防止 ``../`` 或绝对路径穿越到目录外。
 
-``write_file`` / ``edit_file`` / ``run_shell`` 标记为 ``dangerous``，
-可交给 :class:`~polya.agent.Agent` 的 ``approve`` 钩子在执行前拦截。
+``write_file`` / ``edit_file`` / ``multi_edit`` 归类 ``kind="write"``、``bash`` /
+``kill_bash`` 归类 ``kind="exec"``，可交给 :class:`~polya.agent.Agent` 的 ``approve``
+钩子在执行前拦截。
 """
 
 from __future__ import annotations
@@ -235,7 +236,7 @@ def default_tools(
             listing = "\n".join(matches[:200]) + "\n... [命中过多，已截断]"
         return _truncate(listing)
 
-    @tool(name="write_file", dangerous=True)
+    @tool(name="write_file", kind="write")
     def write_file(path: str, content: str) -> str:
         """把 content 整体写入文件，已存在则**完全覆盖**，父目录自动创建。
         仅用于新建文件或完整重写；修改已有文件的个别位置必须用 edit_file，
@@ -245,7 +246,7 @@ def default_tools(
         target.write_text(content, encoding="utf-8")
         return f"已写入 {target.relative_to(base)}（{len(content)} 字符）"
 
-    @tool(name="edit_file", dangerous=True)
+    @tool(name="edit_file", kind="write")
     def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
         """定点替换：把文件中的 old_string 精确替换为 new_string。old_string 必须与文件内容
         逐字符匹配（含缩进），默认要求全文件唯一——不唯一时补充上下文使其唯一，
@@ -262,7 +263,7 @@ def default_tools(
         target.write_text(text.replace(old_string, new_string), encoding="utf-8")
         return f"已修改 {target.relative_to(base)}（{count} 处）"
 
-    @tool(name="multi_edit", dangerous=True)
+    @tool(name="multi_edit", kind="write")
     def multi_edit(path: str, edits: list[dict]) -> str:
         """一次应用多处替换，原子生效：任何一处失败，整个文件都不会被修改。
         edits 是 [{"old_string": ..., "new_string": ...}, ...]，按顺序应用；每个
@@ -289,7 +290,7 @@ def default_tools(
         target.write_text(draft, encoding="utf-8")
         return f"已修改 {target.relative_to(base)}（{len(edits)} 处）"
 
-    @tool(name="bash", dangerous=True)
+    @tool(name="bash", kind="exec")
     def bash(command: str, timeout: int = 10) -> str:
         """在持久 shell 会话中执行命令：cwd、环境变量跨调用保持，dev server 等
         后台任务可事后用 bash_output 读取。用于验证：跑测试、语法检查、编译。
@@ -302,7 +303,7 @@ def default_tools(
         """读取持久会话当前已产生的新输出，不等待命令结束——用于后台/慢速命令。"""
         return _truncate(session.output())
 
-    @tool(name="kill_bash", dangerous=True)
+    @tool(name="kill_bash", kind="exec")
     def kill_bash() -> str:
         """终止持久 shell 会话（命令卡死、想清理环境时用）；下次 bash 自动重启。"""
         session.kill()

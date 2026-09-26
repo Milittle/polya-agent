@@ -39,13 +39,25 @@ def _json_schema(annotation: Any) -> str | dict:
     return _JSON_TYPES.get(annotation, "string")
 
 
+KINDS = ("read", "write", "exec")
+
+
 @dataclass
 class Tool:
     name: str
     description: str
     parameters: dict
     fn: Callable[..., Any]
-    dangerous: bool = False
+    kind: str = "read"  # read=无外部副作用 / write=写文件 / exec=执行命令，权限判定按此分类
+
+    def __post_init__(self):
+        if self.kind not in KINDS:
+            raise ValueError(f"未知工具类别 kind={self.kind!r}，可选：{KINDS}")
+
+    @property
+    def dangerous(self) -> bool:
+        """兼容视图：有副作用（write/exec）即危险。审批全面迁到 kind 判定后移除。"""
+        return self.kind != "read"
 
     def run(self, arguments: dict) -> str:
         """执行工具并把返回值统一成字符串。"""
@@ -124,13 +136,14 @@ def tool(
     *,
     name: str | None = None,
     description: str | None = None,
-    dangerous: bool = False,
+    kind: str = "read",
 ):
     """把函数包装成 :class:`Tool`。
 
-    可以作为 ``@tool`` 直接使用，也可以用 ``@tool(name=..., dangerous=True)`` 覆盖元信息。
-    未显式提供 description 时，取函数的 docstring。``dangerous`` 标记有副作用的工具
-    （写文件、执行命令等），供 Agent 的审批钩子识别。
+    可以作为 ``@tool`` 直接使用，也可以用 ``@tool(name=..., kind=...)`` 覆盖元信息。
+    未显式提供 description 时，取函数的 docstring。``kind`` 按副作用分类：
+    ``read``（无外部副作用，直接放行）/ ``write``（写文件）/ ``exec``（执行命令），
+    供权限判定与审批钩子识别。
     """
 
     def wrap(func: Callable) -> Tool:
@@ -150,7 +163,7 @@ def tool(
             description=resolved_description,
             parameters=parameters,
             fn=func,
-            dangerous=dangerous,
+            kind=kind,
         )
 
     return wrap(fn) if fn is not None else wrap

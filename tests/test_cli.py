@@ -8,9 +8,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from polya import Agent, tool
-from polya.cli import build_agent, handle_command, main, make_session, parse_args, terminal_approve
+from polya.cli import build_agent, main, parse_args
+from polya.loop import handle_command, terminal_approve
+from polya.render import TerminalRenderer
 from polya.todos import TodoStore
-from polya.ui import TerminalRenderer
 
 
 def make_message(content=None, tool_calls=None):
@@ -39,7 +40,7 @@ def add(a: int, b: int) -> str:
     return str(a + b)
 
 
-@tool(name="write_thing", dangerous=True)
+@tool(name="write_thing", kind="write")
 def write_thing(content: str) -> str:
     """写点东西（测试用危险工具）。"""
     return f"已写入: {content}"
@@ -98,13 +99,13 @@ def test_unknown_command():
 
 
 def test_terminal_approve_yes_no_always(monkeypatch):
-    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: 0)
+    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: 0)
     approve = terminal_approve(interactive=True)
     assert approve(add, {}) is True  # 只读工具直接放行，不询问
 
     # 选择列表下标：0 允许 / 1 总是允许 / 2 拒绝
     answers = iter([2, 1])
-    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: next(answers))
+    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: next(answers))
     approve = terminal_approve(interactive=True)
     assert approve(write_thing, {"content": "x"}) is False  # 拒绝
     assert approve(write_thing, {"content": "y"}) is True  # 总是允许 → 放行
@@ -184,15 +185,17 @@ def test_expand_command_dispatches_to_renderer():
     assert "用法" in handle_command("/expand x", make_agent(), renderer)
 
 
-def test_make_session_is_multiline_with_placeholder():
+def test_input_box_builds_multiline_session(tmp_path):
     from prompt_toolkit import PromptSession
 
-    session = make_session()
-    assert isinstance(session, PromptSession)  # 多行/按键/占位由 pty 冒烟端到端验证
+    from polya.input import InputBox
+
+    box = InputBox(history_path=tmp_path / "history")
+    assert isinstance(box._session, PromptSession)  # 多行/按键/占位由 pty 冒烟端到端验证
 
 
 def test_slugify_keeps_kebab_case_only():
-    from polya.cli import _slugify
+    from polya.loop import _slugify
 
     assert _slugify("`Fix-Login-Bug`\n") == "fix-login-bug"
     assert _slugify("Count  README_words!") == "count-readme-words"
@@ -200,7 +203,7 @@ def test_slugify_keeps_kebab_case_only():
 
 
 def test_topic_from_local_fallbacks():
-    from polya.cli import _topic_from
+    from polya.loop import _topic_from
 
     assert _topic_from("Count README words") == "count-readme-words"
     assert _topic_from("统计单词数") == "统计单词数"  # 纯中文退化为截断原文
@@ -208,11 +211,11 @@ def test_topic_from_local_fallbacks():
 
 
 def test_rule_and_prompt_message_lay_out():
-    from polya.cli import _prompt_message, _rule
+    from polya.input import _rule, prompt_message
 
     assert _rule("hi", 10) == "── hi ────"
     assert _rule("", 6) == "──────"
-    message = _prompt_message({"topic": "count-readme-words"})
+    message = prompt_message({"topic": "count-readme-words"})
     text = "".join(fragment for _, fragment in message)
     assert "✳ count-readme-words" in text and text.endswith("❯ ")
 
@@ -224,7 +227,7 @@ def test_approve_cooperates_with_renderer_pause(monkeypatch):
     renderer.pause()
     renderer.resume()
 
-    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: 0)
+    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: 0)
     approve = terminal_approve(interactive=True, renderer=renderer)
     assert approve(write_thing, {"content": "x"}) is True
 
@@ -233,10 +236,12 @@ def test_approve_cooperates_with_renderer_pause(monkeypatch):
 
 
 def approve_and_capture(monkeypatch, capsys, root, name, arguments, choice=0):
-    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: choice)
+    kind = "exec" if name == "bash" else "write"
+    monkeypatch.setattr("polya.loop._select_option", lambda options, **kwargs: choice)
+    monkeypatch.setattr("polya.loop._ask_line", lambda label, default=None: "")
     approve = terminal_approve(interactive=True, root=root)
     approved = approve(
-        SimpleNamespace(name=name, dangerous=True, fn=None),
+        SimpleNamespace(name=name, kind=kind, dangerous=True, fn=None),
         arguments,  # noqa: SLF001
     )
     return approved, capsys.readouterr().err
@@ -273,8 +278,9 @@ def test_approval_bash_shows_full_command(monkeypatch, tmp_path, capsys):
 
 
 def test_approval_reject_and_always(monkeypatch, tmp_path, capsys):
+    # 四选项下标：bash = 0 允许 / 1 前缀授权 / 2 修改后执行 / 3 拒绝
     approved, _ = approve_and_capture(
-        monkeypatch, capsys, tmp_path, "bash", {"command": "ls"}, choice=2
+        monkeypatch, capsys, tmp_path, "bash", {"command": "ls"}, choice=3
     )
     assert approved is False
 
@@ -286,7 +292,7 @@ def test_approval_reject_and_always(monkeypatch, tmp_path, capsys):
 
 
 def test_diff_lines_truncates_with_note():
-    from polya.cli import _diff_lines
+    from polya.loop import _diff_lines
 
     old = "\n".join(f"old{i}" for i in range(60))
     new = "\n".join(f"new{i}" for i in range(60))
@@ -296,7 +302,7 @@ def test_diff_lines_truncates_with_note():
 
 
 def test_apply_edits_draft_flags_future_failures():
-    from polya.cli import _apply_edits_draft
+    from polya.loop import _apply_edits_draft
 
     text = "alpha beta\n"
     draft, error = _apply_edits_draft(text, [{"old_string": "alpha", "new_string": "gamma"}])

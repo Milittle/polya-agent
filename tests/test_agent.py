@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from polya import Agent, ToolRegistry, tool
-from polya.agent import DEFAULT_SYSTEM_PROMPT
+from polya.agent import DEFAULT_SYSTEM_PROMPT, PlanSubmitted, ToolCall, drive, event_payload
 
 
 def make_message(content=None, tool_calls=None):
@@ -96,20 +96,34 @@ def test_array_parameter_schema_is_generated():
     assert params["required"] == ["edits", "name"]
 
 
-def test_on_event_emits_full_sequence():
-    """进度钩子按新词表发完整事件序列（duration_s 不定，剥掉后精确比较）。"""
+def collect(agent, prompt):
+    """消费 steps() 收集事件；ToolCall / PlanSubmitted 用内置驱动策略回填。"""
     events = []
+
+    def handle(ev):
+        events.append(ev)
+        if isinstance(ev, ToolCall):
+            return agent._builtin_tool(ev)
+        if isinstance(ev, PlanSubmitted):
+            return agent._handle_plan(ev.plan)
+        return None
+
+    return drive(agent.steps(prompt), handle), events
+
+
+def test_steps_emits_event_sequence():
+    """生成器词表契约：事件序列精确锁定（tool_result 由驱动层渲染，不在此列）。"""
     llm = ScriptedLLM(
         [
             make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 2, "b": 3}')]),
             make_message(content="5"),
         ]
     )
-    agent = Agent(llm=llm, tools=[add], max_steps=5, on_event=lambda e, p: events.append((e, p)))
+    agent = Agent(llm=llm, tools=[add], max_steps=5)
 
-    assert agent.run("2 + 3") == "5"
-    normalized = [(e, {k: v for k, v in p.items() if k != "duration_s"}) for e, p in events]
-    assert normalized == [
+    answer, events = collect(agent, "2 + 3")
+    assert answer == "5"
+    assert [(e.event, event_payload(e)) for e in events] == [
         ("iteration", {"step": 1, "max_steps": 5}),
         (
             "assistant_message",
@@ -120,51 +134,39 @@ def test_on_event_emits_full_sequence():
             },
         ),
         ("tool_call", {"name": "add", "call_id": "c1", "arguments": {"a": 2, "b": 3}}),
-        ("tool_result", {"name": "add", "call_id": "c1", "result": "5", "error": False}),
         ("iteration", {"step": 2, "max_steps": 5}),
         ("text_delta", {"delta": "5"}),
         ("assistant_message", {"content": "5", "reasoning": None, "tool_calls": []}),
     ]
 
 
-def test_agent_without_on_event_still_runs():
-    """未设置钩子时零开销、行为不变。"""
+def test_agent_runs_without_any_consumer():
+    """内置驱动单独可用，行为不变。"""
     agent = Agent(llm=ScriptedLLM([make_message(content="好")]), tools=[add])
-    assert agent.on_event is None
     assert agent.run("hi") == "好"
 
 
-def test_streaming_requires_event_consumer():
-    """on_event 未设或 stream=False 时 LLM 收不到 on_delta（保持非流式请求）。"""
+def test_stream_switch_controls_on_delta():
+    """stream=False 保持非流式请求；默认流式（回调式客户端也收到 on_delta）。"""
     llm = ScriptedLLM([make_message(content="好")])
-    Agent(llm=llm, tools=[add]).run("hi")
-    assert all(call["on_delta"] is None for call in llm.calls)
-
-    llm = ScriptedLLM([make_message(content="好")])
-    Agent(llm=llm, tools=[add], stream=False, on_event=lambda e, p: None).run("hi")
+    Agent(llm=llm, tools=[add], stream=False).run("hi")
     assert all(call["on_delta"] is None for call in llm.calls)
 
     llm = ScriptedLLM([make_message(content="你好")])
-    Agent(llm=llm, tools=[add], on_event=lambda e, p: None).run("hi")
+    Agent(llm=llm, tools=[add]).run("hi")
     assert all(call["on_delta"] is not None for call in llm.calls)
 
 
-def test_tool_result_event_carries_raw_result():
-    """UI 事件拿原始结果；历史里给模型的是带计数标注的版本（两者互不污染）。"""
-    events = []
+def test_history_tool_message_gets_annotation():
+    """历史里给模型的是带计数标注的版本（UI 拿原始结果由驱动层负责）。"""
     llm = ScriptedLLM(
         [
             make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 2, "b": 3}')]),
             make_message(content="5"),
         ]
     )
-    agent = Agent(
-        llm=llm, tools=[add], status_bar=True, on_event=lambda e, p: events.append((e, p))
-    )
+    agent = Agent(llm=llm, tools=[add], status_bar=True)
     agent.run("2+3")
-    [payload] = [p for e, p in events if e == "tool_result"]
-    assert payload["result"] == "5"
-    # 同一次调用，历史里的 tool 消息带「第 N 次调用」标注（模型侧机制不变）
     [tool_message] = [m for m in llm.calls[1]["messages"] if m.get("role") == "tool"]
     assert tool_message["content"] == "（add 第 1 次调用）\n5"
 
@@ -184,7 +186,7 @@ def test_interrupt_during_stream_leaves_history_valid():
             raise KeyboardInterrupt
 
     llm = InterruptingLLM()
-    agent = Agent(llm=llm, tools=[add], prefix_check=True, on_event=lambda e, p: None)
+    agent = Agent(llm=llm, tools=[add], prefix_check=True)
     with pytest.raises(KeyboardInterrupt):
         agent.run("hi")
     assert agent.history == [{"role": "user", "content": "hi"}]
@@ -196,16 +198,16 @@ def test_interrupt_during_stream_leaves_history_valid():
 
 def test_usage_event_only_when_response_carries_usage():
     usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
-    events = []
     llm = ScriptedLLM([make_message(content="好")], usages=[usage])
-    Agent(llm=llm, tools=[add], on_event=lambda e, p: events.append((e, p))).run("hi")
+    _, events = collect(Agent(llm=llm, tools=[add]), "hi")
     expected = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-    assert [p for e, p in events if e == "usage"] == [{"last": expected, "total": expected}]
+    assert [event_payload(e) for e in events if e.event == "usage"] == [
+        {"last": expected, "total": expected}
+    ]
 
-    events = []
     llm = ScriptedLLM([make_message(content="好")])  # 不带 usage 的响应
-    Agent(llm=llm, tools=[add], on_event=lambda e, p: events.append((e, p))).run("hi")
-    assert not [e for e, _ in events if e == "usage"]
+    _, events = collect(Agent(llm=llm, tools=[add]), "hi")
+    assert not [e for e in events if e.event == "usage"]
 
 
 def test_agent_runs_tool_then_answers():

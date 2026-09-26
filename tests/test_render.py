@@ -6,7 +6,7 @@ from io import StringIO
 
 from rich.console import Console
 
-from polya.ui import TerminalRenderer, _collapse
+from polya.render import TerminalRenderer, _collapse
 
 
 def make_renderer(**kwargs) -> tuple[TerminalRenderer, StringIO]:
@@ -123,7 +123,7 @@ def test_commit_clears_state_for_next_iteration():
 
 
 def test_header_arg_specializes_by_tool():
-    from polya.ui import _header_arg
+    from polya.render import _header_arg
 
     assert _header_arg("bash", {"command": "pytest -q"}) == "$ pytest -q"
     assert _header_arg("bash", {"command": "a &&\nb"}) == "$ a && ⏎ b"

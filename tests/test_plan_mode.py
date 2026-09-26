@@ -13,7 +13,7 @@ def add(a: int, b: int) -> str:
     return str(a + b)
 
 
-@tool(name="write_thing", dangerous=True)
+@tool(name="write_thing", kind="write")
 def write_thing(content: str) -> str:
     """写点东西（测试用危险工具）。"""
     return f"已写入: {content}"

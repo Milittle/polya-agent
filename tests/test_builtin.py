@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from polya.builtin import default_tools
-from polya.tools import ToolRegistry
+from polya.todos import TodoStore
+from polya.tools import ToolRegistry, tool
 
 
 @pytest.fixture
@@ -221,13 +222,36 @@ def test_web_fetch_blocks_ssrf_targets(tools):
         assert "拒绝" in result, url
 
 
-def test_dangerous_flags():
+def test_kinds():
+    """kind 分类表锁定（spec：read 无副作用直接放行 / write 写文件 / exec 执行命令）。"""
+    expected = {
+        "read_file": "read",
+        "list_dir": "read",
+        "glob": "read",
+        "grep": "read",
+        "bash_output": "read",
+        "web_fetch": "read",
+        "write_file": "write",
+        "edit_file": "write",
+        "multi_edit": "write",
+        "bash": "exec",
+        "kill_bash": "exec",
+    }
     by_name = {item.name: item for item in default_tools(".")}
+    for name, kind in expected.items():
+        assert by_name[name].kind == kind, name
+        assert by_name[name].dangerous == (kind != "read"), name  # 兼容视图随分类走
+    # todo_write 可选启用，归类 read（外部记忆，无文件系统副作用）
+    with_todos = {item.name: item.kind for item in default_tools(".", todos=TodoStore())}
+    assert with_todos["todo_write"] == "read"
 
-    for name in ("write_file", "edit_file", "multi_edit", "bash", "kill_bash"):
-        assert by_name[name].dangerous is True, name
-    for name in ("read_file", "list_dir", "glob", "grep", "bash_output", "web_fetch"):
-        assert by_name[name].dangerous is False, name
+
+def test_rejects_unknown_kind():
+    with pytest.raises(ValueError, match="kind"):
+
+        @tool(name="bad", kind="wat")
+        def bad() -> str:
+            return ""
 
 
 def test_tool_descriptions_carry_usage_guidance():

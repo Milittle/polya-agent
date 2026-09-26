@@ -27,64 +27,83 @@ logger = logging.getLogger("polya.llm")
 DeltaCallback = Callable[[str, str], None]
 
 
+def _new_stream_state() -> dict:
+    return {
+        "content_parts": [],
+        "reasoning_parts": [],
+        "tool_calls": {},
+        "finish_reason": None,
+        "usage": None,
+    }
+
+
+def fold_chunk(state: dict, chunk) -> list[tuple[str, str]]:
+    """把一个流式 chunk 折叠进累积态 ``state``（就地修改），返回它产出的
+    ``(kind, delta)`` 列表——回调式（accumulate_stream）与迭代器式
+    （LLM.chat_iter）共享这一份折叠逻辑，行为不会分叉。
+
+    chunk 只按鸭子类型访问（SDK 的 ``ChatCompletionChunk`` 或测试假件均可）：
+    ``delta.content`` / ``delta.reasoning_content`` 各自拼接；``delta.tool_calls[i]``
+    按 index 键控合并——id/name 只在首片段携带，arguments 永远分片拼接，
+    两个工具交错分片也能各自归位；尾部 usage-only chunk 只承载 usage。
+    """
+    emitted: list[tuple[str, str]] = []
+    chunk_usage = getattr(chunk, "usage", None)
+    if chunk_usage is not None:
+        state["usage"] = chunk_usage  # 尾包可能只带 usage
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return emitted
+    choice = choices[0]  # 从不传 n>1
+    if choice.finish_reason:
+        state["finish_reason"] = choice.finish_reason
+    delta = getattr(choice, "delta", None)
+    if delta is None:
+        return emitted
+    reasoning = getattr(delta, "reasoning_content", None)
+    if reasoning:
+        state["reasoning_parts"].append(reasoning)
+        emitted.append(("reasoning", reasoning))
+    if delta.content:  # 空串片段跳过
+        state["content_parts"].append(delta.content)
+        emitted.append(("text", delta.content))
+    for tc in delta.tool_calls or []:
+        index = tc.index if tc.index is not None else 0
+        slot = state["tool_calls"].setdefault(index, {"id": "", "name": "", "arguments": ""})
+        if tc.id:
+            slot["id"] = tc.id
+        if tc.function is not None:  # 个别端点会发只带 index 的占位片段
+            if tc.function.name:
+                slot["name"] = tc.function.name
+            if tc.function.arguments:
+                slot["arguments"] += tc.function.arguments
+    return emitted
+
+
+def _finalize_stream(state: dict) -> dict:
+    """累积态 → 与非流式消息同形的消息 dict（纯工具轮 content 为 None）。"""
+    return {
+        "content": "".join(state["content_parts"]) or None,
+        "reasoning_content": "".join(state["reasoning_parts"]) or None,
+        "tool_calls": [state["tool_calls"][index] for index in sorted(state["tool_calls"])],
+        "finish_reason": state["finish_reason"],
+        "usage": state["usage"],
+    }
+
+
 def accumulate_stream(chunks: Iterable, on_delta: DeltaCallback | None = None) -> dict:
     """把 OpenAI 兼容的流式 chunk 序列累积成一条完整消息（纯函数，不发网络）。
 
-    chunk 只按鸭子类型访问（SDK 的 ``ChatCompletionChunk`` 或测试假件均可）：
-    ``delta.content`` / ``delta.reasoning_content``（DeepSeek 扩展字段，SDK 模型
-    ``extra="allow"`` 可直接 getattr）各自拼接并实时回调；``delta.tool_calls[i]``
-    按 index 键控合并——id/name 只在首片段携带（后续为 None），arguments 永远
-    分片拼接，两个工具交错分片也能各自归位；尾部 usage-only chunk
-    （``choices=[]``，由 ``stream_options={"include_usage": True}`` 产生）只承载
-    usage。输出与非流式消息同形：纯工具轮的 content 是 None 而非空串。
-
+    片段经 :func:`fold_chunk` 折叠并实时回调 ``on_delta(kind, delta)``。
     已知不处理的坏 provider 行为：每片段重复全量 arguments 会重复拼接；
     ``finish_reason`` 永不发则保持 None（Agent 不依赖它）。
     """
-    content_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    tool_calls: dict[int, dict] = {}
-    finish_reason: str | None = None
-    usage = None
+    state = _new_stream_state()
     for chunk in chunks:
-        chunk_usage = getattr(chunk, "usage", None)
-        if chunk_usage is not None:
-            usage = chunk_usage  # 尾包可能只带 usage
-        choices = getattr(chunk, "choices", None) or []
-        if not choices:
-            continue
-        choice = choices[0]  # 从不传 n>1
-        if choice.finish_reason:
-            finish_reason = choice.finish_reason
-        delta = getattr(choice, "delta", None)
-        if delta is None:
-            continue
-        reasoning = getattr(delta, "reasoning_content", None)
-        if reasoning:
-            reasoning_parts.append(reasoning)
+        for kind, delta in fold_chunk(state, chunk):
             if on_delta is not None:
-                on_delta("reasoning", reasoning)
-        if delta.content:  # 空串片段跳过，不发空回调
-            content_parts.append(delta.content)
-            if on_delta is not None:
-                on_delta("text", delta.content)
-        for tc in delta.tool_calls or []:
-            index = tc.index if tc.index is not None else 0
-            slot = tool_calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
-            if tc.id:
-                slot["id"] = tc.id
-            if tc.function is not None:  # 个别端点会发只带 index 的占位片段
-                if tc.function.name:
-                    slot["name"] = tc.function.name
-                if tc.function.arguments:
-                    slot["arguments"] += tc.function.arguments
-    return {
-        "content": "".join(content_parts) or None,
-        "reasoning_content": "".join(reasoning_parts) or None,
-        "tool_calls": [tool_calls[index] for index in sorted(tool_calls)],
-        "finish_reason": finish_reason,
-        "usage": usage,
-    }
+                on_delta(kind, delta)
+    return _finalize_stream(state)
 
 
 def _completion_from_stream(result: dict):
@@ -141,6 +160,54 @@ class LLM:
         # 首次失败即关闭并在本实例内记住（见 chat 的回退逻辑）
         self._stream_usage = True
 
+    def _base_kwargs(self, messages: list[dict], tools: list[dict] | None) -> dict:
+        kwargs: dict = {"model": self.model, "messages": messages}
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        if tools:
+            kwargs["tools"] = tools
+        return kwargs
+
+    def _open_stream(self, kwargs: dict):
+        """打开流式请求；端点不认 stream_options 时去掉重试一次并记住。"""
+        if self._stream_usage:
+            kwargs["stream_options"] = {"include_usage": True}
+        try:
+            return self.client.chat.completions.create(stream=True, **kwargs)
+        except BadRequestError:
+            # 400 在 create 时即抛（流尚未开始迭代），回退安全：该端点不认
+            # stream_options，去掉重试一次并记住，本实例之后不再携带。
+            if "stream_options" not in kwargs:
+                raise
+            self._stream_usage = False
+            del kwargs["stream_options"]
+            return self.client.chat.completions.create(stream=True, **kwargs)
+
+    def chat_iter(self, messages: list[dict], tools: list[dict] | None = None):
+        """流式的迭代器形态：``yield (kind, delta)``，结束的 ``StopIteration.value``
+        是与非流式同形的完整响应。
+
+        与 ``chat(on_delta=...)`` 共享 :func:`fold_chunk` 折叠逻辑——callback 是
+        它的一个特例。生成器协议（ADR 0002）用这个接口逐段 ``yield`` 事件。
+        """
+        kwargs = self._base_kwargs(messages, tools)
+        try:
+            stream = self._open_stream(kwargs)
+            state = _new_stream_state()
+            try:
+                for chunk in stream:
+                    yield from fold_chunk(state, chunk)
+            except (APITimeoutError, RateLimitError):
+                raise
+            return _completion_from_stream(_finalize_stream(state))
+        except (APITimeoutError, RateLimitError) as exc:
+            logger.warning(
+                "请求失败（%s）。若持续超时：调大 LLM(timeout=...)；429 限流会被 SDK 自动重试，"
+                "重试耗尽超时预算时也会表现为超时。",
+                type(exc).__name__,
+            )
+            raise
+
     def chat(
         self,
         messages: list[dict],
@@ -156,30 +223,11 @@ class LLM:
         429 会被 SDK 自动重试；重试把超时预算耗尽后表现为超时异常，这里补一句
         可操作的提示再抛出，避免误判成网络或模型能力问题。
         """
-        kwargs: dict = {
-            "model": self.model,
-            "messages": messages,
-        }
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
-        if tools:
-            kwargs["tools"] = tools
+        kwargs = self._base_kwargs(messages, tools)
         try:
             if on_delta is None:
                 return self.client.chat.completions.create(**kwargs)
-            if self._stream_usage:
-                kwargs["stream_options"] = {"include_usage": True}
-            try:
-                stream = self.client.chat.completions.create(stream=True, **kwargs)
-            except BadRequestError:
-                # 400 在 create 时即抛（流尚未开始迭代），回退安全：该端点不认
-                # stream_options，去掉重试一次并记住，本实例之后不再携带。
-                if "stream_options" not in kwargs:
-                    raise
-                self._stream_usage = False
-                del kwargs["stream_options"]
-                stream = self.client.chat.completions.create(stream=True, **kwargs)
-            return _completion_from_stream(accumulate_stream(stream, on_delta))
+            return _completion_from_stream(accumulate_stream(self._open_stream(kwargs), on_delta))
         except (APITimeoutError, RateLimitError) as exc:
             logger.warning(
                 "请求失败（%s）。若持续超时：调大 LLM(timeout=...)；429 限流会被 SDK 自动重试，"
