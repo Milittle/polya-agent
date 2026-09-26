@@ -32,7 +32,7 @@ class ScriptedLLM:
         self._replies = list(replies)
         self.calls: list[dict] = []
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, on_delta=None):
         self.calls.append({"messages": list(messages), "tools": tools})
         message = self._replies.pop(0)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)

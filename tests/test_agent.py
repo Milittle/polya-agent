@@ -27,6 +27,8 @@ class ScriptedLLM:
     """按脚本依次返回预设回复，并记录每次收到的消息。
 
     usages 可选，与 replies 一一对应；缺省用 None 模拟不带 usage 的响应。
+    on_delta 给定时模拟流式：reasoning / content 各拆两半回调，最终返回与
+    非流式完全相同的对象（mi_z.llm 流式路径的同形契约）。
     """
 
     def __init__(self, replies, usages=None):
@@ -34,11 +36,22 @@ class ScriptedLLM:
         self._usages = list(usages) if usages is not None else [None] * len(replies)
         self.calls: list[dict] = []
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, on_delta=None):
         # 做一次浅拷贝，避免后续对 messages 的修改影响断言
-        self.calls.append({"messages": list(messages), "tools": tools})
+        self.calls.append({"messages": list(messages), "tools": tools, "on_delta": on_delta})
         message = self._replies.pop(0)
         usage = self._usages.pop(0) if self._usages else None
+        if on_delta is not None:
+            for kind, text in (
+                ("reasoning", getattr(message, "reasoning_content", None)),
+                ("text", message.content),
+            ):
+                if not text:
+                    continue
+                half = len(text) // 2
+                if half:
+                    on_delta(kind, text[:half])
+                on_delta(kind, text[half:])
         return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
 
 
@@ -83,8 +96,8 @@ def test_array_parameter_schema_is_generated():
     assert params["required"] == ["edits", "name"]
 
 
-def test_on_event_emits_iteration_and_tool_call():
-    """进度钩子按序发出 iteration / tool_call 事件，供 UI 渲染实时状态。"""
+def test_on_event_emits_full_sequence():
+    """进度钩子按新词表发完整事件序列（duration_s 不定，剥掉后精确比较）。"""
     events = []
     llm = ScriptedLLM(
         [
@@ -95,10 +108,22 @@ def test_on_event_emits_iteration_and_tool_call():
     agent = Agent(llm=llm, tools=[add], max_steps=5, on_event=lambda e, p: events.append((e, p)))
 
     assert agent.run("2 + 3") == "5"
-    assert events == [
+    normalized = [(e, {k: v for k, v in p.items() if k != "duration_s"}) for e, p in events]
+    assert normalized == [
         ("iteration", {"step": 1, "max_steps": 5}),
-        ("tool_call", {"name": "add"}),
+        (
+            "assistant_message",
+            {
+                "content": "",
+                "reasoning": None,
+                "tool_calls": [{"id": "c1", "name": "add", "arguments": '{"a": 2, "b": 3}'}],
+            },
+        ),
+        ("tool_call", {"name": "add", "call_id": "c1", "arguments": {"a": 2, "b": 3}}),
+        ("tool_result", {"name": "add", "call_id": "c1", "result": "5", "error": False}),
         ("iteration", {"step": 2, "max_steps": 5}),
+        ("text_delta", {"delta": "5"}),
+        ("assistant_message", {"content": "5", "reasoning": None, "tool_calls": []}),
     ]
 
 
@@ -107,6 +132,80 @@ def test_agent_without_on_event_still_runs():
     agent = Agent(llm=ScriptedLLM([make_message(content="好")]), tools=[add])
     assert agent.on_event is None
     assert agent.run("hi") == "好"
+
+
+def test_streaming_requires_event_consumer():
+    """on_event 未设或 stream=False 时 LLM 收不到 on_delta（保持非流式请求）。"""
+    llm = ScriptedLLM([make_message(content="好")])
+    Agent(llm=llm, tools=[add]).run("hi")
+    assert all(call["on_delta"] is None for call in llm.calls)
+
+    llm = ScriptedLLM([make_message(content="好")])
+    Agent(llm=llm, tools=[add], stream=False, on_event=lambda e, p: None).run("hi")
+    assert all(call["on_delta"] is None for call in llm.calls)
+
+    llm = ScriptedLLM([make_message(content="你好")])
+    Agent(llm=llm, tools=[add], on_event=lambda e, p: None).run("hi")
+    assert all(call["on_delta"] is not None for call in llm.calls)
+
+
+def test_tool_result_event_carries_raw_result():
+    """UI 事件拿原始结果；历史里给模型的是带计数标注的版本（两者互不污染）。"""
+    events = []
+    llm = ScriptedLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 2, "b": 3}')]),
+            make_message(content="5"),
+        ]
+    )
+    agent = Agent(
+        llm=llm, tools=[add], status_bar=True, on_event=lambda e, p: events.append((e, p))
+    )
+    agent.run("2+3")
+    [payload] = [p for e, p in events if e == "tool_result"]
+    assert payload["result"] == "5"
+    # 同一次调用，历史里的 tool 消息带「第 N 次调用」标注（模型侧机制不变）
+    [tool_message] = [m for m in llm.calls[1]["messages"] if m.get("role") == "tool"]
+    assert tool_message["content"] == "（add 第 1 次调用）\n5"
+
+
+def test_interrupt_during_stream_leaves_history_valid():
+    """流中被 Ctrl+C：assistant 尚未完成，什么都没 append，历史天然合法。"""
+
+    class InterruptingLLM:
+        model = "fake"
+
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, messages, tools=None, on_delta=None):
+            self.calls.append({"messages": list(messages)})
+            on_delta("text", "部分输出")
+            raise KeyboardInterrupt
+
+    llm = InterruptingLLM()
+    agent = Agent(llm=llm, tools=[add], prefix_check=True, on_event=lambda e, p: None)
+    with pytest.raises(KeyboardInterrupt):
+        agent.run("hi")
+    assert agent.history == [{"role": "user", "content": "hi"}]
+
+    # 序列仍合法：换上正常 LLM 后能继续（prefix_check 通过 = 本次请求是上次的严格扩展）
+    agent.llm = ScriptedLLM([make_message(content="好")])
+    assert agent.run("继续") == "好"
+
+
+def test_usage_event_only_when_response_carries_usage():
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+    events = []
+    llm = ScriptedLLM([make_message(content="好")], usages=[usage])
+    Agent(llm=llm, tools=[add], on_event=lambda e, p: events.append((e, p))).run("hi")
+    expected = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert [p for e, p in events if e == "usage"] == [{"last": expected, "total": expected}]
+
+    events = []
+    llm = ScriptedLLM([make_message(content="好")])  # 不带 usage 的响应
+    Agent(llm=llm, tools=[add], on_event=lambda e, p: events.append((e, p))).run("hi")
+    assert not [e for e, _ in events if e == "usage"]
 
 
 def test_agent_runs_tool_then_answers():

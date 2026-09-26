@@ -12,6 +12,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from .shell import ShellSession
@@ -116,11 +117,14 @@ def _walk_files(root: Path, name_filter: str | None = None):
 def default_tools(
     root: str | os.PathLike[str] = ".",
     todos: TodoStore | None = None,
+    on_shell_output: Callable[[str], None] | None = None,
 ) -> list[Tool]:
     """构造一组受限在 ``root`` 目录内的编码工具。
 
     传入 ``todos``（与 ``Agent(todos=...)`` 同一实例）时额外提供 ``todo_write``
-    工具，清单会随状态栏每轮渲染到上下文末尾。
+    工具，清单会随状态栏每轮渲染到上下文末尾。传入 ``on_shell_output`` 时
+    bash 每产生一行输出就回调（agent 线程内同步调用），供 UI 实时展示运行中
+    命令的输出；引擎不感知 UI，这是唯一的输出旁路。
     """
     base = Path(root).resolve()
     session = ShellSession(str(base))
@@ -291,7 +295,7 @@ def default_tools(
         后台任务可事后用 bash_output 读取。用于验证：跑测试、语法检查、编译。
         命令必须非交互（等待输入的命令会一直跑到超时）。超时会终止会话（环境
         状态丢失，下次调用自动重启）。读文件/搜索优先用 read_file/grep/glob。"""
-        return _truncate(session.run(command, timeout))
+        return _truncate(session.run(command, timeout, on_line=on_shell_output))
 
     @tool(name="bash_output")
     def bash_output() -> str:

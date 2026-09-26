@@ -57,12 +57,17 @@ REPL 斜杠命令：
 | `/help` | 命令列表 |
 | `/todos` `/status` | 查看 TODO 清单 / 会话状态（模式、用量、工具计数） |
 | `/plan on\|off` | 随时切换规划模式（`exit_plan_mode` 构造时已注册，切换不动工具数组，缓存安全） |
+| `/expand [N]` | 展开最近 N 块（默认 5）的工具结果 / 思考全文——滚动区的折叠块在这里看全量 |
 | `/reset` | 清空对话历史、TODO 与统计 |
 | `/exit` `/quit` | 退出（输入处 Ctrl+D / Ctrl+C 同效） |
 
-**审批交互**：危险工具执行前询问 `允许执行 write_file(...)? [y/N/a]`——`y` 本次允许、
-`n` 拒绝、`a` 本会话内该工具不再询问；`--plan` 模式下计划全文展示后 `y/N` 批准。
-非交互环境（管道/CI）默认拒绝一切危险操作，`--yes` 才放行（仅在信任任务时使用）。
+**审批交互**：危险工具执行前先展示**变更预览**，再弹出选择列表——写类工具
+（`write_file`/`edit_file`/`multi_edit`）给出与磁盘现状比对的行级 diff（红删绿增，
+新文件整块标绿，超过 40 行折叠并标注），`bash` 展示完整命令。选项带说明：
+`允许`（执行本次调用）、`总是允许`（本会话内该工具不再询问）、`拒绝`（让模型
+调整方案）；↑/↓ + Enter 或数字键选择，Esc 拒绝，光标默认停在「拒绝」——Enter
+单按绝不放行。`--plan` 模式下计划全文展示后同样以选择列表批准。非交互环境
+（管道/CI）默认拒绝一切危险操作，`--yes` 才放行（仅在信任任务时使用）。
 **中断**：`run()` 执行中按 Ctrl+C 只终止本次任务（历史保留，未回填的工具结果自动补齐，
 对话可继续）；输入提示处按 Ctrl+C/Ctrl+D 直接退出。
 
@@ -71,16 +76,38 @@ REPL 斜杠命令：
 显示层用 [rich](https://github.com/Textualize/rich)、输入层用
 [prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit)、`--help`
 用 [rich-argparse](https://github.com/Hamatti/rich-argparse) 排版。这些只在
-stdin/stdout 是终端时启用；管道/CI 下自动降级为纯文本（补全、实时状态条、颜色都不出现）。
+stdin/stdout 是终端时启用；管道/CI 下自动降级为纯文本（补全、流式渲染、颜色都不出现）。
 
-- **回答与审批**：模型回答按 Markdown 渲染（标题、列表、代码块、复选框等）；危险工具审批
-  与执行计划用带边框的 `Panel` 展示。
-- **实时状态**：任务执行期间在底部显示状态条（`⠋ 第 12/25 轮 · 调用 read_file`），轮次与
-  当前工具由 `Agent.on_event` 钩子推送（见下）。`-p` 单任务模式刻意不加状态条，保持可管道。
-- **输入**：命令历史持久化到 `~/.mi_z_history`（上下键翻阅），输入 `/` 自动补全斜杠命令，
-  并按历史给出灰色建议（`→` 接受）。
-- **日志**：`[mi_z.agent] 调用工具 ...` 走 **stderr**，stdout 只承载答案——`-p` 模式可安全
-  `> answer.md` 或接管道；日志与状态条同屏时自动排在状态区上方，不打断刷新。
+终端交互对标 pi（badlogic/pi-mono）的极简风格：**滚动区永久追加 + 底部小型 live 区**。
+完成的内容（思考折叠行、工具块、完整 Markdown 段落）打印进终端原生 scrollback、
+永不重绘；只有正在流式输出的尾窗和 spinner 状态行占据底部 live 区，段落完成即提交
+进滚动区。`-p` 单任务模式不接渲染器，stdout 只承载最终答案，可安全 `> answer.md`
+或接管道。
+
+- **流式输出**：回答逐段流入 live 区（节流重渲染的 Markdown），完成即整体提交滚动区；
+  中间轮的 assistant 文字与 thinking 同样可见——思考折叠为一行 dim italic 摘要
+  （`✻ 思考 47 字：…`），全文用 `/expand` 查看。
+- **工具块**（Claude Code 树形）：头行按工具特化——`⏺ bash  $ pytest -q`、
+  `⏺ read_file  mi_z/ui.py:10-50`、`⏺ write_file  app.py`（陌生工具退回紧凑 JSON）；
+  结果首行用 `  ⎿ ` 连接符、续行 4 空格对齐，默认折叠前 8 行 / 600 字符（`… 还有
+  N 行未显示（/expand 查看全文）`），耗时以 dim 附在尾行；错误结果整块标红；块间空行分组。
+- **实时状态**：底部 spinner 标注阶段（`思考中` / `回复中` / `运行 bash`）、轮次、
+  阶段耗时与**上下文占用**（`12.8k/128k（10%）`，随 usage 事件更新，压缩后回落可见）；
+  状态由 `Agent.on_event` 事件流驱动（见下）。
+- **bash 实时输出**：命令运行期间输出逐行流入 live 区尾窗（默认尾 8 行），不再是
+  spinner 干转；全量输出仍由随后的 `⎿` 块承载。
+- **输入**（Claude Code 风格）：上下两条横线围出输入区——顶线嵌会话主题
+  （`── ✳ count-readme-words ────`），底线是按键提示（`── Enter 发送 · Alt+Enter
+  换行 ────`）；`❯` 提示符 + 空输入 dim 占位提示；**Enter 提交**，Alt+Enter（或
+  行尾反斜杠 + Enter）换行写多行任务；命令历史持久化到 `~/.mi_z_history`
+  （上下键翻阅），输入 `/` 自动补全斜杠命令，并按历史给出灰色建议（`→` 接受）。
+- **会话主题**（Claude Code 同款）：首个任务完成后从任务内容**本地**推断一个
+  kebab-case slug（如 `count-readme-words`），嵌入输入框顶线并写入终端标签页标题
+  （`✳ topic`）。纯本地推断（slug 化 → 输入截断逐级降级）——不为装饰发起任何
+  额外 LLM 请求。
+- **日志**：走 **stderr**，与渲染共用同一 rich Console，自动排在 live 区上方；SDK 的
+  HTTP 明细日志被压到 WARNING，不刷屏。`--no-stream` 可为不支持流式的端点关闭流式
+  （分块进度仍在）。
 
 ## 用法
 
@@ -128,9 +155,20 @@ agent = Agent(
   也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易
   数错——状态栏用代码提前算好。更新采用持久追加（旧状态留在轨迹里，不删改），KV Cache
   前缀始终稳定。也可传入自定义渲染函数 `status_bar=lambda snapshot: ...`。
-- `on_event(event, payload)` 是可选观测钩子：每轮迭代开始发 `("iteration", {"step",
-  "max_steps"})`，每次工具调用前发 `("tool_call", {"name"})`。CLI 的实时状态条就建立在它
-  之上；不设钩子时零开销、核心逻辑不受影响，任何前端（REPL、全屏 TUI、Web）都能接这条事件流。
+- `on_event(event, payload)` 是可选观测钩子，CLI 的终端渲染（`mi_z/ui.py` 的
+  `TerminalRenderer`）就建立在它之上；不设钩子时零开销、核心逻辑不受影响，任何前端
+  （REPL、全屏 TUI、Web）都能接这条事件流。事件词表（时序：`iteration → [usage] →
+  *_delta* → assistant_message → (tool_call → tool_result)*`）：
+
+  | 事件 | 载荷 | 时机 |
+  |---|---|---|
+  | `iteration` | `{step, max_steps}` | 每轮迭代开头 |
+  | `reasoning_delta` / `text_delta` | `{delta}` | 流式片段（设置了钩子且未 `stream=False` 时，LLM 走流式） |
+  | `assistant_message` | `{content, reasoning, tool_calls}` | 一轮完整消息落历史后 |
+  | `tool_call` | `{name, call_id, arguments}` | 工具分发前（参数已解析） |
+  | `tool_result` | `{name, call_id, result, duration_s, error}` | 结果回填历史后（`result` 为原始结果） |
+  | `usage` | `{last, total}` | 仅当本次响应带 usage |
+
   注意它与 `status_bar` 不同：后者是给**模型**看的上下文内容，`on_event` 是给**人**看的进度信号。
 - `agent.total_usage` / `agent.last_usage` 累计/记录每次请求的 token 用量（响应里没有
   usage 字段时保持为 0 / `None`，不会报错）；只做统计，不进消息历史，不影响缓存前缀。

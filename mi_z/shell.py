@@ -17,6 +17,7 @@ import queue
 import subprocess
 import threading
 import uuid
+from collections.abc import Callable
 
 _MARKER_PREFIX = "__mi_z_done_"
 
@@ -58,8 +59,19 @@ class ShellSession:
         # 进程退出时放一个 None 哨兵，让等待者不会永远阻塞
         self._queue.put(None)
 
-    def run(self, command: str, timeout: float = 10.0) -> str:
-        """执行命令并等待完成，返回 `退出码 N\\n输出` 格式的结果。"""
+    def run(
+        self,
+        command: str,
+        timeout: float = 10.0,
+        on_line: Callable[[str], None] | None = None,
+    ) -> str:
+        """执行命令并等待完成，返回 `输出\\n退出码 N` 格式的结果。
+
+        输出在前、退出码殿后（Claude Code 同序）：命令输出是主要信息，退出码
+        是收尾确认——模型与终端渲染（⎿ 树形块）都先看到正文。
+        ``on_line``：每收到一行输出就同步回调（在本方法调用者的线程里），供 UI
+        在命令运行期间实时展示；None 时零开销。
+        """
         self._ensure_started()
         assert self._proc is not None and self._proc.stdin is not None
         marker = f"{_MARKER_PREFIX}{uuid.uuid4().hex[:8]}"
@@ -74,19 +86,22 @@ class ShellSession:
             except queue.Empty:
                 self.kill()
                 return (
-                    "退出码 -\n"
                     f"[命令超时（{timeout:.0f} 秒），会话已终止；环境状态丢失，下次调用将自动重启。"
-                    "命令可能正在等待交互输入——请改用非交互命令]"
+                    "命令可能正在等待交互输入——请改用非交互命令]\n退出码 -"
                 )
             if line is None:  # bash 进程已退出
-                return f"退出码 {self._proc.returncode}\n{''.join(lines).strip()}"
+                output = "".join(lines).strip()
+                code = self._proc.returncode
+                return f"{output}\n退出码 {code}" if output else f"退出码 {code}"
             if line.startswith(marker):
                 exit_code = line[len(marker) :].strip()
                 break
             lines.append(line)
+            if on_line is not None:
+                on_line(line.rstrip("\n"))
 
         output = "".join(lines).strip()
-        return f"退出码 {exit_code}\n{output if output else '(无输出)'}"
+        return f"{output}\n退出码 {exit_code}" if output else f"(无输出)\n退出码 {exit_code}"
 
     def output(self) -> str:
         """不等待地取走目前已产生的输出（后台/慢速命令的增量读取）。"""

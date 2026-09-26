@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import time
 from collections import Counter
 from collections.abc import Callable
 
@@ -63,6 +64,7 @@ class Agent:
         profile: ModelProfile | None = None,
         prefix_check: bool = False,
         on_event: Callable[[str, dict], None] | None = None,
+        stream: bool = True,
     ):
         self.llm = llm
         self.tools = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
@@ -113,10 +115,20 @@ class Agent:
         # 推理连续性断裂（2.7）——所以提供可开启的运行时断言。
         self.prefix_check = prefix_check
         self._last_prefix: list[dict] | None = None
-        # 观测钩子（可选）：迭代开始与工具调用前向外发出语义事件，供 UI 层渲染
-        # 实时进度（事件：iteration{step,max_steps}、tool_call{name}）。不设钩子
+        # 观测钩子（可选）：向外发出语义事件，供 UI 层渲染实时进度。不设钩子
         # 时零开销、核心逻辑不受影响——与 approve / status_bar 同属可选回调。
+        # 事件词表（时序：iteration → [usage] → *_delta* → assistant_message
+        # → (tool_call → tool_result)*）：
+        #   iteration{step,max_steps}                  每轮开头
+        #   reasoning_delta{delta} / text_delta{delta} 流式片段（LLM 流式路径）
+        #   assistant_message{content,reasoning,tool_calls}  一轮消息落历史后
+        #   tool_call{name,call_id,arguments}          工具分发前（参数已解析）
+        #   tool_result{name,call_id,result,duration_s,error}  结果回填历史后
+        #   usage{last,total}                          仅当本次响应带 usage
         self.on_event = on_event
+        # 流式开关（与 on_event 正交）：有事件消费者时默认走流式，让 UI 能逐段
+        # 渲染；--no-stream 逃生口给不支持流式的端点。
+        self.stream = stream
 
     def reset(self) -> None:
         self.history.clear()
@@ -130,6 +142,10 @@ class Agent:
         """向外发出一个进度事件；未设置 on_event 时零开销。"""
         if self.on_event is not None:
             self.on_event(event, payload)
+
+    def _stream_delta(self, kind: str, delta: str) -> None:
+        """LLM 流式片段转发为事件（reasoning_delta / text_delta），供 UI 实时渲染。"""
+        self._emit("reasoning_delta" if kind == "reasoning" else "text_delta", delta=delta)
 
     def _check_prefix(self, messages: list[dict]) -> None:
         """前缀不变量的运行时断言：本次请求必须是上一次的严格扩展。
@@ -258,8 +274,14 @@ class Agent:
                 messages.append(status_message)
                 self.history.append(status_message)
 
-            response = self.llm.chat(messages, tools=schemas)
+            # 有事件消费者才走流式（LLM 收到 on_delta 即 stream=True），否则
+            # 保持非流式路径不变；stream=False 是不支持流式端点的逃生口
+            on_delta = self._stream_delta if (self.on_event is not None and self.stream) else None
+            response = self.llm.chat(messages, tools=schemas, on_delta=on_delta)
+            usage_present = getattr(response, "usage", None) is not None
             self._record_usage(response)
+            if usage_present and self.on_event is not None:
+                self._emit("usage", last=dict(self.last_usage), total=dict(self.total_usage))
             message = response.choices[0].message
 
             assistant = {"role": "assistant", "content": message.content}
@@ -283,6 +305,22 @@ class Agent:
                 ]
             messages.append(assistant)
             self.history.append(assistant)
+            if self.on_event is not None:
+                # reasoning 原样给 UI——显示它与是否随历史回传（profile 的
+                # reasoning_passthrough）是两回事
+                self._emit(
+                    "assistant_message",
+                    content=message.content or "",
+                    reasoning=reasoning,
+                    tool_calls=[
+                        {
+                            "id": call.id,
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        }
+                        for call in (message.tool_calls or [])
+                    ],
+                )
 
             if not message.tool_calls:
                 return message.content or ""
@@ -294,8 +332,8 @@ class Agent:
                         arguments = json.loads(call.function.arguments or "{}")
                     except json.JSONDecodeError:
                         arguments = {}
-                    logger.info("调用工具 %s(%s)", name, arguments)
-                    self._emit("tool_call", name=name)
+                    logger.debug("调用工具 %s(%s)", name, arguments)
+                    self._emit("tool_call", name=name, call_id=call.id, arguments=arguments)
 
                     item = self.tools.get(name)
                     if item is not None and self.plan_mode and item.dangerous:
@@ -305,30 +343,44 @@ class Agent:
                             f"Error: 规划模式下只能使用只读工具（{name} 被拒绝）。"
                             "完成计划后调用 exit_plan_mode 提交，批准后进入执行模式。"
                         )
+                        duration_s = 0.0
                     elif (
                         item is not None
                         and self.approve is not None
                         and not self.approve(item, arguments)
                     ):
                         result = f"Error: 用户拒绝了工具调用 {name}"
+                        duration_s = 0.0  # 审批阻塞时间不算工具耗时
                     else:
+                        t0 = time.monotonic()
                         result = self.tools.call(name, arguments)
+                        duration_s = time.monotonic() - t0
 
                     self.tool_counts[name] += 1
+                    annotated = result
                     if self.status_bar is not None:
                         # 调用计数标注（书实验 2-9）：显式次数触发模型的模式识别——
-                        # 第 3 次失败后主动换路，而不是无限重试。
-                        result = f"（{name} 第 {self.tool_counts[name]} 次调用）\n{result}"
+                        # 第 3 次失败后主动换路，而不是无限重试。只进 tool 消息，
+                        # tool_result 事件发原始结果（UI 不该看到给模型的标注）。
+                        annotated = f"（{name} 第 {self.tool_counts[name]} 次调用）\n{result}"
 
-                    # 返回值可能很长（截断后仍有 8000 字符），日志里只留开头
-                    logger.info("工具 %s 返回: %.200s", name, result)
+                    logger.debug("工具 %s 返回: %.200s", name, result)
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": call.id,
-                        "content": result,
+                        "content": annotated,
                     }
                     messages.append(tool_message)
                     self.history.append(tool_message)
+                    if self.on_event is not None:
+                        self._emit(
+                            "tool_result",
+                            name=name,
+                            call_id=call.id,
+                            result=result,
+                            duration_s=round(duration_s, 3),
+                            error=result.startswith("Error"),
+                        )
             except KeyboardInterrupt:
                 # 中断可能落在工具循环中间：assistant 已声明 N 个 tool_call，
                 # 只回填一部分的话，下一轮请求的序列残缺会被 API 拒绝（每个

@@ -43,7 +43,7 @@ class ScriptedLLM:
         self._usages = list(usages) if usages is not None else [None] * len(replies)
         self.calls: list[dict] = []
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, on_delta=None):
         self.calls.append({"messages": list(messages), "tools": tools})
         message = self._replies.pop(0)
         return SimpleNamespace(
@@ -199,7 +199,7 @@ def test_agent_below_threshold_or_missing_usage_never_compresses():
 
 def test_agent_circuit_breaker_after_three_failures():
     class FailingCompactLLM(ScriptedLLM):
-        def chat(self, messages, tools=None):
+        def chat(self, messages, tools=None, on_delta=None):
             if tools is None:  # 压缩调用直接失败
                 self.calls.append({"messages": list(messages), "tools": tools, "failed": True})
                 raise RuntimeError("压缩服务不可用")

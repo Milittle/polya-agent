@@ -54,3 +54,13 @@ def test_kill_then_restart(tmp_path):
     session.kill()
     assert not session.alive
     assert "退出码 0" in session.run("echo b")  # 自动重启
+
+
+def test_run_streams_lines_via_callback(tmp_path):
+    """on_line 在命令运行期间逐行回调（UI 实时输出的接缝），哨兵行不外漏。"""
+    session = ShellSession(str(tmp_path))
+    seen: list[str] = []
+    result = session.run("echo one; echo two", on_line=seen.append)
+    assert seen == ["one", "two"]
+    assert "退出码 0" in result and "one" in result
+    assert all("__mi_z_done_" not in line for line in seen)

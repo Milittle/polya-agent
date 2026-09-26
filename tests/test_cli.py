@@ -8,8 +8,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from mi_z import Agent, tool
-from mi_z.cli import LiveStatusBar, build_agent, handle_command, main, parse_args, terminal_approve
+from mi_z.cli import build_agent, handle_command, main, make_session, parse_args, terminal_approve
 from mi_z.todos import TodoStore
+from mi_z.ui import TerminalRenderer
 
 
 def make_message(content=None, tool_calls=None):
@@ -20,7 +21,7 @@ class ScriptedLLM:
     def __init__(self, replies):
         self._replies = list(replies)
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, on_delta=None):
         return SimpleNamespace(choices=[SimpleNamespace(message=self._replies.pop(0))], usage=None)
 
     @property
@@ -56,7 +57,7 @@ def test_quit_commands_return_none():
 def test_status_and_todos_rendering():
     agent = make_agent()
     agent.todos.rewrite([{"content": "修 bug", "status": "in_progress"}])
-    assert "[1] [in_progress] 修 bug" in handle_command("/todos", agent)
+    assert "[1] [进行中] 修 bug" in handle_command("/todos", agent)
     assert "（TODO 清单为空）" in handle_command("/todos", make_agent())
 
     status = handle_command("/status", agent)
@@ -97,17 +98,18 @@ def test_unknown_command():
 
 
 def test_terminal_approve_yes_no_always(monkeypatch):
-    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: 0)
     approve = terminal_approve(interactive=True)
     assert approve(add, {}) is True  # 只读工具直接放行，不询问
 
-    answers = iter(["n", "a"])
-    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    # 选择列表下标：0 允许 / 1 总是允许 / 2 拒绝
+    answers = iter([2, 1])
+    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: next(answers))
     approve = terminal_approve(interactive=True)
-    assert approve(write_thing, {"content": "x"}) is False  # n → 拒绝
-    assert approve(write_thing, {"content": "y"}) is True  # a → 放行
+    assert approve(write_thing, {"content": "x"}) is False  # 拒绝
+    assert approve(write_thing, {"content": "y"}) is True  # 总是允许 → 放行
 
-    # a 之后同工具不再询问：input 耗尽会抛 StopIteration，若被询问即测试失败
+    # 总是允许之后同工具不再询问：答案耗尽会抛 StopIteration，若被询问即测试失败
     assert approve(write_thing, {"content": "z"}) is True
 
 
@@ -159,13 +161,149 @@ def test_repl_loop_runs_and_exits(monkeypatch, tmp_path, capsys):
     assert "1024" in out and "工具调用" in out  # 答案 + /status 输出
 
 
-def test_live_status_bar_tracks_events():
-    """状态栏读事件更新轮次与当前工具；新一轮开始清掉上一轮的工具名。"""
-    bar = LiveStatusBar()
-    bar.update("iteration", {"step": 2, "max_steps": 25})
-    bar.update("tool_call", {"name": "read_file"})
-    label = bar.render().text.plain
-    assert "第 2/25 轮" in label and "read_file" in label
+def test_no_stream_flag_disables_streaming(tmp_path):
+    agent = build_agent(parse_args(["--root", str(tmp_path), "--no-stream"]), llm=ScriptedLLM([]))
+    assert agent.stream is False
 
-    bar.update("iteration", {"step": 3, "max_steps": 25})
-    assert "read_file" not in bar.render().text.plain
+
+def test_expand_command_dispatches_to_renderer():
+    from io import StringIO
+
+    from rich.console import Console
+
+    renderer = TerminalRenderer(Console(file=StringIO(), force_terminal=False, width=120))
+    renderer.update("tool_call", {"name": "bash", "call_id": "c1", "arguments": {"command": "ls"}})
+    renderer.update(
+        "tool_result",
+        {"name": "bash", "call_id": "c1", "result": "完整输出", "duration_s": 0.1, "error": False},
+    )
+    assert "完整输出" in handle_command("/expand", make_agent(), renderer)
+    assert "⏺ bash 结果全文" in handle_command("/expand 1", make_agent(), renderer)
+    # 无渲染器（非终端会话）：给出解释而不是炸
+    assert "非终端" in handle_command("/expand", make_agent())
+    assert "用法" in handle_command("/expand x", make_agent(), renderer)
+
+
+def test_make_session_is_multiline_with_placeholder():
+    from prompt_toolkit import PromptSession
+
+    session = make_session()
+    assert isinstance(session, PromptSession)  # 多行/按键/占位由 pty 冒烟端到端验证
+
+
+def test_slugify_keeps_kebab_case_only():
+    from mi_z.cli import _slugify
+
+    assert _slugify("`Fix-Login-Bug`\n") == "fix-login-bug"
+    assert _slugify("Count  README_words!") == "count-readme-words"
+    assert _slugify("中文输入无英文") == ""
+
+
+def test_topic_from_local_fallbacks():
+    from mi_z.cli import _topic_from
+
+    assert _topic_from("Count README words") == "count-readme-words"
+    assert _topic_from("统计单词数") == "统计单词数"  # 纯中文退化为截断原文
+    assert _topic_from("") == "new-session"
+
+
+def test_rule_and_prompt_message_lay_out():
+    from mi_z.cli import _prompt_message, _rule
+
+    assert _rule("hi", 10) == "── hi ────"
+    assert _rule("", 6) == "──────"
+    message = _prompt_message({"topic": "count-readme-words"})
+    text = "".join(fragment for _, fragment in message)
+    assert "✳ count-readme-words" in text and text.endswith("❯ ")
+
+
+def test_approve_cooperates_with_renderer_pause(monkeypatch):
+    """审批询问前暂停渲染器、结束后恢复——非终端下 pause/resume 均 no-op，不炸。"""
+    renderer = TerminalRenderer()
+    assert renderer._live is None  # 非 tty：未进入 with 前本就无 Live
+    renderer.pause()
+    renderer.resume()
+
+    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: 0)
+    approve = terminal_approve(interactive=True, renderer=renderer)
+    assert approve(write_thing, {"content": "x"}) is True
+
+
+# ---------- 审批变更预览：diff / 命令 / 截断 ----------
+
+
+def approve_and_capture(monkeypatch, capsys, root, name, arguments, choice=0):
+    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: choice)
+    approve = terminal_approve(interactive=True, root=root)
+    approved = approve(
+        SimpleNamespace(name=name, dangerous=True, fn=None),
+        arguments,  # noqa: SLF001
+    )
+    return approved, capsys.readouterr().err
+
+
+def test_approval_shows_diff_for_write_file(monkeypatch, tmp_path, capsys):
+    (tmp_path / "app.py").write_text("old = 1\nprint(old)\n", encoding="utf-8")
+    approved, err = approve_and_capture(
+        monkeypatch,
+        capsys,
+        tmp_path,
+        "write_file",
+        {"path": "app.py", "content": "new = 2\nprint(new)\n"},
+    )
+    assert approved is True
+    assert "--- a/app.py" in err and "+++ b/app.py" in err
+    assert "-old = 1" in err and "+new = 2" in err  # 红删绿增的原料行
+
+
+def test_approval_new_file_diff_is_all_additions(monkeypatch, tmp_path, capsys):
+    approved, err = approve_and_capture(
+        monkeypatch, capsys, tmp_path, "write_file", {"path": "new.py", "content": "x = 1\n"}
+    )
+    assert approved is True
+    assert "-old" not in err and "+x = 1" in err
+
+
+def test_approval_bash_shows_full_command(monkeypatch, tmp_path, capsys):
+    approved, err = approve_and_capture(
+        monkeypatch, capsys, tmp_path, "bash", {"command": "pytest -q tests/"}
+    )
+    assert approved is True
+    assert "$ pytest -q tests/" in err
+
+
+def test_approval_reject_and_always(monkeypatch, tmp_path, capsys):
+    approved, _ = approve_and_capture(
+        monkeypatch, capsys, tmp_path, "bash", {"command": "ls"}, choice=2
+    )
+    assert approved is False
+
+    approved, err = approve_and_capture(
+        monkeypatch, capsys, tmp_path, "bash", {"command": "ls"}, choice=1
+    )
+    assert approved is True
+    assert "不再询问" in err
+
+
+def test_diff_lines_truncates_with_note():
+    from mi_z.cli import _diff_lines
+
+    old = "\n".join(f"old{i}" for i in range(60))
+    new = "\n".join(f"new{i}" for i in range(60))
+    diff = _diff_lines(old, new, "big.txt", max_lines=10)
+    assert len(diff) == 11 and diff[-1].startswith("… 还有 ")
+    assert _diff_lines("同", "同", "same.txt") == ["（内容无变化）"]
+
+
+def test_apply_edits_draft_flags_future_failures():
+    from mi_z.cli import _apply_edits_draft
+
+    text = "alpha beta\n"
+    draft, error = _apply_edits_draft(text, [{"old_string": "alpha", "new_string": "gamma"}])
+    assert draft == "gamma beta\n" and error is None
+
+    draft, error = _apply_edits_draft(text, [{"old_string": "zeta", "new_string": "x"}])
+    assert error and "未找到" in error
+
+    draft, error = _apply_edits_draft("a a a", [{"old_string": "a", "new_string": "b"}])
+    assert "不唯一" in error
