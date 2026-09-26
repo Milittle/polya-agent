@@ -29,10 +29,33 @@ cp .env.example .env
 # 编辑 .env，填入 OPENAI_API_KEY（以及可选的 OPENAI_BASE_URL / OPENAI_MODEL）
 ```
 
+多家厂商或 coding plan 可注册为命名 profile，全程在会话内完成——`/models add`
+进交互向导（存于 `~/.polya/models.json`，权限 0600；录入 key 时输入框让位终端、
+走 getpass 不回显，不进屏幕与输入历史，列表只显示尾四位）：
+
+```
+/models add
+  可用预设（已知厂商内置，选名字即可）：
+    1. z.ai coding plan（国际） · glm-5.3 @ api.z.ai
+    2. z.ai coding plan（国内 bigmodel） · glm-5.3 @ open.bigmodel.cn
+    3. DeepSeek API · deepseek-flash @ api.deepseek.com
+    4. OpenRouter（跨厂商） · （自填模型名） @ openrouter.ai
+    5. Moonshot Kimi · （自填模型名） @ api.moonshot.cn
+    6. 自定义 OpenAI 兼容端点
+/models add ds deepseek             # 单行捷径：预设名 + 隐藏输 key
+/models add box http://localhost:8000/v1 qwen3    # 自定义端点捷径
+/models remove ds
+```
+
+预设只是预填 base_url 和建议模型——任何 OpenAI 兼容端点都是同一个三元组。
+启动解析优先级：CLI 旗标 > active profile > `OPENAI_*` 环境变量。会话内
+`/models` 随时切换（无参数展开选项器）：对话保留，旧模型的 thinking 剥离，
+选择写回 active。
+
 ## 运行示例
 
 ```bash
-uv run demo.py
+uv run examples/demo.py
 ```
 
 示例会启动一个本地编码代理，让它列出目录、阅读 `polya/agent.py` 并总结。工具调用过程会通过
@@ -50,8 +73,13 @@ uv run polya -p "修复 pytest 失败的测试" --plan -y   # 单任务模式：
 常用参数：`--root DIR` 工作目录（默认 `.`，文件操作被限制在内）、`--plan` 启动进入
 规划模式、`--yes` 自动批准一切审批、`--max-steps N`（默认 25）、`--model/--base-url/
 --api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启，用量超窗口 80%
-时批量压缩旧工具结果）、`--context-window N`（默认 128000）、`--keep-recent N`
-（压缩保留区，默认 30）。
+时批量压缩旧工具结果）、`--no-microcompact` 关闭微压缩、`--context-window N`
+（默认 128000）、`--keep-recent N`
+（压缩保留区消息数，默认 30）、`--keep-recent-tokens N`（按 token 预算定保留区，
+优先于 `--keep-recent`）。
+
+提示词与用户可见文案由 `POLYA_LANG` 选择语言（`zh` 默认，`en` 面向英文受众）；
+提示词在导入时求值，会话内稳定，不破 KV Cache 前缀。
 
 REPL 斜杠命令：
 
@@ -60,9 +88,22 @@ REPL 斜杠命令：
 | `/help` | 命令列表 |
 | `/todos` `/status` | 查看 TODO 清单 / 会话状态（模式、用量、工具计数） |
 | `/plan on\|off` | 随时切换规划模式（`exit_plan_mode` 构造时已注册，切换不动工具数组，缓存安全） |
+| `/models [profile]` | 查看 / 切换 / 录入模型 profile：对话保留、旧模型 thinking 剥离、能力档案跟随；无参数展开选项器，`/models add` 进交互向导（预设选名字、key 隐藏输入） |
 | `/expand [N]` | 展开最近 N 块（默认 5）的工具结果 / 思考全文——滚动区的折叠块在这里看全量 |
-| `/reset` | 清空对话历史、TODO 与统计 |
+| `/compact [说明]` | 立即压缩上下文（不等阈值）；可选说明聚焦摘要重点 |
+| `/clear` | 清空对话历史、TODO 与统计（别名 `/reset`；保留会话主题、授权规则与排队消息） |
+| `/rename <主题>` | 重命名当前会话主题与终端标题（单行，最多 120 字）；忙时下一轮请求前生效 |
+| `/new` | 开新会话：在 `/clear` 之上重置主题、清空授权规则、丢弃排队消息并重印启动区 |
 | `/exit` `/quit` | 退出（输入处 Ctrl+D / 空框双击 Ctrl+C 同效） |
+
+`/plan`、`/permissions`、`/models` 无参数时在原输入框展开选项，并标记当前值（`/models`
+的选项器尾行带 `add` 向导与 `remove`）；方向键移动，
+Tab / Enter 选中，再按 Enter 执行，Esc 关闭菜单。也可直接输入 `/plan on|off`、
+`/permissions ask|all`、`/models <名字>`，支持参数补全。命令或参数错误时保留草稿并提示；
+`/details ID`、`/expand [N]` 只接受正整数。`/help` 的名称、别名、参数和忙时策略
+与补全、执行共用定义。普通命令在下一次模型请求前执行；`/clear`、`/new`、`/exit`、`/quit`
+等待当前任务结束，后续输入保持队列顺序；`/resume` 恢复中断、拒绝或异常后暂停的队列；正在停止时需等当前操作结束。
+管道 REPL 不显示选项菜单，需要显式提供参数。
 
 **输入前缀**：`!command` 本地跑 shell、输出进上下文（8000 字符截断）；`#note`
 追加一行到项目记忆 `AGENTS.md`（下节）；`@` 触发文件路径补全；`/` 补全命令并带说明列。
@@ -72,57 +113,75 @@ REPL 斜杠命令：
 不变，不违「系统提示词静态」铁律的精神（铁律防的是逐轮变更破缓存）；`#` 前缀写入的
 内容下次会话生效。
 
-**审批交互**：危险工具执行前先展示**变更预览**，再弹出四选项列表——写类工具
+**Skills**：项目技能放在 `.polya/skills/<名称>/SKILL.md`，用户技能放在
+`~/.polya/skills/<名称>/SKILL.md`，目录递归发现——含 `SKILL.md` 的目录即技能根，
+不再下钻。Agent Skills 标准位置同样默认加载：`~/.agents/skills/`（用户级）与从
+工作目录逐级向上直至 git 仓库根的各级 `.agents/skills/`。同名优先级从低到高：
+用户 `.agents` → 用户 `.polya` → 祖先 `.agents`（远→近）→ 项目 `.polya`。文件用
+YAML frontmatter 声明 `name` 和 `description`；无效条目警告后跳过。启动只注入目录元数据，模型在任务匹配
+或用户点名 `$名称` 时用 `skill_read(name=...)` 加载正文。引用资源通过该工具的
+`path` 按技能目录解析，不能越出目录；大文件按行及字符偏移分页。脚本仍通过 bash
+走正常审批，用户技能不扩大项目文件工具的读取范围。新增技能在下次启动时发现。
+
+仓库自带 `$develop-polya`：读取任务票与约定、实现、检查并修复失败、检查 diff、记录
+交付证据。例如在 REPL 输入：`使用 $develop-polya 实现 .scratch/feature/issues/01-task.md`。
+技能是流程指导，不能覆盖用户当前指令和审批限制。
+
+**审批交互**：危险工具执行前先展示**变更预览**，再弹出选项列表——写类工具
 （`write_file`/`edit_file`/`multi_edit`）给出与磁盘现状比对的行级 diff（红删绿增，
 新文件整块标绿，超过 40 行折叠并标注），`bash` 展示完整命令。选项：`1 允许`（执行
 本次调用）、`2 本会话前缀授权`（如 `bash(pytest tests/test_a.py:*)`，命中即不再询问；
 **含 `&&` `;` `|` 的复合命令不给此选项**，已有前缀规则也不覆盖复合命令）、
-`3 修改后执行`（仅 bash：预填原命令改完重跑）、`4 拒绝`（可附理由，回传给模型）。
-↑/↓ + Enter 或数字键选择，光标默认停在「拒绝」——**Enter 单按绝不放行**。命中高危
-启发式（`rm -rf`、`sudo`、`curl|sh`、`push -f`，只匹 bash 命令串）时不给授权出口。
+`3 Edit command`（仅 bash：修改后重新评估并审批）、`4 本会话全部允许`（高危仍询问）、
+`5 拒绝`（停止当前任务，可附理由）。不可用的选项省略，编号随实际列表显示。
+`/permissions all` 开启会话全部允许；`/permissions ask` 恢复逐次审批并清除会话规则。
+拒绝后暂停排队任务，可输入新任务；`/resume` 显式恢复队列（不是恢复历史会话）。
+↑/↓ + Enter 或数字键选择。**低/中风险默认 Allow once，高危/未知默认 Deny，Esc 始终取消**。
+风险评估只决定菜单默认项，不自动授权 shell 命令；常驻 shell 尚无系统级隔离。
+动态 shell 语法不复用前缀授权，不提供通用解释器前缀授权；写文件授权检查解析后的工作区路径。
+命中高危
+启发式（`rm -rf`、`sudo`、`curl|sh`、`git push`、`git reset --hard`，只匹 bash 命令串）时不给授权出口。
 `--plan` 模式下计划全文展示后同样以选择列表批准。非交互环境（管道/CI）默认拒绝一切
 危险操作，`--yes` 才放行（但高危仍会询问）。
-**中断**：`run()` 执行中按 Ctrl+C 只终止本次任务（历史保留，未回填的工具结果自动补齐，
-对话可继续）；输入框 Ctrl+C 先清空输入，空框 2 秒内双击退出，Ctrl+D 直接退出。
+**中断**：交互模式按 Esc 请求中断（补全菜单打开时先关闭菜单）；当前工具或模型
+请求可能需要完成后才能停止。已完成步骤保留，未执行工具自动回填中断结果。
+Ctrl+C 清空输入，空框两秒内双击退出；Ctrl+D 退出。`-p` 保留 Ctrl+C 中断。
 
 ### 交互与显示
 
-显示层用 [rich](https://github.com/Textualize/rich)、输入层用
-[prompt_toolkit](https://github.com/prompt-toolkit/python-prompt-toolkit)、`--help`
-用 [rich-argparse](https://github.com/Hamatti/rich-argparse) 排版。这些只在
-stdin/stdout 是终端时启用；管道/CI 下自动降级为纯文本（补全、流式渲染、颜色都不出现）。
-
-终端交互对标 pi（badlogic/pi-mono）的极简风格：**滚动区永久追加 + 底部小型 live 区**。
-完成的内容（思考折叠行、工具块、完整 Markdown 段落）打印进终端原生 scrollback、
-永不重绘；只有正在流式输出的尾窗和 spinner 状态行占据底部 live 区，段落完成即提交
-进滚动区。`-p` 单任务模式不接渲染器，stdout 只承载最终答案，可安全 `> answer.md`
-或接管道。
-
-- **流式输出**：回答逐段流入 live 区（节流重渲染的 Markdown），完成即整体提交滚动区；
-  中间轮的 assistant 文字与 thinking 同样可见——思考折叠为一行 dim italic 摘要
-  （`✻ 思考 47 字：…`），全文用 `/expand` 查看。
-- **工具块**（Claude Code 树形）：头行按工具特化——`⏺ bash  $ pytest -q`、
-  `⏺ read_file  polya/ui.py:10-50`、`⏺ write_file  app.py`（陌生工具退回紧凑 JSON）；
-  结果首行用 `  ⎿ ` 连接符、续行 4 空格对齐，默认折叠前 8 行 / 600 字符（`… 还有
-  N 行未显示（/expand 查看全文）`），耗时以 dim 附在尾行；错误结果整块标红；块间空行分组。
-- **实时状态**：底部 spinner 标注阶段（`思考中` / `回复中` / `运行 bash`）、轮次、
-  阶段耗时与**上下文占用**（`12.8k/128k（10%）`，随 usage 事件更新，压缩后回落可见）；
-  状态由 `Agent.on_event` 事件流驱动（见下）。
-- **bash 实时输出**：命令运行期间输出逐行流入 live 区尾窗（默认尾 8 行），不再是
-  spinner 干转；全量输出仍由随后的 `⎿` 块承载。
-- **输入**（Claude Code 风格）：上下两条横线围出输入区——顶线嵌会话主题
-  （`── ✳ count-readme-words ────`），底线是按键提示（`── Enter 发送 · Alt+Enter
-  换行 ────`）；`❯` 提示符 + 空输入 dim 占位提示；**Enter 提交**，Alt+Enter（或
-  行尾反斜杠 + Enter）换行写多行任务；命令历史持久化到**状态目录** `~/.polya/` 下的
-  `history`（上下键翻阅；状态目录亦将承载后续配置），输入 `/` 自动补全斜杠命令，
-  并按历史给出灰色建议（`→` 接受）。
-- **会话主题**（Claude Code 同款）：首个任务完成后从任务内容**本地**推断一个
-  kebab-case slug（如 `count-readme-words`），嵌入输入框顶线并写入终端标签页标题
-  （`✳ topic`）。纯本地推断（slug 化 → 输入截断逐级降级）——不为装饰发起任何
-  额外 LLM 请求。
-- **日志**：走 **stderr**，与渲染共用同一 rich Console，自动排在 live 区上方；SDK 的
-  HTTP 明细日志被压到 WARNING，不刷屏。`--no-stream` 可为不支持流式的端点关闭流式
-  （分块进度仍在）。
+- **启动区**：名称、版本、一句定位、项目路径和模型，只显示一次，随后自然滚走。
+- **常驻输入**：上下边线紧贴编辑区，续行缩进，最多六行后内部滚动。框外第一行显示
+  模型、项目目录和上下文占比，第二行显示会话主题、模式、队列状态与操作提示。
+  窄终端省略上下文、缩短路径与主题，优先保留模型和项目名。运行中仍可编辑草稿。
+  主题默认取自首条任务，不额外调用模型；`/rename <主题>` 同步修改底部主题与终端标题，
+  `/clear` 保留主题，`/new` 重置主题。
+- **输入操作**：Enter 在文本末尾提交、行中换行；Alt+Enter / Ctrl+J 换行；补全菜单
+  打开时 Enter 选择候选。`/` 补命令，`@` 补文件；候选最多六行；长粘贴折叠，提交
+  时展开。历史保存在 `~/.polya/history`。
+- **忙时排队**：消息与命令按提交顺序排队。当前批次的所有工具结果回填后、下次模型
+  请求前处理；若任务已结束，则启动下一任务。`/clear`、`/new`、`/exit`、`/quit` 等
+  当前任务收尾后执行，其后的消息也保持等待，避免重置仍在使用的历史。
+  补充进入下一轮请求时显示回执。Esc 中断、审批拒绝或任务异常都会暂停队列；
+  停止后可用 `/resume` 恢复，也可直接输入新任务，旧队列继续暂停。
+- **审批让位**：审批暂时接管终端，选项列表复用同一会话底栏，操作提示改为等待审批；
+  完成后恢复原草稿、光标和折叠粘贴内容。工具与计划审批采用相同的阶段反馈。
+- **内容区**：保留原生终端滚动与复制。正文无需等换行，在输入框上方的 live 区持续
+  显示 Markdown 尾部（最多八行正文，矮终端自动减少）；消息完成后一次写入滚动区，
+  保留表格、列表与代码块排版。中断时保留已生成的正文并标记未完成。
+  思考默认折叠，可用 `/expand` 查看。
+- **工具块**：工具展示名使用 `Bash`、`Read File`，内部标识不变。状态为 `Running` →
+  `Ran` / `Failed` / `Denied`，命令高亮；结果预览最多三行、400 字符，bash 流式输出
+  在 live 区持续更新尾部，滚动区只留下完成摘要。`+ Show details: /details ID` 按固定编号查看对应审批或工具块
+  的完整参数和返回结果
+  （工具自身的输出上限仍有效）。
+- **任务状态**：输入框上方统一显示当前动作与整轮耗时：`Waiting for model`、`Thinking`、
+  `Responding`、`Running …`、`Reviewing` 或 `Awaiting approval`；工具切换不重置计时。
+  `Stopping` 显示正在等待哪个动作。每轮模型任务留下结束、拒绝、中断或失败回执及耗时，
+  「本轮结束」不代表目标已验证成功。明确批准后打印 `✔ You approved polya to run …`，
+  命令摘要灰色显示，带固定编号的详情入口；自动放行不打印此记录。最近保留 20 块，
+  过期编号会提示不可用。补全打开时提示 Esc 关闭补全，已请求停止时提示等待当前操作结束。
+- **输出协调**：交互模式经同一输出代理，prompt_toolkit 独占输入区刷新，不再同时
+  启动 Rich Live。`-p` 的最终答案 stdout / 诊断 stderr 契约保持不变。
 
 ## 用法
 
@@ -152,7 +211,7 @@ agent = Agent(
     llm=LLM(),
     tools=default_tools(root="./my-project"),  # 工具被限制在这个目录内
     system_prompt=CODING_SYSTEM_PROMPT,  # 编码代理专用提示词（推荐搭配 default_tools）
-    approve=lambda tool, args: tool.dangerous is False,  # 拒绝一切副作用工具
+    approve=lambda tool, args: tool.kind == "read",  # 拒绝一切副作用工具（read 无外部副作用）
 )
 ```
 
@@ -198,14 +257,20 @@ agent = Agent(
   `approve_plan(plan) -> bool` 决定放行（缺省自动批准）；状态栏会显示当前模式。
   工具数组全程不变（中途增删 tools 会破坏 KV Cache 前缀），模式切换只是运行时状态。
 - **上下文压缩**：`Agent(compress=True)`（CLI 默认开启，`--no-compress` 关闭）。最近一次
-  请求的 prompt tokens 超过 `context_window × compress_threshold`（默认 128K × 80%）时，
+  请求的 prompt tokens 加新增输入估算超过 `context_window × compress_threshold`
+  （默认 128K × 80%）时，
   在两次 API 调用之间**批量压缩**保留区（最近 `keep_recent=30` 条）之外的旧 tool 结果：
   一次 LLM 调用（合并式，注入当前任务做任务感知压缩）把它们原地替换为带 `[COMPRESSED]`
   标记的摘要（防重复处理），消息条数与 tool_call_id 配对不变，对话脉络完整；同区的旧
   状态栏消息直接删除（噪声不做摘要）。替换点之后的 KV Cache 会失效——这是有意识的
-  权衡，所以阈值高、批量压、低频次。触发判据必须是**最近一次**调用的 prompt_tokens，
-  不能用累计用量（每轮重复计入共享前缀，二次增长会过早触发）。连续 3 次压缩失败自动
-  熔断（压缩失败不影响主任务，保留完整信息继续跑）。
+  权衡，所以阈值高、批量压、低频次。使用最近 usage 校准新增内容；缺失 usage 时按
+  UTF-8 大小估算（非精确 tokenizer），不能使用累计用量。空摘要保留原历史；连续三次
+  压缩失败熔断。估算达到窗口 95% 时保留历史并停止请求，可切换更大窗口模型继续。
+  没有可压工具结果时回退到完整摘要重启；切点保证同批工具结果已全部回填。
+  压缩交接保留已加载技能来源与 TODO，摘要要求保留用户修正、验收条件、改动、实际
+  验证结果和下一步。`history_read(snapshot="1", message=1, offset=0)` 可回查压缩前
+  原始消息，每次最多 8000 字符。快照只在当前进程/会话有效，`/clear` 与 `/new` 清除，
+  不是跨进程会话恢复。
 - **模型能力声明**（`polya.providers.ModelProfile`）：Agent 只问能力、不特判模型名。
   压缩策略按 `supports_inplace_tool_edit` 自动切换——OpenAI 式模型（不回传 reasoning）
   原地替换 tool content；thinking 绑定前缀的模型（`deepseek-reasoner`/`claude`/`gemini`
@@ -222,8 +287,8 @@ agent = Agent(
 - 不传 `system_prompt` 时使用内置的通用提示词；`default_tools` 建议搭配
   `polya.builtin.CODING_SYSTEM_PROMPT`（围绕内置工具的工作流：任务拆解 → 探查 →
   小步修改 → 验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是
-  改写提示词。唯一 sanctioned 例外：CLI 启动时把项目记忆 `AGENTS.md` 读一次注入系统提示词
-  尾部（准静态：会话内不变）。
+  改写提示词。CLI 启动时将项目记忆 `AGENTS.md` 和 skills 元数据一次性注入系统提示词，
+  会话内保持不变。
 
 ## 内置工具
 
@@ -241,13 +306,27 @@ agent = Agent(
 | `edit_file` | write | 定点替换，默认要求匹配唯一 |
 | `multi_edit` | write | 一次多处替换，**原子生效**（任一处失败全不落盘） |
 | `bash` | exec | **持久会话**执行命令：cwd/环境变量跨调用保持 |
-| `bash_output` | read | 非阻塞读取会话新输出（后台/慢速命令） |
+| `bash_output` | read | 读取或等待命令结果；按命令编号、行范围回查完整输出 |
 | `kill_bash` | exec | 终止持久会话 |
 | `web_fetch` | read | 抓取 URL，HTML 转文本，`<external_content>` 包裹防注入；**拒绝内网/localhost（SSRF 防护）** |
 | `todo_write` | read | 全量重写 TODO 清单（可选；需 `default_tools(todos=store)` + `Agent(todos=store)` 共享同一实例） |
 
-工具结果会进上下文，因此输出统一截断到 8000 字符。`bash` 会话超时会终止并重启
-（环境状态丢失）；命令必须非交互。`web_fetch` 用标准库实现，零第三方依赖。
+驱动层另外装配 `task`（kind `delegate`）：把一个有界子任务交给隔离上下文的子代理
+（独立 history 与 shell 会话），把探查链挡在主上下文之外；只有最终报告回到父层，
+子代理的工具调用仍逐个经过共享审批（深度为 1，子代理没有 `task` 工具）。
+
+上下文分两级管理：**微压缩**（不调 LLM）在用量过窗口 60% 后把大块旧工具结果换成
+`history_read` 回查指针；**压缩**（LLM 摘要）在 80% 触发；`/compact` 手动触发全量压缩。
+用量上报时若端点提供 `cached_tokens` 会显示缓存命中率。
+
+多数工具结果截断到 8000 字符；bash 预览保留头尾及退出码。`bash(timeout=N)` 仅等待
+N 秒（0–300），到期返回命令编号，命令继续运行。用 `bash_output(timeout=30)` 再次
+等待；完成前不能启动下一条前台命令。`bash_output(command_id=1, start_line=1,
+end_line=200)` 回查完整日志，过长页按提示用字符 `offset` 继续。日志在工具集存活期间
+有效。命令必须非交互；`kill_bash` 显式终止会话，POSIX 下连同进程组一起终止，下次
+调用重启。显式 `&` 后台任务共用 stdout，验证任务宜使用前台命令以准确归属输出。
+CLI 另装配只读 `skill_read`，开启压缩时增加只读 `history_read`。
+`web_fetch` 用标准库实现，零第三方依赖。
 
 TODO 清单是状态栏的「任务规划」组件：`todo_write` 写入共享的 `TodoStore`，
 状态栏每轮把它渲染到上下文末尾——模型不用从历史里回忆还剩什么（外部记忆）：
@@ -261,13 +340,15 @@ TODO 清单是状态栏的「任务规划」组件：`todo_write` 写入共享�
 ```
 polya/
   agent.py       # 生成器协议：事件联合类型 + steps() + run() 内置驱动（ADR 0002）
-  loop.py        # 交互驱动：渲染 / 权限判定 / 审批四选项 / 执行 / 输入分流（! # /）
+  loop.py        # 交互驱动：渲染 / 权限判定 / 审批选项 / 执行 / 输入分流（! # /）
   input.py       # InputBox：多行编辑、@ 路径补全、粘贴折叠、Ctrl+C 双击退出、状态栏
   render.py      # 滚动区 + live 区渲染器与共享 Console
   permissions.py # decide() 六步判定 + 高危启发式表 + 前缀授权规则
+  approval.py    # 会话授权、风险默认项与终端审批
   executor.py    # 工具执行器（loop 与 run() 共用）
   cli.py         # argparse + Agent 装配 + 单任务模式 + AGENTS.md 启动注入
   llm.py         # OpenAI 兼容接口封装：chat(on_delta) 与 chat_iter 双形态
+  models.py      # 模型 profile（~/.polya/models.json）：读写校验、厂商预设、启动解析
   tools.py       # @tool 装饰器与工具注册表（kind 分类）
   builtin.py     # 内置编码工具 + 编码代理提示词（内容层）
   shell.py       # 持久 bash 会话（读线程 + 哨兵标记协议）
@@ -275,8 +356,12 @@ polya/
   status.py      # 状态栏快照与默认渲染器
   todos.py       # TODO 清单存储（外部记忆）
   compact.py     # 上下文压缩：原地替换 + 摘要重启（按模型能力选择）
+  skills.py      # 技能发现、元数据目录、只读正文与资源加载
+  history.py     # 压缩前原始历史的内存只读快照与分页回查
+  prompt.py      # 系统提示词具名 section 装配
+  i18n.py        # 文案目录：POLYA_LANG 选择语言（zh 默认 / en）
   providers.py   # 模型能力声明：只问能力不特判型号
-demo.py         # 可运行示例（库用法）
+examples/       # 可运行示例（库用法）与演示工具
 tests/          # 用假 LLM 验证循环 + 内置工具/会话/抓取的沙箱测试
 ```
 

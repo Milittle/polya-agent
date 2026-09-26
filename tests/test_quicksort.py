@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 
-from quicksort import quicksort, quicksort_inplace
+from examples.quicksort import quicksort, quicksort_inplace
 
 
 def test_sorts_int_and_str():

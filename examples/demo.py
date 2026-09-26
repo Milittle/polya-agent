@@ -2,7 +2,7 @@
 
 运行前在 .env 里配置好模型（见 .env.example），然后：
 
-    python demo.py
+    python examples/demo.py
 
 有副作用的工具（write_file / edit_file / run_shell）执行前会要求确认；
 在非交互环境（比如管道、CI）下默认拒绝，避免静默执行破坏性命令。
@@ -29,7 +29,7 @@ QUESTION = (
 
 def approve(tool, arguments) -> bool:
     """副作用工具的审批钩子：只读工具直接放行，危险工具先问一句。"""
-    if not tool.dangerous:
+    if tool.kind == "read":
         return True
     if not sys.stdin.isatty():
         print(f"[非交互环境，默认拒绝] {tool.name}({arguments})")
