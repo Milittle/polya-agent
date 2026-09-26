@@ -27,6 +27,10 @@ logger = logging.getLogger("polya.llm")
 DeltaCallback = Callable[[str, str], None]
 
 
+class _StreamUnsupported(Exception):
+    """端点拒绝流式请求（400 且信息指向 stream），调用方回退非流式。"""
+
+
 def _new_stream_state() -> dict:
     return {
         "content_parts": [],
@@ -140,12 +144,16 @@ class LLM:
         temperature: float | None = 0.0,
         timeout: float = 120.0,
         max_retries: int = 2,
+        profile_name: str | None = None,
         **client_kwargs,
     ):
         resolved_key = api_key or os.getenv("OPENAI_API_KEY")
         if not resolved_key:
             raise ValueError("缺少 API key：请设置环境变量 OPENAI_API_KEY，或传入 api_key 参数。")
         self.model = model or os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
+        # 来源标识：来自 ~/.polya/models.json 的哪个命名 profile（票 14）——状态行
+        # 与 /models 选项器标记「当前」用；env/旗标直连时为 None
+        self.profile_name = profile_name
         # temperature=None 表示该模型不接受自定义温度（o 系列只允许默认 1），
         # 请求时不携带该参数
         self.temperature = temperature
@@ -159,6 +167,10 @@ class LLM:
         # 该端点是否接受 stream_options：个别 OpenAI 兼容端点会因它 400，
         # 首次失败即关闭并在本实例内记住（见 chat 的回退逻辑）
         self._stream_usage = True
+        # 端点是否支持流式：不支持时回退非流式（首次 400 后记住）
+        self._stream_supported = True
+        # 流式瞬时错误的有界重试：只在尚未吐出任何片段时重开请求
+        self._stream_retries = 1
 
     def _base_kwargs(self, messages: list[dict], tools: list[dict] | None) -> dict:
         kwargs: dict = {"model": self.model, "messages": messages}
@@ -169,19 +181,30 @@ class LLM:
         return kwargs
 
     def _open_stream(self, kwargs: dict):
-        """打开流式请求；端点不认 stream_options 时去掉重试一次并记住。"""
+        """打开流式请求；端点不认 stream_options 时去掉重试一次并记住，
+        端点根本不支持流式时抛 :class:`_StreamUnsupported` 由调用方回退。"""
+        if not self._stream_supported:
+            raise _StreamUnsupported
         if self._stream_usage:
             kwargs["stream_options"] = {"include_usage": True}
         try:
             return self.client.chat.completions.create(stream=True, **kwargs)
-        except BadRequestError:
-            # 400 在 create 时即抛（流尚未开始迭代），回退安全：该端点不认
-            # stream_options，去掉重试一次并记住，本实例之后不再携带。
-            if "stream_options" not in kwargs:
-                raise
-            self._stream_usage = False
-            del kwargs["stream_options"]
-            return self.client.chat.completions.create(stream=True, **kwargs)
+        except BadRequestError as exc:
+            # 400 在 create 时即抛（流尚未开始迭代），回退安全。
+            if "stream_options" in kwargs:
+                self._stream_usage = False
+                kwargs.pop("stream_options")
+                try:
+                    return self.client.chat.completions.create(stream=True, **kwargs)
+                except BadRequestError as retry_exc:
+                    if "stream" in str(retry_exc).lower():
+                        self._stream_supported = False
+                        raise _StreamUnsupported from retry_exc
+                    raise
+            if "stream" in str(exc).lower():
+                self._stream_supported = False
+                raise _StreamUnsupported from exc
+            raise
 
     def chat_iter(self, messages: list[dict], tools: list[dict] | None = None):
         """流式的迭代器形态：``yield (kind, delta)``，结束的 ``StopIteration.value``
@@ -189,24 +212,41 @@ class LLM:
 
         与 ``chat(on_delta=...)`` 共享 :func:`fold_chunk` 折叠逻辑——callback 是
         它的一个特例。生成器协议（ADR 0002）用这个接口逐段 ``yield`` 事件。
+
+        健壮性：端点不支持流式时静默回退非流式（不吐任何片段，直接返回完整
+        响应）；尚未吐出任何片段的瞬时错误（超时 / 限流）重开一次请求；一旦
+        已有片段输出，错误直接上抛（重试会造成重复文本）。
         """
         kwargs = self._base_kwargs(messages, tools)
-        try:
-            stream = self._open_stream(kwargs)
+        attempts = 0
+        while True:
+            attempts += 1
+            emitted = False
+            try:
+                stream = self._open_stream(kwargs)
+            except _StreamUnsupported:
+                return self.client.chat.completions.create(**kwargs)
             state = _new_stream_state()
             try:
                 for chunk in stream:
-                    yield from fold_chunk(state, chunk)
-            except (APITimeoutError, RateLimitError):
+                    for kind, delta in fold_chunk(state, chunk):
+                        emitted = True
+                        yield (kind, delta)
+            except (APITimeoutError, RateLimitError) as exc:
+                if not emitted and attempts <= self._stream_retries:
+                    logger.warning(
+                        "流式请求在首个片段前失败（%s），重试第 %d 次",
+                        type(exc).__name__,
+                        attempts,
+                    )
+                    continue
+                logger.warning(
+                    "请求失败（%s）。若持续超时：调大 LLM(timeout=...)；429 限流会被 SDK 自动重试，"
+                    "重试耗尽超时预算时也会表现为超时。",
+                    type(exc).__name__,
+                )
                 raise
             return _completion_from_stream(_finalize_stream(state))
-        except (APITimeoutError, RateLimitError) as exc:
-            logger.warning(
-                "请求失败（%s）。若持续超时：调大 LLM(timeout=...)；429 限流会被 SDK 自动重试，"
-                "重试耗尽超时预算时也会表现为超时。",
-                type(exc).__name__,
-            )
-            raise
 
     def chat(
         self,
@@ -227,7 +267,13 @@ class LLM:
         try:
             if on_delta is None:
                 return self.client.chat.completions.create(**kwargs)
-            return _completion_from_stream(accumulate_stream(self._open_stream(kwargs), on_delta))
+            try:
+                return _completion_from_stream(
+                    accumulate_stream(self._open_stream(kwargs), on_delta)
+                )
+            except _StreamUnsupported:
+                # 端点不支持流式：静默回退非流式（无实时回调，但结果正确）
+                return self.client.chat.completions.create(**kwargs)
         except (APITimeoutError, RateLimitError) as exc:
             logger.warning(
                 "请求失败（%s）。若持续超时：调大 LLM(timeout=...)；429 限流会被 SDK 自动重试，"

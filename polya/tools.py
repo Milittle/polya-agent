@@ -2,16 +2,30 @@
 
 用 ``@tool`` 装饰一个普通函数即可把它变成可供模型调用的工具，
 JSON Schema 会根据函数签名和类型注解自动生成。
+
+工具是「自描述单元」，三面各自独立、互不混淆：
+
+- ``description``：完整用法说明，进请求的 tools 数组（模型逐字看到）。
+- ``snippet``：一行摘要，进系统提示词的 ``<tools>`` 段。
+- ``guidelines``：零到多条纪律句，进系统提示词的 ``<rules>`` 段。
+
+参数说明写在类型注解里的 ``Annotated[T, "描述"]`` 中，避免与 docstring
+挤在一起；``Literal`` / ``Enum`` 会生成 ``enum`` 约束，``dataclass`` 会展开
+为嵌套 object，不再把复杂类型静默降级成 ``string``。
 """
 
 from __future__ import annotations
 
+import enum
 import inspect
 import json
 import types
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from dataclasses import MISSING, dataclass, is_dataclass
+from dataclasses import fields as dataclass_fields
+from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_type_hints
+
+from .i18n import t, tool_description
 
 _JSON_TYPES: dict[Any, str] = {
     str: "string",
@@ -21,25 +35,98 @@ _JSON_TYPES: dict[Any, str] = {
 }
 
 
-def _json_schema(annotation: Any) -> str | dict:
-    """把 Python 类型注解映射成 JSON Schema（type 字符串或完整 schema 对象）。"""
+def _unwrap_annotated(annotation: Any) -> tuple[Any, str | None]:
+    """剥掉 ``Annotated[T, ...]``，把其中的字符串元数据当作参数描述返回。"""
+    if get_origin(annotation) is Annotated:
+        base, *meta = get_args(annotation)
+        description = next((item for item in meta if isinstance(item, str)), None)
+        return base, description
+    return annotation, None
+
+
+def _literal_schema(values: tuple) -> dict:
+    """``Literal[...]`` / ``Enum`` 的枚举项 → JSON Schema（带类型与 enum）。"""
+    if not values:
+        return {}
+    python_types = {type(item) for item in values}
+    if len(python_types) == 1:
+        json_type = _JSON_TYPES.get(next(iter(python_types)))
+        schema: dict = {}
+        if json_type:
+            schema["type"] = json_type
+        schema["enum"] = list(values)
+        return schema
+    return {"enum": list(values)}
+
+
+def json_schema(annotation: Any) -> dict:
+    """把 Python 类型注解映射成 JSON Schema 对象。
+
+    支持：基元、``Optional`` / ``Union`` 单值、``Literal`` / ``Enum``、
+    ``list[T]``、``dict[str, T]``、嵌套 ``dataclass``。无法理解的类型返回
+    空 schema（不加约束），而不是伪装成 ``string``——错误约束比无约束更糟。
+    """
+    annotation, _ = _unwrap_annotated(annotation)
+
+    if is_dataclass(annotation) and isinstance(annotation, type):
+        try:
+            hints = get_type_hints(annotation, include_extras=True)
+        except Exception:  # noqa: BLE001 - 无法解析的注解退化为无约束
+            hints = {}
+        properties: dict[str, dict] = {}
+        required: list[str] = []
+        for field in dataclass_fields(annotation):
+            field_annotation = hints.get(field.name, field.type)
+            sub, _ = _unwrap_annotated(field_annotation)
+            schema = json_schema(sub)
+            _annotate(schema, _field_description(field))
+            properties[field.name] = schema
+            if field.default is MISSING and field.default_factory is MISSING:
+                required.append(field.name)
+        result: dict = {"type": "object", "properties": properties}
+        if required:
+            result["required"] = required
+        return result
+
     origin = get_origin(annotation)
-    if origin is Union or origin is types.UnionType:
-        inner = [a for a in get_args(annotation) if a is not type(None)]
+    if origin is Literal:
+        return _literal_schema(get_args(annotation))
+    if origin in (Union, types.UnionType):
+        inner = [arg for arg in get_args(annotation) if arg is not type(None)]
         if len(inner) == 1:
-            return _json_schema(inner[0])
+            return json_schema(inner[0])
+        return {"anyOf": [json_schema(arg) for arg in inner]}
     if origin is list:
-        (item,) = get_args(annotation) or (str,)
-        item_schema = _json_schema(item)
-        if isinstance(item_schema, str):
-            item_schema = {"type": item_schema}
-        return {"type": "array", "items": item_schema}
+        args = get_args(annotation)
+        item = args[0] if args else str
+        return {"type": "array", "items": json_schema(item)}
     if origin is dict or annotation is dict:
-        return {"type": "object"}
-    return _JSON_TYPES.get(annotation, "string")
+        args = get_args(annotation)
+        schema = {"type": "object"}
+        if len(args) == 2:
+            schema["additionalProperties"] = json_schema(args[1])
+        return schema
+
+    if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
+        return _literal_schema(tuple(member.value for member in annotation))
+
+    json_type = _JSON_TYPES.get(annotation)
+    return {"type": json_type} if json_type else {}
 
 
-KINDS = ("read", "write", "exec")
+def _field_description(field: Any) -> str | None:
+    """``dataclasses.field(metadata={"description": ...})`` 的说明。"""
+    metadata = getattr(field, "metadata", None) or {}
+    value = metadata.get("description")
+    return value if isinstance(value, str) else None
+
+
+def _annotate(schema: dict, description: str | None) -> None:
+    if description:
+        schema.setdefault("description", description)
+
+
+KINDS = ("read", "write", "exec", "delegate")
 
 
 @dataclass
@@ -48,16 +135,14 @@ class Tool:
     description: str
     parameters: dict
     fn: Callable[..., Any]
-    kind: str = "read"  # read=无外部副作用 / write=写文件 / exec=执行命令，权限判定按此分类
+    # read=无副作用 / write=写文件 / exec=执行命令 / delegate=委派，权限判定按此分类
+    kind: str = "read"
+    snippet: str = ""  # 一行摘要，进系统提示词的 <tools> 段；空则不进
+    guidelines: tuple[str, ...] = ()  # 纪律句，进 <rules> 段
 
     def __post_init__(self):
         if self.kind not in KINDS:
             raise ValueError(f"未知工具类别 kind={self.kind!r}，可选：{KINDS}")
-
-    @property
-    def dangerous(self) -> bool:
-        """兼容视图：有副作用（write/exec）即危险。审批全面迁到 kind 判定后移除。"""
-        return self.kind != "read"
 
     def run(self, arguments: dict) -> str:
         """执行工具并把返回值统一成字符串。"""
@@ -101,10 +186,7 @@ class ToolRegistry:
 
     def add(self, item: Tool) -> Tool:
         if self._frozen:
-            raise RuntimeError(
-                "工具注册表已冻结：对话开始后增删工具会使 KV Cache 失效，"
-                "请在构建 Agent 前配置好全部工具。"
-            )
+            raise RuntimeError(t("agent.tools_frozen"))
         self._tools[item.name] = item
         return item
 
@@ -137,33 +219,44 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     kind: str = "read",
+    snippet: str | None = None,
+    guidelines: tuple[str, ...] | list[str] = (),
 ):
     """把函数包装成 :class:`Tool`。
 
-    可以作为 ``@tool`` 直接使用，也可以用 ``@tool(name=..., kind=...)`` 覆盖元信息。
-    未显式提供 description 时，取函数的 docstring。``kind`` 按副作用分类：
-    ``read``（无外部副作用，直接放行）/ ``write``（写文件）/ ``exec``（执行命令），
-    供权限判定与审批钩子识别。
+    可以作为 ``@tool`` 直接使用，也可以用 ``@tool(name=..., kind=..., snippet=...)``
+    覆盖元信息。未显式提供 description 时取函数 docstring。``kind`` 按副作用分类：
+    ``read``（无副作用，直接放行）/ ``write``（写文件）/ ``exec``（执行命令）/
+    ``delegate``（委派子任务，副作用在子层）。
+    参数说明写在 ``Annotated[T, "描述"]`` 里，会进入 schema 的字段 description。
     """
 
     def wrap(func: Callable) -> Tool:
         signature = inspect.signature(func)
-        hints = get_type_hints(func)
+        hints = get_type_hints(func, include_extras=True)
         properties: dict[str, dict] = {}
         required: list[str] = []
         for param_name, param in signature.parameters.items():
-            schema = _json_schema(hints.get(param_name, str))
-            properties[param_name] = {"type": schema} if isinstance(schema, str) else schema
+            annotation, annotated_description = _unwrap_annotated(hints.get(param_name, str))
+            schema = json_schema(annotation)
+            _annotate(schema, annotated_description)
+            properties[param_name] = schema
             if param.default is inspect.Parameter.empty:
                 required.append(param_name)
-        parameters = {"type": "object", "properties": properties, "required": required}
-        resolved_description = description or (inspect.getdoc(func) or "").strip() or func.__name__
+        parameters: dict = {"type": "object", "properties": properties}
+        if required:
+            parameters["required"] = required
+        resolved_name = name or func.__name__
+        doc = (inspect.getdoc(func) or "").strip() or resolved_name
+        resolved_description = description or tool_description(resolved_name, doc)
         return Tool(
-            name=name or func.__name__,
+            name=resolved_name,
             description=resolved_description,
             parameters=parameters,
             fn=func,
             kind=kind,
+            snippet=snippet or "",
+            guidelines=tuple(guidelines),
         )
 
     return wrap(fn) if fn is not None else wrap
