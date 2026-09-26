@@ -1,11 +1,11 @@
-"""mi-z 命令行入口：交互式 REPL 与单任务模式。
+"""polya 命令行入口：交互式 REPL 与单任务模式。
 
 用法::
 
-    uv run mi-z                     # 交互式 REPL（当前目录为工作目录）
-    uv run mi-z -p "修复测试" --plan  # 单任务模式：执行一次即退出
+    uv run polya                     # 交互式 REPL（当前目录为工作目录）
+    uv run polya -p "修复测试" --plan  # 单任务模式：执行一次即退出
 
-交互设计对标 pi（badlogic/pi-mono）的极简风格（详见 mi_z/ui.py）：滚动区永久
+交互设计对标 pi（badlogic/pi-mono）的极简风格（详见 polya/ui.py）：滚动区永久
 追加 + 底部小型 live 区。中断分级——输入处 EOF / Ctrl+C 统一退出；``run()``
 执行中 Ctrl+C 仅终止本轮回提示符（历史保留，缺失的 tool 结果由 Agent 补齐后
 序列仍合法；流式被打断时半截内容不落历史，序列天然合法）。
@@ -385,7 +385,7 @@ def terminal_approve_plan(interactive: bool, renderer: TerminalRenderer | None =
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="mi-z",
+        prog="polya",
         description="本地编码代理：读文件、改代码、跑命令，干活前先问一句。",
         formatter_class=RichHelpFormatter,
     )
@@ -551,6 +551,8 @@ def make_session() -> PromptSession:
         width = shutil.get_terminal_size((100, 24)).columns
         return [("class:rule", _rule("Enter 发送 · Alt+Enter 换行 · /help 命令", width))]
 
+    state_dir = Path.home() / ".polya"  # 状态目录：输入历史现居于此，配置将放这里
+    state_dir.mkdir(parents=True, exist_ok=True)
     return PromptSession(
         multiline=True,
         prompt_continuation=lambda width, line_number, is_soft_wrap: [("class:continuation", "… ")],
@@ -565,7 +567,7 @@ def make_session() -> PromptSession:
                 "placeholder": "dim",
             }
         ),
-        history=FileHistory(str(Path.home() / ".mi_z_history")),
+        history=FileHistory(str(state_dir / "history")),
         completer=SlashCommandCompleter(),
         auto_suggest=AutoSuggestFromHistory(),
         key_bindings=bindings,
@@ -602,7 +604,7 @@ def repl(agent: Agent, root: str, renderer: TerminalRenderer) -> None:
     if interactive:
         agent.on_event = renderer.update
         if ui.is_terminal:
-            ui.set_window_title("mi-z")
+            ui.set_window_title("polya")
 
     def say(message: str, style: str) -> None:
         if interactive:
@@ -610,7 +612,7 @@ def repl(agent: Agent, root: str, renderer: TerminalRenderer) -> None:
         else:
             console.print(message, style=style, markup=False)
 
-    say(f"mi-z（模型: {agent.llm.model}，工作目录: {os.path.abspath(root)}）", "none")
+    say(f"polya（模型: {agent.llm.model}，工作目录: {os.path.abspath(root)}）", "none")
     say("输入任务开始；/help 查看命令；Ctrl+D 退出。规划模式可用 /plan on 开启。\n", "none")
     while True:
         try:

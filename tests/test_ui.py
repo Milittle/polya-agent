@@ -6,7 +6,7 @@ from io import StringIO
 
 from rich.console import Console
 
-from mi_z.ui import TerminalRenderer, _collapse
+from polya.ui import TerminalRenderer, _collapse
 
 
 def make_renderer(**kwargs) -> tuple[TerminalRenderer, StringIO]:
@@ -123,12 +123,12 @@ def test_commit_clears_state_for_next_iteration():
 
 
 def test_header_arg_specializes_by_tool():
-    from mi_z.ui import _header_arg
+    from polya.ui import _header_arg
 
     assert _header_arg("bash", {"command": "pytest -q"}) == "$ pytest -q"
     assert _header_arg("bash", {"command": "a &&\nb"}) == "$ a && ⏎ b"
-    assert _header_arg("read_file", {"path": "mi_z/ui.py", "start_line": 10, "end_line": 50}) == (
-        "mi_z/ui.py:10-50"
+    assert _header_arg("read_file", {"path": "polya/ui.py", "start_line": 10, "end_line": 50}) == (
+        "polya/ui.py:10-50"
     )
     assert _header_arg("multi_edit", {"path": "a.py", "edits": [{}, {}]}) == "a.py（2 处）"
     assert _header_arg("grep", {"pattern": "def run", "glob": "*.py"}) == "def run  ·  glob *.py"

@@ -4,7 +4,7 @@
 解析后校验，防止 ``../`` 或绝对路径穿越到目录外。
 
 ``write_file`` / ``edit_file`` / ``run_shell`` 标记为 ``dangerous``，
-可交给 :class:`~mi_z.agent.Agent` 的 ``approve`` 钩子在执行前拦截。
+可交给 :class:`~polya.agent.Agent` 的 ``approve`` 钩子在执行前拦截。
 """
 
 from __future__ import annotations

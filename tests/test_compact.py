@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mi_z import Agent, tool
-from mi_z.compact import (
+from polya import Agent, tool
+from polya.compact import (
     COMPRESS_MARKER,
     compact_messages,
     compact_restart,
@@ -253,7 +253,7 @@ def test_compact_restart_folds_history_into_summary():
 
 
 def test_agent_uses_restart_for_thinking_bound_models():
-    from mi_z.providers import ModelProfile
+    from polya.providers import ModelProfile
 
     llm = ScriptedLLM(
         # keep_recent=4：第 3 轮开头历史 7 条，切点落在第 3 轮状态栏（user 边界）

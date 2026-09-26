@@ -1,5 +1,5 @@
 [project]
-name = "mi-z"
+name = "polya"
 version = "0.1.0"
 description = "一个最小可运行的 LLM 工具调用 Agent"
 readme = "README.md"
@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mi-z = "mi_z.cli:main"
+polya = "polya.cli:main"
 
 [dependency-groups]
 dev = [
@@ -33,4 +33,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["mi_z"]
+packages = ["polya"]

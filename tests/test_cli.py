@@ -7,10 +7,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mi_z import Agent, tool
-from mi_z.cli import build_agent, handle_command, main, make_session, parse_args, terminal_approve
-from mi_z.todos import TodoStore
-from mi_z.ui import TerminalRenderer
+from polya import Agent, tool
+from polya.cli import build_agent, handle_command, main, make_session, parse_args, terminal_approve
+from polya.todos import TodoStore
+from polya.ui import TerminalRenderer
 
 
 def make_message(content=None, tool_calls=None):
@@ -98,13 +98,13 @@ def test_unknown_command():
 
 
 def test_terminal_approve_yes_no_always(monkeypatch):
-    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: 0)
+    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: 0)
     approve = terminal_approve(interactive=True)
     assert approve(add, {}) is True  # 只读工具直接放行，不询问
 
     # 选择列表下标：0 允许 / 1 总是允许 / 2 拒绝
     answers = iter([2, 1])
-    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: next(answers))
+    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: next(answers))
     approve = terminal_approve(interactive=True)
     assert approve(write_thing, {"content": "x"}) is False  # 拒绝
     assert approve(write_thing, {"content": "y"}) is True  # 总是允许 → 放行
@@ -143,7 +143,7 @@ def test_yes_mode_disables_approval(tmp_path):
 
 def test_prompt_mode_prints_answer(monkeypatch, tmp_path, capsys):
     fake = ScriptedLLM([make_message("答案是 42")])
-    monkeypatch.setattr("mi_z.cli.LLM", lambda **kwargs: fake)
+    monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
     code = main(["--root", str(tmp_path), "-p", "终极问题的答案"])
     assert code == 0
     assert "答案是 42" in capsys.readouterr().out
@@ -151,7 +151,7 @@ def test_prompt_mode_prints_answer(monkeypatch, tmp_path, capsys):
 
 def test_repl_loop_runs_and_exits(monkeypatch, tmp_path, capsys):
     fake = ScriptedLLM([make_message("1024")])
-    monkeypatch.setattr("mi_z.cli.LLM", lambda **kwargs: fake)
+    monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
     inputs = iter(["2 的 10 次方", "/status", "/exit"])
     monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
     monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: False))
@@ -192,7 +192,7 @@ def test_make_session_is_multiline_with_placeholder():
 
 
 def test_slugify_keeps_kebab_case_only():
-    from mi_z.cli import _slugify
+    from polya.cli import _slugify
 
     assert _slugify("`Fix-Login-Bug`\n") == "fix-login-bug"
     assert _slugify("Count  README_words!") == "count-readme-words"
@@ -200,7 +200,7 @@ def test_slugify_keeps_kebab_case_only():
 
 
 def test_topic_from_local_fallbacks():
-    from mi_z.cli import _topic_from
+    from polya.cli import _topic_from
 
     assert _topic_from("Count README words") == "count-readme-words"
     assert _topic_from("统计单词数") == "统计单词数"  # 纯中文退化为截断原文
@@ -208,7 +208,7 @@ def test_topic_from_local_fallbacks():
 
 
 def test_rule_and_prompt_message_lay_out():
-    from mi_z.cli import _prompt_message, _rule
+    from polya.cli import _prompt_message, _rule
 
     assert _rule("hi", 10) == "── hi ────"
     assert _rule("", 6) == "──────"
@@ -224,7 +224,7 @@ def test_approve_cooperates_with_renderer_pause(monkeypatch):
     renderer.pause()
     renderer.resume()
 
-    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: 0)
+    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: 0)
     approve = terminal_approve(interactive=True, renderer=renderer)
     assert approve(write_thing, {"content": "x"}) is True
 
@@ -233,7 +233,7 @@ def test_approve_cooperates_with_renderer_pause(monkeypatch):
 
 
 def approve_and_capture(monkeypatch, capsys, root, name, arguments, choice=0):
-    monkeypatch.setattr("mi_z.cli._select_option", lambda options, **kwargs: choice)
+    monkeypatch.setattr("polya.cli._select_option", lambda options, **kwargs: choice)
     approve = terminal_approve(interactive=True, root=root)
     approved = approve(
         SimpleNamespace(name=name, dangerous=True, fn=None),
@@ -286,7 +286,7 @@ def test_approval_reject_and_always(monkeypatch, tmp_path, capsys):
 
 
 def test_diff_lines_truncates_with_note():
-    from mi_z.cli import _diff_lines
+    from polya.cli import _diff_lines
 
     old = "\n".join(f"old{i}" for i in range(60))
     new = "\n".join(f"new{i}" for i in range(60))
@@ -296,7 +296,7 @@ def test_diff_lines_truncates_with_note():
 
 
 def test_apply_edits_draft_flags_future_failures():
-    from mi_z.cli import _apply_edits_draft
+    from polya.cli import _apply_edits_draft
 
     text = "alpha beta\n"
     draft, error = _apply_edits_draft(text, [{"old_string": "alpha", "new_string": "gamma"}])

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from mi_z.builtin import default_tools
-from mi_z.tools import ToolRegistry
+from polya.builtin import default_tools
+from polya.tools import ToolRegistry
 
 
 @pytest.fixture
@@ -193,8 +193,8 @@ def test_web_fetch_wraps_content_with_source_marker(tools, monkeypatch):
         def __exit__(self, *args):
             return False
 
-    monkeypatch.setattr("mi_z.web.urllib.request.urlopen", lambda req, timeout: FakeResponse())
-    monkeypatch.setattr("mi_z.web._assert_public_url", lambda url: None)  # 测试不做 DNS 解析
+    monkeypatch.setattr("polya.web.urllib.request.urlopen", lambda req, timeout: FakeResponse())
+    monkeypatch.setattr("polya.web._assert_public_url", lambda url: None)  # 测试不做 DNS 解析
     result = tools.call("web_fetch", {"url": "https://example.com/docs"})
 
     assert '<external_content source="webpage" url="https://example.com/docs">' in result

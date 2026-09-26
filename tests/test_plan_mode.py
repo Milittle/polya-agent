@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mi_z import Agent, tool
+from polya import Agent, tool
 
 
 @tool

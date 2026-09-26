@@ -22,7 +22,7 @@ from openai import APITimeoutError, BadRequestError, OpenAI, RateLimitError
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
 
-logger = logging.getLogger("mi_z.llm")
+logger = logging.getLogger("polya.llm")
 
 DeltaCallback = Callable[[str, str], None]
 

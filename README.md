@@ -1,7 +1,8 @@
-# mi-z
+# polya-agent
 
 一个最小可运行的 LLM 工具调用 Agent：模型思考 → 调用工具 → 回填结果 → 直到给出最终答案。
-自带一组本地编码工具，可以直接当编码代理用。
+自带一组本地编码工具，可以直接当编码代理用。内部（包名 / CLI 命令 / 品牌）一律叫 **polya**，
+取自波利亚（G. Pólya，《怎样解题》）——问题求解代理的祖师爷。
 
 ## 安装
 
@@ -32,16 +33,16 @@ cp .env.example .env
 uv run demo.py
 ```
 
-示例会启动一个本地编码代理，让它列出目录、阅读 `mi_z/agent.py` 并总结。工具调用过程会通过
+示例会启动一个本地编码代理，让它列出目录、阅读 `polya/agent.py` 并总结。工具调用过程会通过
 日志打印出来。有副作用的工具执行前会要求确认；非交互环境（管道、CI）下默认拒绝。
 
 ## CLI
 
-安装后直接用 `mi-z`（开发时 `uv run mi-z`），两种模式：
+安装后直接用 `polya`（开发时 `uv run polya`），两种模式：
 
 ```bash
-uv run mi-z                    # 交互式 REPL：多轮对话，斜杠命令控制会话
-uv run mi-z -p "修复 pytest 失败的测试" --plan -y   # 单任务模式：执行一次即退出
+uv run polya                    # 交互式 REPL：多轮对话，斜杠命令控制会话
+uv run polya -p "修复 pytest 失败的测试" --plan -y   # 单任务模式：执行一次即退出
 ```
 
 常用参数：`--root DIR` 工作目录（默认 `.`，文件操作被限制在内）、`--plan` 启动进入
@@ -88,7 +89,7 @@ stdin/stdout 是终端时启用；管道/CI 下自动降级为纯文本（补全
   中间轮的 assistant 文字与 thinking 同样可见——思考折叠为一行 dim italic 摘要
   （`✻ 思考 47 字：…`），全文用 `/expand` 查看。
 - **工具块**（Claude Code 树形）：头行按工具特化——`⏺ bash  $ pytest -q`、
-  `⏺ read_file  mi_z/ui.py:10-50`、`⏺ write_file  app.py`（陌生工具退回紧凑 JSON）；
+  `⏺ read_file  polya/ui.py:10-50`、`⏺ write_file  app.py`（陌生工具退回紧凑 JSON）；
   结果首行用 `  ⎿ ` 连接符、续行 4 空格对齐，默认折叠前 8 行 / 600 字符（`… 还有
   N 行未显示（/expand 查看全文）`），耗时以 dim 附在尾行；错误结果整块标红；块间空行分组。
 - **实时状态**：底部 spinner 标注阶段（`思考中` / `回复中` / `运行 bash`）、轮次、
@@ -99,8 +100,9 @@ stdin/stdout 是终端时启用；管道/CI 下自动降级为纯文本（补全
 - **输入**（Claude Code 风格）：上下两条横线围出输入区——顶线嵌会话主题
   （`── ✳ count-readme-words ────`），底线是按键提示（`── Enter 发送 · Alt+Enter
   换行 ────`）；`❯` 提示符 + 空输入 dim 占位提示；**Enter 提交**，Alt+Enter（或
-  行尾反斜杠 + Enter）换行写多行任务；命令历史持久化到 `~/.mi_z_history`
-  （上下键翻阅），输入 `/` 自动补全斜杠命令，并按历史给出灰色建议（`→` 接受）。
+  行尾反斜杠 + Enter）换行写多行任务；命令历史持久化到**状态目录** `~/.polya/` 下的
+  `history`（上下键翻阅；状态目录亦将承载后续配置），输入 `/` 自动补全斜杠命令，
+  并按历史给出灰色建议（`→` 接受）。
 - **会话主题**（Claude Code 同款）：首个任务完成后从任务内容**本地**推断一个
   kebab-case slug（如 `count-readme-words`），嵌入输入框顶线并写入终端标签页标题
   （`✳ topic`）。纯本地推断（slug 化 → 输入截断逐级降级）——不为装饰发起任何
@@ -114,7 +116,7 @@ stdin/stdout 是终端时启用；管道/CI 下自动降级为纯文本（补全
 定义工具就是一个普通函数加 `@tool` 装饰器，JSON Schema 会从签名和类型注解自动生成：
 
 ```python
-from mi_z import Agent, LLM, tool
+from polya import Agent, LLM, tool
 
 
 @tool
@@ -130,8 +132,8 @@ print(agent.run("北京今天天气怎么样？"))
 直接用内置的编码工具：
 
 ```python
-from mi_z import Agent, LLM, default_tools
-from mi_z.builtin import CODING_SYSTEM_PROMPT
+from polya import Agent, LLM, default_tools
+from polya.builtin import CODING_SYSTEM_PROMPT
 
 agent = Agent(
     llm=LLM(),
@@ -155,7 +157,7 @@ agent = Agent(
   也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易
   数错——状态栏用代码提前算好。更新采用持久追加（旧状态留在轨迹里，不删改），KV Cache
   前缀始终稳定。也可传入自定义渲染函数 `status_bar=lambda snapshot: ...`。
-- `on_event(event, payload)` 是可选观测钩子，CLI 的终端渲染（`mi_z/ui.py` 的
+- `on_event(event, payload)` 是可选观测钩子，CLI 的终端渲染（`polya/ui.py` 的
   `TerminalRenderer`）就建立在它之上；不设钩子时零开销、核心逻辑不受影响，任何前端
   （REPL、全屏 TUI、Web）都能接这条事件流。事件词表（时序：`iteration → [usage] →
   *_delta* → assistant_message → (tool_call → tool_result)*`）：
@@ -185,7 +187,7 @@ agent = Agent(
   权衡，所以阈值高、批量压、低频次。触发判据必须是**最近一次**调用的 prompt_tokens，
   不能用累计用量（每轮重复计入共享前缀，二次增长会过早触发）。连续 3 次压缩失败自动
   熔断（压缩失败不影响主任务，保留完整信息继续跑）。
-- **模型能力声明**（`mi_z.providers.ModelProfile`）：Agent 只问能力、不特判模型名。
+- **模型能力声明**（`polya.providers.ModelProfile`）：Agent 只问能力、不特判模型名。
   压缩策略按 `supports_inplace_tool_edit` 自动切换——OpenAI 式模型（不回传 reasoning）
   原地替换 tool content；thinking 绑定前缀的模型（`deepseek-reasoner`/`claude`/`gemini`
   档案）改用**摘要重启**：整段旧历史压成一条 `<session_summary>` 消息，模型从摘要冷
@@ -199,7 +201,7 @@ agent = Agent(
   「两个压缩点之间严格 append-only」从纪律变成代码。压缩/摘要重启/reset 后基线自动
   重置（压缩点是合法的推理重启点）。
 - 不传 `system_prompt` 时使用内置的通用提示词；`default_tools` 建议搭配
-  `mi_z.builtin.CODING_SYSTEM_PROMPT`（围绕内置工具的工作流：任务拆解 → 探查 →
+  `polya.builtin.CODING_SYSTEM_PROMPT`（围绕内置工具的工作流：任务拆解 → 探查 →
   小步修改 → 验证 → 汇报）。系统提示词应当 100% 静态——动态信息请追加到对话末尾，而不是改写提示词。
 
 ## 内置工具
@@ -235,7 +237,7 @@ TODO 清单是状态栏的「任务规划」组件：`todo_write` 写入共享�
 ## 项目结构
 
 ```
-mi_z/
+polya/
   agent.py    # 核心循环 + 审批钩子 + 状态栏注入 + on_event 进度钩子
   cli.py      # 命令行入口：REPL + 单任务模式 + 终端审批 + rich/prompt_toolkit 显示层
   llm.py      # OpenAI 兼容接口封装

@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mi_z import Agent, ToolRegistry, tool
-from mi_z.agent import DEFAULT_SYSTEM_PROMPT
+from polya import Agent, ToolRegistry, tool
+from polya.agent import DEFAULT_SYSTEM_PROMPT
 
 
 def make_message(content=None, tool_calls=None):
@@ -28,7 +28,7 @@ class ScriptedLLM:
 
     usages 可选，与 replies 一一对应；缺省用 None 模拟不带 usage 的响应。
     on_delta 给定时模拟流式：reasoning / content 各拆两半回调，最终返回与
-    非流式完全相同的对象（mi_z.llm 流式路径的同形契约）。
+    非流式完全相同的对象（polya.llm 流式路径的同形契约）。
     """
 
     def __init__(self, replies, usages=None):
@@ -519,7 +519,7 @@ def test_reasoning_content_passthrough():
 
 
 def test_reasoning_passthrough_disabled_by_profile():
-    from mi_z.providers import ModelProfile
+    from polya.providers import ModelProfile
 
     reply = make_message(content="好的")
     reply.reasoning_content = "内心戏"
@@ -530,7 +530,7 @@ def test_reasoning_passthrough_disabled_by_profile():
 
 
 def test_profile_provides_defaults_and_explicit_wins():
-    from mi_z.providers import profile_for
+    from polya.providers import profile_for
 
     claude_like = Agent(llm=ScriptedLLM([]), profile=profile_for("claude-opus-4-5"))
     assert claude_like.context_window == 200_000  # 档案默认

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mi_z.providers import ModelProfile, profile_for
+from polya.providers import ModelProfile, profile_for
 
 
 def test_profile_for_matches_by_prefix():

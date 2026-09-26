@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mi_z.shell import ShellSession
+from polya.shell import ShellSession
 
 
 def test_run_returns_exit_code_and_output(tmp_path):
@@ -63,4 +63,4 @@ def test_run_streams_lines_via_callback(tmp_path):
     result = session.run("echo one; echo two", on_line=seen.append)
     assert seen == ["one", "two"]
     assert "退出码 0" in result and "one" in result
-    assert all("__mi_z_done_" not in line for line in seen)
+    assert all("__polya_done_" not in line for line in seen)

@@ -15,14 +15,14 @@ import sys
 
 from dotenv import load_dotenv
 
-from mi_z import LLM, Agent, default_tools
-from mi_z.builtin import CODING_SYSTEM_PROMPT
-from mi_z.todos import TodoStore
+from polya import LLM, Agent, default_tools
+from polya.builtin import CODING_SYSTEM_PROMPT
+from polya.todos import TodoStore
 
 load_dotenv()
 
 QUESTION = (
-    "先统计 mi_z/ 和 tests/ 各有几个 Python 文件（用 glob），再读 mi_z/agent.py，"
+    "先统计 polya/ 和 tests/ 各有几个 Python 文件（用 glob），再读 polya/agent.py，"
     "最后用三五句话说明这个文件负责什么、核心循环是怎么跑的。"
 )
 

@@ -19,7 +19,7 @@ import threading
 import uuid
 from collections.abc import Callable
 
-_MARKER_PREFIX = "__mi_z_done_"
+_MARKER_PREFIX = "__polya_done_"
 
 
 class ShellSession:

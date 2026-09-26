@@ -15,7 +15,7 @@
 
 注意：若模型把 reasoning/thinking 绑定在前缀上（DeepSeek-R1 类推理模型），
 原地替换同样会使保留区的 thinking 失效，书推荐的替代是把整段旧历史压成一条
-摘要消息。mi-z 保存并回传 reasoning_content（agent 侧随消息追加），因此
+摘要消息。polya 保存并回传 reasoning_content（agent 侧随消息追加），因此
 providers.ModelProfile 按 reasoning_passthrough 能力选择策略：支持原地替换
 tool content 的用 compact_messages，thinking 绑定前缀的用 compact_restart。
 """

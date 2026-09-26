@@ -15,7 +15,7 @@ from .status import StatusSnapshot, render_status
 from .todos import TodoStore
 from .tools import Tool, ToolRegistry, tool
 
-logger = logging.getLogger("mi_z.agent")
+logger = logging.getLogger("polya.agent")
 
 DEFAULT_SYSTEM_PROMPT = """\
 你是一个可以调用工具解决问题的助手，按下面的流程工作。

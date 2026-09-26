@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from mi_z import Agent, ToolRegistry
-from mi_z.builtin import default_tools
-from mi_z.status import StatusSnapshot, render_status
-from mi_z.todos import TodoStore
+from polya import Agent, ToolRegistry
+from polya.builtin import default_tools
+from polya.status import StatusSnapshot, render_status
+from polya.todos import TodoStore
 
 
 def registry(todos=None) -> ToolRegistry:

@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 MAX_BYTES = 1_000_000
 MAX_OUTPUT = 8000
 
-_USER_AGENT = "mi-z-agent/0.1 (web_fetch tool)"
+_USER_AGENT = "polya-agent/0.1 (web_fetch tool)"
 
 
 def _assert_public_url(url: str) -> None:

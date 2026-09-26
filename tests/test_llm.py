@@ -8,7 +8,7 @@ import httpx2
 import pytest
 from openai import BadRequestError
 
-from mi_z.llm import LLM, _completion_from_stream, accumulate_stream
+from polya.llm import LLM, _completion_from_stream, accumulate_stream
 
 
 @pytest.fixture
@@ -20,7 +20,7 @@ def captured(monkeypatch):
         def __init__(self, **kwargs):
             box.update(kwargs)
 
-    monkeypatch.setattr("mi_z.llm.OpenAI", FakeClient)
+    monkeypatch.setattr("polya.llm.OpenAI", FakeClient)
     return box
 
 
@@ -218,7 +218,7 @@ def fake_llm(monkeypatch):
         def __init__(self, **kwargs):
             self.chat = SimpleNamespace(completions=completions)
 
-    monkeypatch.setattr("mi_z.llm.OpenAI", FakeOpenAI)
+    monkeypatch.setattr("polya.llm.OpenAI", FakeOpenAI)
     return LLM(api_key="k"), completions
 
 
