@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - No-progress breaker: repeating the same tool call with identical arguments
   (`--loop-repeat-limit`, default 3) first nudges the model (the nudge is appended to
-  the tool result), then stops the turn resumably; `--no-loop-guard` disables it. It is
+  the tool result), then stops the turn resumably; `--loop-repeat-limit 0` disables it. It is
   independent of `--max-steps` and stays active with `--max-steps 0`. Waiting tools are
   exempt via the new `Tool.poll` flag (e.g. `bash_output` polling); sub-agents keep
   their hard `max_steps` bound instead.

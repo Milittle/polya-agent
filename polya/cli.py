@@ -69,15 +69,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="检查点后自动续跑的最多次数；0 表示到点即收尾（默认 4）",
     )
     parser.add_argument(
-        "--no-loop-guard",
-        action="store_true",
-        help="关闭无进展熔断（默认开启：同工具同参数连续重复先提醒、再犯即停止）",
-    )
-    parser.add_argument(
         "--loop-repeat-limit",
         type=int,
         default=3,
-        help="同一工具同参数连续重复达该次数先提醒、再犯即停止（默认 3）",
+        help="无进展熔断：同工具同参数连续重复达该次数先提醒、再犯即停止；0 关闭（默认 3）",
     )
     parser.add_argument("--model", help="模型名（默认取 OPENAI_MODEL 环境变量）")
     parser.add_argument("--base-url", help="API 地址（默认取 OPENAI_BASE_URL 环境变量）")
@@ -228,8 +223,8 @@ def build_agent(
         plan_capable=True,  # exit_plan_mode 构造时注册，/plan 随时切换而不动工具数组
         max_steps=args.max_steps,
         max_continuations=args.max_continuations,
-        loop_guard=not args.no_loop_guard,
-        loop_repeat_limit=args.loop_repeat_limit,
+        loop_guard=args.loop_repeat_limit > 0,
+        loop_repeat_limit=max(1, args.loop_repeat_limit),
         compress=not args.no_compress,
         context_window=context_window,
         micro_threshold=None if args.no_microcompact else 0.6,

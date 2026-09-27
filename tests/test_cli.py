@@ -114,17 +114,21 @@ def test_build_agent_registers_exit_plan_mode(tmp_path):
 
 
 def test_loop_guard_flags(tmp_path):
-    """票 07：CLI 默认开启无进展熔断，--no-loop-guard/--loop-repeat-limit 可调。"""
+    """票 07：CLI 默认开启无进展熔断；--loop-repeat-limit 调阈值，0 关闭。"""
     agent = build_agent(parse_args(["--root", str(tmp_path)]), llm=ScriptedLLM([]))
     assert agent.loop_guard is True and agent.loop_repeat_limit == 3
 
     off = build_agent(
-        parse_args(
-            ["--root", str(tmp_path), "--no-loop-guard", "--loop-repeat-limit", "5"]
-        ),
+        parse_args(["--root", str(tmp_path), "--loop-repeat-limit", "0"]),
         llm=ScriptedLLM([]),
     )
-    assert off.loop_guard is False and off.loop_repeat_limit == 5
+    assert off.loop_guard is False
+
+    tuned = build_agent(
+        parse_args(["--root", str(tmp_path), "--loop-repeat-limit", "5"]),
+        llm=ScriptedLLM([]),
+    )
+    assert tuned.loop_guard is True and tuned.loop_repeat_limit == 5
 
 
 def test_prompt_mode_prints_answer(monkeypatch, tmp_path, capsys):
