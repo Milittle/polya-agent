@@ -141,18 +141,17 @@ def test_prompt_mode_saves_session(monkeypatch, tmp_path, capsys):
 
 def test_prompt_mode_budget_exhausted_returns_unfinished(monkeypatch, tmp_path, capsys):
     """票 03：达续跑上限 -> [未完成] + 退出码 1，且仍落盘。"""
-    call = SimpleNamespace(
-        id="c1", function=SimpleNamespace(name="add", arguments='{"a": 1, "b": 2}')
-    )
-    fake = ScriptedLLM([make_message(tool_calls=[call])])
+    # 参数各不相同（避开无进展熔断），--max-steps 1 下连跳上限 4 -> 第 5 轮预算收尾
+    calls = [
+        SimpleNamespace(
+            id=f"c{i}", function=SimpleNamespace(name="add", arguments=f'{{"a": {i}, "b": 2}}')
+        )
+        for i in range(5)
+    ]
+    fake = ScriptedLLM([make_message(tool_calls=[c]) for c in calls])
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
-    code = main(
-        [
-            "--root", str(tmp_path), "-p", "循环",
-            "--max-steps", "1", "--max-continuations", "0",
-        ]
-    )
+    code = main(["--root", str(tmp_path), "-p", "循环", "--max-steps", "1"])
     assert code == 1
     captured = capsys.readouterr()
     assert "[未完成]" in captured.err

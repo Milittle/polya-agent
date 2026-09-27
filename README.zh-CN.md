@@ -68,9 +68,7 @@ uv run polya -p "修复 pytest 失败的测试" --plan   # 单任务模式：执
 
 常用参数：`--root DIR` 工作目录（默认 `.`，文件操作被限制在内）、`--plan` 启动进入
 规划模式、`--trust` / `--no-trust` 保存并应用项目信任决定（`--trust` 加载其 `AGENTS.md` / 项目 skills，非交互场景必需）、
-`--max-steps N`（默认 100；软检查点，到点自动续跑，0 表示无界）、
-`--max-continuations N`（检查点后自动续跑次数，默认 4）、
-`--model/--base-url/
+`--max-steps N`（默认 100；软检查点，到点自动续跑，0 表示无界）、`--model/--base-url/
 --api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启）、`--no-microcompact`
 关闭微压缩、`--context-window N`
 （默认 128000）、`--keep-recent N`

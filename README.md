@@ -70,7 +70,7 @@ uv run polya -p "fix the failing tests" --plan   # one-shot mode
 Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 (start in plan mode), `--trust` / `--no-trust` (save and apply a project-trust decision;
 `--trust` is needed for non-interactive runs in a fresh directory), `--max-steps N` (default 100;
-soft checkpoint that auto-continues, `0` = unbounded), `--max-continuations N` (default 4),
+soft checkpoint that auto-continues, `0` = unbounded),
 `--model/--base-url/--api-key`, `--no-stream`, `--no-compress`, `--no-microcompact`,
 `--context-window N` (default 128000), `--keep-recent N`, `--keep-recent-tokens N`,
 `--reserve-tokens N` (absolute compaction reserve, default 16384), `--prefix-check`.

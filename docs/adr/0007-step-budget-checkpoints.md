@@ -16,7 +16,7 @@
    返回一句提示串收尾（`agent.last_run_exhausted = True`）。**删除 `raise`**：
    终止方式从异常改为事件 + 返回值。
 2. `max_steps == 0` 表示无界（pi 语义）：不发检查点，循环直到模型给出最终答案。
-3. 默认值分层：CLI `--max-steps` = 100、`--max-continuations` = 4；
+3. 默认值分层：CLI `--max-steps` = 100、内部续跑上限 = 4（不做 CLI 开关）；
    `Agent()` 默认 `max_steps=10` + `max_continuations=0`（库默认仍是有界硬停，
    不抛异常）；子代理 `max_steps=20` + `max_continuations=0`（有界子任务语义不变，
    首个检查点即报错收尾）。
@@ -40,7 +40,7 @@
   `except RuntimeError` 改为识别 `BudgetExhausted` 事件。
 - `max_steps == 0` 时状态栏不显示 `/0`（status.py 用「（无上限）」）。
 - 事件词表新增 `budget_checkpoint` / `budget_exhausted`，驱动层渲染，引擎不感知 UI。
-- 真正跑飞的安全护栏（无进展熔断）尚未实现，`--max-continuations` 只是数量兜底；
+- 真正跑飞的安全护栏（无进展熔断）尚未实现，自动续跑上限只是数量兜底；
   `--max-steps 0` 的语义在此之前不建议作为默认。
 - 交互层 `run_task` 返回值从 `bool`（是否计划）改为字符串收尾原因
   （`"plan"` / `"budget"` / `"final"`）。
