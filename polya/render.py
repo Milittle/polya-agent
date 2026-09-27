@@ -336,6 +336,15 @@ class TerminalRenderer:
                     style="dim",
                 )
             )
+        elif event == "no_progress":
+            # 无进展熔断：nudged 只提醒、回合继续；stopped 收尾（可续）。
+            tool = payload.get("tool", "?")
+            count = payload.get("count", 0)
+            if payload.get("phase") == "stopped":
+                line = f"⏹ 检测到重复调用 {tool} ×{count}，已停止；发送消息可继续"
+            else:
+                line = f"↺ 检测到重复调用 {tool} ×{count}，已提醒模型"
+            self._console.print(Text(line, style="dim"))
         elif event == "tool_result":
             self._print_tool_result(payload)
             self.current_tool = None

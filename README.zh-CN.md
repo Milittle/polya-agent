@@ -69,7 +69,9 @@ uv run polya -p "修复 pytest 失败的测试" --plan   # 单任务模式：执
 常用参数：`--root DIR` 工作目录（默认 `.`，文件操作被限制在内）、`--plan` 启动进入
 规划模式、`--trust` / `--no-trust` 保存并应用项目信任决定（`--trust` 加载其 `AGENTS.md` / 项目 skills，非交互场景必需）、
 `--max-steps N`（默认 100；软检查点，到点自动续跑，0 表示无界）、
-`--max-continuations N`（检查点后自动续跑次数，默认 4）、`--model/--base-url/
+`--max-continuations N`（检查点后自动续跑次数，默认 4）、
+`--loop-repeat-limit N`（无进展熔断：同工具同参数连续重复达该次数先提醒、再犯即停止，
+默认 3）、`--no-loop-guard`（关闭无进展熔断）、`--model/--base-url/
 --api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启）、`--no-microcompact`
 关闭微压缩、`--context-window N`
 （默认 128000）、`--keep-recent N`
@@ -242,6 +244,10 @@ agent = Agent(
 - `max_steps` 是**软检查点周期**而非硬上限：每走满该轮数发一次 `BudgetCheckpoint` 并
   自动续跑，连跳 `max_continuations` 次后发 `BudgetExhausted` 收尾（历史完整保留，发下一条
   消息即可继续）；`max_steps=0` 表示无界（pi 语义）。不再抛「超过最大步数」。
+- **无进展熔断**（CLI 默认开启）：同一工具、同一参数**连续**重复时，第
+  `--loop-repeat-limit`（默认 3）次把提醒拼进工具结果，再犯即**可续停止**（历史保留，
+  发消息可继续）。与 `max_steps` 独立，`--max-steps 0` 下仍生效；`bash_output` 等
+  `poll` 等待工具豁免（相同参数的轮询是合法等待）。`--no-loop-guard` 关闭。
 - `status_bar=True` 开启 Agent 状态栏：每轮迭代以 user 消息在上下文**末尾**追加
   `<agent_status>` 元信息（迭代号、各工具累计调用次数、token 用量、时间），工具结果
   也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易
@@ -266,6 +272,7 @@ agent = Agent(
   | `plan_submitted` | `{plan}` | 规划模式提交计划，驱动层打印后结束本轮 |
   | `budget_checkpoint` | `{step, limit, continuation}` | 走满一轮预算，自动续跑（软检查点） |
   | `budget_exhausted` | `{step, limit, continuations}` | 连跳上限后收尾，历史保留可继续 |
+  | `no_progress` | `{tool, arguments, count, phase}` | 无进展熔断：`nudged` 提醒 / `stopped` 停止 |
 
   注意它与 `status_bar` 不同：后者是给**模型**看的上下文内容，事件流是给**驱动层**看的
   控制与进度信号。

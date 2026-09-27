@@ -113,6 +113,20 @@ def test_build_agent_registers_exit_plan_mode(tmp_path):
     assert planned.plan_mode is True
 
 
+def test_loop_guard_flags(tmp_path):
+    """票 07：CLI 默认开启无进展熔断，--no-loop-guard/--loop-repeat-limit 可调。"""
+    agent = build_agent(parse_args(["--root", str(tmp_path)]), llm=ScriptedLLM([]))
+    assert agent.loop_guard is True and agent.loop_repeat_limit == 3
+
+    off = build_agent(
+        parse_args(
+            ["--root", str(tmp_path), "--no-loop-guard", "--loop-repeat-limit", "5"]
+        ),
+        llm=ScriptedLLM([]),
+    )
+    assert off.loop_guard is False and off.loop_repeat_limit == 5
+
+
 def test_prompt_mode_prints_answer(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     fake = ScriptedLLM([make_message("答案是 42")])
@@ -150,6 +164,25 @@ def test_prompt_mode_budget_exhausted_returns_unfinished(monkeypatch, tmp_path, 
     assert code == 1
     captured = capsys.readouterr()
     assert "[未完成]" in captured.err
+    assert (tmp_path / ".polya" / "sessions").exists()
+
+
+def test_prompt_mode_loop_guard_returns_unfinished(monkeypatch, tmp_path, capsys):
+    """票 07：-p 熔断收尾复用 last_run_exhausted -> [未完成] + 退出码 1。"""
+    call = SimpleNamespace(
+        id="c1", function=SimpleNamespace(name="add", arguments='{"a": 1, "b": 2}')
+    )
+    fake = ScriptedLLM([make_message(tool_calls=[call]) for _ in range(2)])
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
+    code = main(
+        [
+            "--root", str(tmp_path), "-p", "循环",
+            "--max-steps", "0", "--loop-repeat-limit", "1",
+        ]
+    )
+    assert code == 1
+    assert "[未完成]" in capsys.readouterr().err
     assert (tmp_path / ".polya" / "sessions").exists()
 
 

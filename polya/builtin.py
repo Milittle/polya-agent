@@ -279,7 +279,7 @@ def _make_session_tools(
         命令必须非交互。读文件/搜索优先用 read_file/grep/glob。"""
         return session.run(command, timeout, on_line=on_shell_output)
 
-    @tool(name="bash_output", **tool_text("bash_output"))
+    @tool(name="bash_output", poll=True, **tool_text("bash_output"))
     def bash_output(
         timeout: int = 0,
         command_id: int | None = None,

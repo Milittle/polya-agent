@@ -32,6 +32,7 @@ from .agent import (
     BudgetCheckpoint,
     BudgetExhausted,
     Iteration,
+    NoProgress,
     PlanSubmitted,
     ToolCall,
     event_payload,
@@ -152,6 +153,12 @@ def run_task(
                 elif isinstance(ev, BudgetExhausted):
                     renderer.update(ev.event, event_payload(ev))
                     outcome = "budget"
+                    to_send = None
+                elif isinstance(ev, NoProgress):
+                    # 无进展熔断：nudged 只是提醒、回合继续；stopped 收尾（可续）。
+                    renderer.update(ev.event, event_payload(ev))
+                    if ev.phase == "stopped":
+                        outcome = "no_progress"
                     to_send = None
                 elif isinstance(ev, Iteration) and on_boundary is not None:
                     renderer.update(ev.event, event_payload(ev))
@@ -514,6 +521,14 @@ class InteractiveSession:
                     outcome = "达检查点收尾"
                     self.say(
                         "已达单轮预算，历史已保留；继续请直接发送下一条消息。", "yellow"
+                    )
+                elif task_outcome == "no_progress":
+                    # 无进展熔断收尾：同样不是失败。
+                    outcome = "检测到重复调用，已停止"
+                    self.say(
+                        "检测到重复调用，本轮已停止；历史已保留，"
+                        "继续请直接发送下一条消息。",
+                        "yellow",
                     )
         except InterruptedError:
             outcome = "本轮已中断"

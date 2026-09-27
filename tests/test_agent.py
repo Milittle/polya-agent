@@ -13,6 +13,7 @@ from polya.agent import (
     DEFAULT_SYSTEM_PROMPT,
     BudgetCheckpoint,
     BudgetExhausted,
+    NoProgress,
     PlanSubmitted,
     ToolCall,
     drive,
@@ -313,6 +314,135 @@ def test_max_steps_zero_is_unbounded():
     assert answer == "完成"
     assert not [e for e in events if isinstance(e, (BudgetCheckpoint, BudgetExhausted))]
     assert agent.last_run_exhausted is False
+
+
+def test_tool_poll_flag_passthrough():
+    """票 05：@tool(poll=True) 透传；未声明默认 False。"""
+
+    @tool(poll=True)
+    def waiter() -> str:
+        """等待。"""
+        return "still running"
+
+    assert ToolRegistry([waiter]).get("waiter").poll is True
+    assert ToolRegistry([add]).get("add").poll is False
+
+
+def _progress(events):
+    return [e for e in events if isinstance(e, NoProgress)]
+
+
+def test_loop_guard_nudges_then_stops():
+    """票 06：同工具同参数连续重复，第 limit 次 nudge、再犯即收尾，nudge 进工具结果。"""
+    same = '{"a": 1, "b": 1}'
+    replies = [make_message(tool_calls=[make_tool_call(f"c{i}", "add", same)]) for i in range(4)]
+    agent = Agent(
+        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        loop_repeat_limit=2,
+    )
+
+    answer, events = collect(agent, "循环")
+    assert [e.phase for e in _progress(events)] == ["nudged", "stopped"]
+    assert [e.count for e in _progress(events)] == [2, 3]
+    assert agent.last_run_exhausted is True
+    assert "已停止" in answer
+    # nudge 拼进了对应工具结果（独立于 status_bar）
+    tool_messages = [m for m in agent.history if m["role"] == "tool"]
+    assert any("相同参数" in m["content"] for m in tool_messages)
+
+
+def test_loop_guard_ignores_different_arguments():
+    """票 06：参数不同就是不同调用，不触发。"""
+    replies = [
+        make_message(tool_calls=[make_tool_call(f"c{i}", "add", f'{{"a": {i}, "b": 1}}')])
+        for i in range(4)
+    ] + [make_message(content="完成")]
+    agent = Agent(
+        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        loop_repeat_limit=2,
+    )
+
+    answer, events = collect(agent, "不循环")
+    assert answer == "完成" and not _progress(events)
+
+
+def test_loop_guard_skips_poll_tools():
+    """票 06：poll 工具（bash_output 类）同参数重复是合法等待，不触发。"""
+
+    @tool(poll=True)
+    def waiter() -> str:
+        """等待。"""
+        return "still running"
+
+    replies = [
+        make_message(tool_calls=[make_tool_call(f"c{i}", "waiter", "{}")]) for i in range(5)
+    ] + [make_message(content="完成")]
+    agent = Agent(
+        llm=ScriptedLLM(replies), tools=[waiter], max_steps=0, loop_guard=True,
+        loop_repeat_limit=2,
+    )
+
+    answer, events = collect(agent, "等待")
+    assert answer == "完成" and not _progress(events)
+
+
+def test_loop_guard_ignores_bad_json():
+    """票 06：参数解析失败不算重复，重置 streak。"""
+    replies = [
+        make_message(tool_calls=[make_tool_call(f"c{i}", "add", "not-json")]) for i in range(4)
+    ] + [make_message(content="完成")]
+    agent = Agent(
+        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        loop_repeat_limit=2,
+    )
+
+    answer, events = collect(agent, "坏 JSON")
+    assert answer == "完成" and not _progress(events)
+
+
+def test_loop_guard_off_by_default():
+    """票 06/07：库默认 loop_guard=False（CLI 才默认开）。"""
+    same = '{"a": 1, "b": 1}'
+    replies = [make_message(tool_calls=[make_tool_call(f"c{i}", "add", same)]) for i in range(4)]
+    replies.append(make_message(content="完成"))
+    agent = Agent(llm=ScriptedLLM(replies), tools=[add], max_steps=0)
+
+    answer, events = collect(agent, "循环")
+    assert answer == "完成" and not _progress(events)
+
+
+def test_loop_guard_stop_backfills_remaining_tool_calls():
+    """票 06：同一条 assistant 消息内多条 tool_call，熔断停在中间也要回填其余调用。"""
+    same = '{"a": 1, "b": 1}'
+    message = make_message(
+        tool_calls=[make_tool_call(f"c{i}", "add", same) for i in range(4)]
+    )
+    agent = Agent(
+        llm=ScriptedLLM([message]), tools=[add], max_steps=0, loop_guard=True,
+        loop_repeat_limit=2,
+    )
+
+    agent.run("循环")
+    declared = {call.id for call in message.tool_calls}
+    answered = {m["tool_call_id"] for m in agent.history if m["role"] == "tool"}
+    assert declared <= answered  # 每个声明的 tool_call 都有 tool 结果，历史合法
+
+
+def test_loop_guard_stop_is_resumable():
+    """票 06/08：熔断收尾后，下一条消息能继续（streak 已重置）。"""
+    same = '{"a": 1, "b": 1}'
+    replies = [
+        make_message(tool_calls=[make_tool_call(f"c{i}", "add", same)]) for i in range(3)
+    ] + [make_message(content="完成")]
+    agent = Agent(
+        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        loop_repeat_limit=2,
+    )
+
+    first = agent.run("循环")
+    assert agent.last_run_exhausted is True and "已停止" in first
+    second = agent.run("继续")
+    assert second == "完成" and agent.last_run_exhausted is False
 
 
 class _DenyReviewer:

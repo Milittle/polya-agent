@@ -442,3 +442,17 @@ def test_budget_exhausted_renders_notice():
     renderer.update("budget_exhausted", {"step": 500, "limit": 100, "continuations": 4})
     out = buf.getvalue()
     assert "续跑上限" in out and "500" in out
+
+
+def test_no_progress_renders_dim_notice():
+    renderer, buf = make_renderer()
+    renderer.update(
+        "no_progress",
+        {"tool": "read_file", "arguments": {}, "count": 3, "phase": "nudged"},
+    )
+    renderer.update(
+        "no_progress",
+        {"tool": "read_file", "arguments": {}, "count": 4, "phase": "stopped"},
+    )
+    out = buf.getvalue()
+    assert "已提醒模型" in out and "已停止" in out and "read_file" in out

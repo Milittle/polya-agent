@@ -627,3 +627,40 @@ def test_budget_exhausted_is_not_a_failure(tmp_path, monkeypatch):
         text = output.getvalue()
         assert "已达单轮预算" in text  # 可继续提示
         assert "[任务失败]" not in text
+
+
+# ---------- 票 07：无进展熔断接线 ----------
+
+
+def test_run_task_loop_guard_stops_with_outcome():
+    llm = FakeLLM([reply(calls=[call("_noop", f"c{i}")]) for i in range(2)])
+    agent = Agent(
+        llm=llm, tools=[_noop], status_bar=False, max_steps=0,
+        loop_guard=True, loop_repeat_limit=1,
+    )
+    output = StringIO()
+    renderer = TerminalRenderer(Console(file=output))
+    assert run_task(agent, renderer, "循环") == "no_progress"
+    assert "已停止" in output.getvalue()
+
+
+def test_loop_guard_stop_is_not_a_failure(tmp_path, monkeypatch):
+    """熔断收尾走正常路径：可继续提示，不出现 [任务失败]。"""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    llm = FakeLLM([reply(calls=[call("_noop", f"c{i}")]) for i in range(2)])
+    with session_for(
+        tmp_path, llm, tools=[_noop], max_steps=0, loop_guard=True, loop_repeat_limit=1
+    ) as (session, pipe, output):
+
+        async def scenario():
+            task = asyncio.create_task(session.run())
+            await until(lambda: session.box._session.app.is_running)
+            pipe.send_text("循环\r")
+            await until(lambda: "检测到重复调用，已停止" in output.getvalue())
+            pipe.send_text("\x04")
+            await asyncio.wait_for(task, 3)
+
+        asyncio.run(scenario())
+        text = output.getvalue()
+        assert "已停止" in text
+        assert "[任务失败]" not in text

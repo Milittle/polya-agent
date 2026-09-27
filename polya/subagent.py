@@ -96,6 +96,7 @@ class SubagentRunner:
             cwd=self.root,
             max_steps=self.max_steps,
             max_continuations=0,  # 子代理是有界子任务：首个检查点即报错收尾
+            loop_guard=False,  # 已有 max_steps 硬边界，不叠加无进展熔断
             status_bar=None,
             plan_mode=parent.plan_mode,  # 子 Context 继承父规划模式
             plan_capable=False,  # 子无 exit_plan_mode

@@ -94,6 +94,21 @@ class BudgetExhausted(Event):
 
 
 @dataclass(frozen=True)
+class NoProgress(Event):
+    """无进展熔断（票 06）：同一工具同参数连续重复到达阈值。
+
+    ``phase="nudged"`` 是第 limit 次，劝告已拼进工具结果，回合继续；
+    ``phase="stopped"`` 是再犯，收尾（可续）。
+    """
+
+    event: ClassVar[str] = "no_progress"
+    tool: str
+    arguments: dict
+    count: int
+    phase: str
+
+
+@dataclass(frozen=True)
 class ReasoningDelta(Event):
     event: ClassVar[str] = "reasoning_delta"
     delta: str
@@ -175,6 +190,8 @@ class Agent:
         system_prompt: str | None = None,
         max_steps: int = 10,
         max_continuations: int = 0,
+        loop_guard: bool = False,
+        loop_repeat_limit: int = 3,
         status_bar: bool | Callable[[StatusSnapshot], str] | None = None,
         todos: TodoStore | None = None,
         plan_mode: bool = False,
@@ -210,7 +227,14 @@ class Agent:
         # 续跑，最多连跳 max_continuations 次后以 BudgetExhausted 收尾。max_steps==0
         # 表示无界（pi 语义）。库默认 0 连跳 = 有界硬停（不抛异常，返回提示串）。
         self.max_continuations = max_continuations
-        self.last_run_exhausted = False  # 本次 run 是否因预算收尾（驱动层判定未完成）
+        # 无进展熔断（票 06）：同一工具同参数连续重复的护栏。库默认关（与 compress
+        # 同款，库保守、CLI 开启）；loop_repeat_limit 次先 nudge，再犯即可续收尾。
+        self.loop_guard = loop_guard
+        self.loop_repeat_limit = loop_repeat_limit
+        self.last_run_exhausted = False  # 本次 run 是否因预算/熔断收尾（驱动判定未完成）
+        self._last_signature: str | None = None  # 上一个工具调用签名（无进展检测）
+        self._streak = 0  # 相同签名连续出现次数
+        self._nudged = False  # 本 streak 是否已 nudge 过
         # 审查器缝（review.py）：默认放行，plan 只读约束在 AllowAllReviewer 内。
         # 未来模型审查器（Jev 类）实现同一协议即可接入。
         self.reviewer: Reviewer = reviewer or AllowAllReviewer()
@@ -667,6 +691,9 @@ class Agent:
         self.tools.freeze()
         self._truncation_continues = 0
         self.last_run_exhausted = False
+        self._last_signature = None
+        self._streak = 0
+        self._nudged = False
         self.tree.append(KIND_USER, {"content": user_input})
         messages = self.tree.project()
         schemas = self.tools.schemas() or None
@@ -895,12 +922,44 @@ class Agent:
                         verdict = parse_error
                     result = verdict if isinstance(verdict, str) else "Error: 工具结果缺失"
                     self.tool_counts[name] += 1
+                    # 无进展熔断（票 06）：同工具同参数的连续重复检测。坏 JSON、计划
+                    # 提交、poll 等待类都重置 streak（合法重复不算打转）。
+                    nudge = guard_stop = False
+                    if self.loop_guard:
+                        tool_item = self.tools.get(name)
+                        if (
+                            parse_error is not None
+                            or name == "exit_plan_mode"
+                            or (tool_item is not None and tool_item.poll)
+                        ):
+                            self._last_signature, self._streak, self._nudged = None, 0, False
+                        else:
+                            signature = json.dumps(
+                                arguments, sort_keys=True, ensure_ascii=False
+                            )
+                            if signature == self._last_signature:
+                                self._streak += 1
+                            else:
+                                self._last_signature = signature
+                                self._streak = 1
+                                self._nudged = False
+                            if self._streak == self.loop_repeat_limit:
+                                self._nudged = True
+                                nudge = True
+                            elif self._nudged and self._streak > self.loop_repeat_limit:
+                                guard_stop = True
                     annotated = result
                     if self.status_bar is not None:
                         # 调用计数标注（书实验 2-9）：显式次数触发模型的模式识别——
                         # 第 3 次失败后主动换路，而不是无限重试。只进 tool 消息，
                         # tool_result 事件发原始结果（UI 不该看到给模型的标注）。
                         annotated = f"（{name} 第 {self.tool_counts[name]} 次调用）\n{result}"
+                    if nudge:
+                        # 独立于 status_bar：guard 必须始终生效。
+                        annotated = (
+                            f"{annotated}\n\n"
+                            + t("agent.no_progress_nudge", tool=name, count=self._streak)
+                        )
 
                     logger.debug("工具 %s 返回: %.200s", name, result)
                     tool_message = {
@@ -910,6 +969,26 @@ class Agent:
                     }
                     messages.append(tool_message)
                     self.tree.append(KIND_TOOL, {"tool_call_id": call.id, "content": annotated})
+                    if nudge:
+                        yield NoProgress(
+                            tool=name,
+                            arguments=arguments,
+                            count=self._streak,
+                            phase="nudged",
+                        )
+                    if guard_stop:
+                        # 本消息可能还声明了其他 tool_call：先回填，保证历史合法。
+                        self._backfill_tool_results(messages, message.tool_calls or [])
+                        yield NoProgress(
+                            tool=name,
+                            arguments=arguments,
+                            count=self._streak,
+                            phase="stopped",
+                        )
+                        self.last_run_exhausted = True
+                        return t(
+                            "agent.no_progress_stopped", tool=name, count=self._streak
+                        )
             except (KeyboardInterrupt, GeneratorExit):
                 # 中断可能落在工具序列中间：assistant 已声明 N 个 tool_call，
                 # 只回填一部分的话，下一轮请求的序列残缺会被 API 拒绝（每个

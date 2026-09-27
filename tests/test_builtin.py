@@ -288,6 +288,15 @@ def test_kinds():
     assert with_todos["todo_write"] == "read"
 
 
+def test_poll_tools_are_marked():
+    """票 05：等待类工具 bash_output 标 poll=True（无进展熔断跳过它）。"""
+    by_name = {item.name: item for item in default_tools(".")}
+    assert by_name["bash_output"].poll is True
+    assert by_name["read_file"].poll is False
+    assert by_name["bash"].poll is False
+    assert by_name["write_file"].poll is False
+
+
 def test_rejects_unknown_kind():
     with pytest.raises(ValueError, match="kind"):
 

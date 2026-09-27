@@ -87,6 +87,7 @@ def test_child_tools_have_history_read_but_no_task(tmp_path):
     assert child is not None
     assert child.tools.get("task") is None  # 深度 1
     assert child.tools.get("history_read") is not None  # 子压缩启用
+    assert child.loop_guard is False  # 有界子任务不叠加无进展熔断（票 07）
 
 
 def test_child_usage_merged_into_parent(tmp_path):

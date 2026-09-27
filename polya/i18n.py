@@ -137,6 +137,14 @@ _ZH = {
         "已达单轮预算的续跑上限，本轮收尾（历史已完整保留）；"
         "发送下一条消息即可继续。"
     ),
+    "agent.no_progress_nudge": (
+        "你已连续 {count} 次用相同参数调用 {tool}，结果没有变化。"
+        "请换一种策略，或基于已有信息直接给出最终结论。"
+    ),
+    "agent.no_progress_stopped": (
+        "检测到重复调用 {tool} ×{count}，本轮已停止（历史已完整保留）；"
+        "发送下一条消息即可继续。"
+    ),
     "agent.rejected": "Error: 用户拒绝了工具调用 {name}",
     "agent.interrupted": "Error: 用户中断了本次任务。",
     "agent.compact_disabled": "压缩未启用：启动时带了 --no-compress，无法归档原文。",
@@ -282,6 +290,15 @@ result directly, with no preamble or explanation.""",
     "agent.budget_exhausted": (
         "Reached the continuation limit for this turn's budget; the turn ended with full "
         "history preserved. Send another message to continue."
+    ),
+    "agent.no_progress_nudge": (
+        "You have called {tool} {count} times in a row with identical arguments and the "
+        "result has not changed. Change your approach, or give a final answer from what "
+        "you already know."
+    ),
+    "agent.no_progress_stopped": (
+        "Detected a repeated {tool} call ×{count}; the turn stopped with the full history "
+        "preserved. Send another message to continue."
     ),
     "agent.rejected": "Error: the user rejected the tool call {name}",
     "agent.interrupted": "Error: the user interrupted this task.",

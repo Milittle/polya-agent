@@ -139,6 +139,8 @@ class Tool:
     kind: str = "read"
     snippet: str = ""  # 一行摘要，进系统提示词的 <tools> 段；空则不进
     guidelines: tuple[str, ...] = ()  # 纪律句，进 <rules> 段
+    # 等待类工具（bash_output 轮询）：相同参数重复调用是合法等待，无进展熔断跳过它
+    poll: bool = False
 
     def __post_init__(self):
         if self.kind not in KINDS:
@@ -229,6 +231,7 @@ def tool(
     kind: str = "read",
     snippet: str | None = None,
     guidelines: tuple[str, ...] | list[str] = (),
+    poll: bool = False,
 ):
     """把函数包装成 :class:`Tool`。
 
@@ -237,6 +240,8 @@ def tool(
     ``read``（无副作用，直接放行）/ ``write``（写文件）/ ``exec``（执行命令）/
     ``delegate``（委派子任务，副作用在子层）。
     参数说明写在 ``Annotated[T, "描述"]`` 里，会进入 schema 的字段 description。
+    ``poll=True`` 标记等待类工具（如 ``bash_output``）：同参数重复是合法轮询，
+    无进展熔断会跳过它。
     """
 
     def wrap(func: Callable) -> Tool:
@@ -265,6 +270,7 @@ def tool(
             kind=kind,
             snippet=snippet or "",
             guidelines=tuple(guidelines),
+            poll=poll,
         )
 
     return wrap(fn) if fn is not None else wrap

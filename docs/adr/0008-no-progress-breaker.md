@@ -1,0 +1,46 @@
+# 无进展熔断：拦「原地打转」而不是「轮数多」
+
+ADR 0007 把单轮预算从硬上限改成软检查点，并允许 `--max-steps 0` 无界。但「轮数多」
+不等于「出问题」：复杂任务本可以上百轮；而真正的失控是**原地打转**——同一工具、同一
+参数反复调用（反复 `read_file` 同一文件、反复跑同一条失败命令），每轮都在动、却没有
+新信息、没有写文件。`--max-continuations` 只决定烧到多少钱停，识别不了循环。本 ADR 定
+「无进展熔断」：识别重复，先提醒、再犯即**可续停止**。
+
+## Decision
+
+1. **信号只看参数、且要求连续**：维护 `last_signature` + `streak`；签名 =
+   `json.dumps(arguments, sort_keys=True, ensure_ascii=False)` **严格相等**；任何不同
+   签名、坏 JSON、或等待类调用都重置 streak。**不比较工具输出**——避免语义比较的复杂度
+   与误杀。
+2. **等待类工具豁免**：`Tool.poll: bool = False`（`bash_output` 标 `poll=True`）。
+   `bash_output(id=3)` 轮询等命令跑完是合法等待，绝不能触发。**不新增 `kind`**（它是固定
+   校验集合）。
+3. **先劝后断**：第 `loop_repeat_limit`（默认 3）次 yield `NoProgress(phase="nudged")`，
+   把劝告拼进工具结果尾部；再犯 yield `NoProgress(phase="stopped")`，以提示串**可续收尾**
+   （复用 `last_run_exhausted`，`-p` 输出 `[未完成]` + 退出码 1）。
+4. **与预算独立**：`max_steps` / `max_continuations` 管「轮数里程碑」，熔断管「无进展」，
+   两者正交；`--max-steps 0` 时熔断仍生效，是唯一护栏。
+5. **默认策略**：CLI 默认开启（`--no-loop-guard` 关，`--loop-repeat-limit N` 调）；`Agent()`
+   库默认关（与 `compress` 同款：库保守、CLI 开启）；子代理不启用（已有 `max_steps=20`
+   硬边界，不叠加）。
+6. **状态每任务**：streak 挂在单次 `steps()` 运行，任务结束清零、不落盘。
+
+## Considered Options
+
+- **纯轮数硬上限**（已被 0007 否掉）：误伤长任务、且调大后拦不住真循环。
+- **比较工具结果判断「无新信息」**：能覆盖「参数不同也没产出」的漂移式打转，但要语义
+  比较、贵、误杀高；先用最精确的签名信号，等有真实误杀数据再谈。
+- **guard 内硬编码 `bash_output` 名字**：省事但脆弱；改由工具自声明（`Tool.poll`）。
+- **只劝不断**：模型可无视软提示（现有 `tool_counts` 标注即如此）；必须有一次强制出口。
+- **熔断并入检查点**：语义不同、无法分别调参；独立成护栏。
+
+## Consequences
+
+- 新事件 `no_progress{tool, arguments, count, phase}`；渲染层 dim 行 + 状态栏；收尾复用
+  可续通道，交互显示可继续提示（非 `[任务失败]`）。
+- 已知误杀：**同参数但结果不同**的调用（如 `bash("git status")` 连发）也会 nudge；由
+  「先劝后断」缓解——用不比较输出换取零等待误杀与实现便宜。
+- nudge 拼进工具结果尾部（append-only），**独立于 `status_bar` 门控**；不新增消息条数，
+  保持前缀稳定。
+- 子代理保持有界；`--max-steps 0` 从「拿钱赌模型不犯傻」变成有兜底。
+- 仍不解决「参数不同但无产出」的漂移；留给后续按需扩展。
