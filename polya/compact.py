@@ -12,6 +12,10 @@
   消息条数与 tool_call_id 配对不变，对话脉络完整保留）；
 - 替换点之后的缓存全部失效——这是有意识的权衡，因此阈值高（80%）、批量压、
   低频次，而不是每轮都压。
+- 摘要调用本身是全新的一次性 prompt：OpenAI 兼容协议没有「禁用缓存写」的
+  开关（Anthropic 的 cache_control 是显式 opt-in，pi 因此可禁；DeepSeek/GLM
+  自动缓存无 opt-out），无从关闭，只能接受一次 cache miss 计价；但至少
+  不带 tools（摘要不需要工具），避免无关的 schema 进入计费前缀。
 
 注意：若模型把 reasoning/thinking 绑定在前缀上（DeepSeek-R1 类推理模型），
 原地替换同样会使保留区的 thinking 失效，书推荐的替代是把整段旧历史压成一条
@@ -246,12 +250,14 @@ def compact_restart(
     keep: int,
     query: str,
     previous_summary: str | None = None,
+    on_usage=None,
 ) -> list[dict] | None:
     """摘要重启（书 2.7 对 thinking 绑定模型的推荐方案）。
 
     thinking/reasoning 与产生它的前缀绑定（签名校验），原地替换旧 tool 内容
     会让保留区的全部 thinking 失效。正解：把切点之前的整段历史压成**一条**
     摘要消息，模型从摘要冷启动重新推理，保留区作为干净的前缀基线。
+    ``on_usage(response)`` 在摘要响应返回后回调（计费入总量用）。
     """
     split = find_restart_split(history, keep)
     if split is None or split == 0:
@@ -268,15 +274,24 @@ def compact_restart(
                     if previous_summary
                     else ""
                 )
-                + f"以下是一段 Agent 对话历史，"
-                f"请压缩成一份结构化摘要（保留关键决策、约束及其理由、已排除的"
-                f"失败路径、文件路径与结论性输出）。按目标与验收、用户约束、已改文件、"
-                f"验证证据、失败路径、技能、未完成事项与下一步组织。\n\n"
+                + "以下是一段 Agent 对话历史，请压缩成结构化摘要，"
+                "严格按下列小节组织（无内容的节写「无」，小节标题原样保留）：\n"
+                "1. 目标与验收\n"
+                "2. 用户约束与偏好\n"
+                "3. 进展（已完成 / 进行中 / 受阻）\n"
+                "4. 关键决策与理由\n"
+                "5. 已读/已改文件\n"
+                "6. 验证证据（已运行命令、退出码、结论；区分实际验证与计划）\n"
+                "7. 已排除的失败路径\n"
+                "8. 已加载技能\n"
+                "9. 未完成事项与下一步\n\n"
                 f"{render_conversation(history[:split])}"
             ),
         },
     ]
     response = llm.chat(request, tools=None)
+    if on_usage is not None:
+        on_usage(response)
     summary = (response.choices[0].message.content or "").strip()
     if not summary:
         raise RuntimeError("压缩调用返回空摘要")
@@ -299,12 +314,14 @@ def compact_messages(
     keep: int,
     query: str,
     previous_summary: str | None = None,
+    on_usage=None,
 ) -> list[dict] | None:
     """压缩历史并返回新列表（原列表不动）；没有可压消息时返回 None。
 
     一次 LLM 调用合并压缩全部待压内容（合并式优于逐条：跨源的重复信息一次
     去重）；query 让压缩任务感知（书实验 2-10：40k vs 93k token 的差距来源）。
-    LLM 异常向上抛，由调用方计数熔断。
+    LLM 异常向上抛，由调用方计数熔断。``on_usage(response)`` 在摘要响应
+    返回后回调（计费入总量用）。
     """
     targets = compressible_indices(history, keep)
     if not targets:
@@ -336,6 +353,8 @@ def compact_messages(
         },
     ]
     response = llm.chat(request, tools=None)
+    if on_usage is not None:
+        on_usage(response)
     summary_text = response.choices[0].message.content or ""
     if not summary_text.strip():
         raise RuntimeError("压缩调用返回空摘要，保留原始历史")

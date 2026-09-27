@@ -33,6 +33,26 @@ class _StreamUnsupported(Exception):
     """端点拒绝流式请求（400 且信息指向 stream），调用方回退非流式。"""
 
 
+# provider 超窗错误的特征片段（小写匹配）。OpenAI 系：context_length_exceeded /
+# "This model's maximum context length is ..."；Anthropic："prompt is too long ..."。
+# Agent 用它判定「压缩释放空间后重试一次」是否适用（pi 同款恢复语义）。
+_OVERFLOW_MARKERS = (
+    "context_length",
+    "maximum context length",
+    "prompt is too long",
+    "prompt too long",
+    "exceeds the context window",
+    "exceeds context window",
+    "input tokens exceed",
+)
+
+
+def is_context_overflow(exc: BaseException) -> bool:
+    """判断异常是否为 provider 的上下文超窗错误（按错误文案特征匹配）。"""
+    text = str(exc).lower()
+    return any(marker in text for marker in _OVERFLOW_MARKERS)
+
+
 def _new_stream_state() -> dict:
     return {
         "content_parts": [],

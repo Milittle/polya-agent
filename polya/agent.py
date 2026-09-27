@@ -30,6 +30,7 @@ from .compact import (
 )
 from .executor import execute
 from .i18n import t, tool_text
+from .llm import is_context_overflow
 from .prompt import SystemPrompt, diff_sections, tool_guidelines, tool_snippets
 from .providers import ModelProfile, profile_for
 from .review import AllowAllReviewer, Reviewer
@@ -161,6 +162,7 @@ class Agent:
         keep_recent_tokens: int | None = None,
         micro_threshold: float | None = 0.6,
         micro_min_chars: int = MICRO_MIN_CHARS,
+        reserve_tokens: int = 16384,
         profile: ModelProfile | None = None,
         prefix_check: bool = False,
         stream: bool = True,
@@ -236,6 +238,9 @@ class Agent:
         self.keep_recent_tokens = keep_recent_tokens
         self.micro_threshold = micro_threshold
         self.micro_min_chars = micro_min_chars
+        # 全量压缩的绝对预留（对齐 pi 的 reserveTokens）：小窗口下先于百分比
+        # 阈值触发，保证触发时至少留出一轮响应的空间（见 _full_trigger）。
+        self.reserve_tokens = reserve_tokens
         self._compress_failures = 0
         self._request_size = 0
         # 压缩累积追踪：跨多次压缩记住读过/改过的文件，摘要后仍可引用。
@@ -693,35 +698,74 @@ class Agent:
                 raise RuntimeError(t("agent.context_limit"))
             self._request_size = self._estimated_size()
 
-            # 流式：迭代器形态（chat_iter）逐段实时 yield；回调式客户端（测试
-            # 假件）片段收齐后统一 yield——事件序列不变，只丢实时性。
-            if not self.stream:
-                response = self.llm.chat(messages, tools=schemas)
-            else:
-                chat_iter = getattr(self.llm, "chat_iter", None)
-                if chat_iter is not None:
-                    chunks = chat_iter(messages, schemas)
-                    try:
-                        while True:
+            # 超窗恢复（pi 同款语义，每任务一次）：provider 拒绝超长请求时，压缩
+            # 释放空间后原地重试；仅未吐出任何片段才允许重试（避免重复文本）。
+            # 无可压目标或已恢复过一次 → 原样上抛。
+            overflow_recovered = False
+            response = None
+            for attempt in (0, 1):
+                emitted = False
+                try:
+                    # 流式：迭代器形态（chat_iter）逐段实时 yield；回调式客户端（测试
+                    # 假件）片段收齐后统一 yield——事件序列不变，只丢实时性。
+                    if not self.stream:
+                        response = self.llm.chat(messages, tools=schemas)
+                    else:
+                        chat_iter = getattr(self.llm, "chat_iter", None)
+                        if chat_iter is not None:
+                            chunks = chat_iter(messages, schemas)
                             try:
-                                kind, delta = next(chunks)
-                            except StopIteration as stop:
-                                response = stop.value
-                                break
-                            yield ReasoningDelta(delta) if kind == "reasoning" else Text(delta)
-                    finally:
-                        close = getattr(chunks, "close", None)
-                        if close is not None:
-                            close()
-                else:
-                    box: list[tuple[str, str]] = []
+                                while True:
+                                    try:
+                                        kind, delta = next(chunks)
+                                    except StopIteration as stop:
+                                        response = stop.value
+                                        break
+                                    emitted = True
+                                    yield (
+                                        ReasoningDelta(delta)
+                                        if kind == "reasoning"
+                                        else Text(delta)
+                                    )
+                            finally:
+                                close = getattr(chunks, "close", None)
+                                if close is not None:
+                                    close()
+                        else:
+                            box: list[tuple[str, str]] = []
 
-                    def _tap(kind: str, delta: str, sink: list = box) -> None:
-                        sink.append((kind, delta))
+                            def _tap(kind: str, delta: str, sink: list = box) -> None:
+                                sink.append((kind, delta))
 
-                    response = self.llm.chat(messages, tools=schemas, on_delta=_tap)
-                    for kind, delta in box:
-                        yield ReasoningDelta(delta) if kind == "reasoning" else Text(delta)
+                            response = self.llm.chat(messages, tools=schemas, on_delta=_tap)
+                            for kind, delta in box:
+                                emitted = True
+                                yield (
+                                    ReasoningDelta(delta) if kind == "reasoning" else Text(delta)
+                                )
+                    break
+                except Exception as exc:
+                    if not (
+                        attempt == 0
+                        and not emitted
+                        and not overflow_recovered
+                        and self.compress
+                        and self._compress_failures < 3
+                        and is_context_overflow(exc)
+                    ):
+                        raise
+                    compacted = self._try_compress(user_input)
+                    if compacted is not None:
+                        before = self._apply_compaction(compacted)
+                    elif self._try_microcompress() is not None:
+                        before = len(self.history)
+                    else:
+                        raise
+                    overflow_recovered = True
+                    messages = self.tree.project()
+                    yield Compaction(mode="full", before=before, after=len(self.history))
+            # 重试循环成功退出后 response 必已赋值（异常路径都已 raise）。
+            assert response is not None
             usage_present = getattr(response, "usage", None) is not None
             self._record_usage(response)
             if usage_present:
@@ -777,8 +821,7 @@ class Agent:
                         if self.compress:
                             compacted = self._try_compress(user_input)
                             if compacted is not None:
-                                self.tree.replace_conversation(compacted)
-                                self._last_prefix = None
+                                self._apply_compaction(compacted)
                         self.tree.append(
                             KIND_USER,
                             {"content": t("agent.truncation_continue")},
@@ -930,6 +973,19 @@ class Agent:
             self.total_usage.get("cached_tokens", 0) + self.last_usage["cached_tokens"]
         )
 
+    def _record_summary_usage(self, response) -> None:
+        """压缩摘要调用也计费：累计进 total_usage，但不动 last_usage——
+        那是主对话上下文的锚点，摘要请求的 prompt 不是同一个上下文。"""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            self.total_usage[field] += getattr(usage, field, 0) or 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        self.total_usage["cached_tokens"] = (
+            self.total_usage.get("cached_tokens", 0) + getattr(details, "cached_tokens", 0) or 0
+        )
+
     def _history_read_tool(self) -> Tool:
         """压缩启用时注册的只读回查工具：按入口 id 读原文（投影覆盖不影响）。"""
 
@@ -958,8 +1014,20 @@ class Agent:
     def _should_compress(self) -> bool:
         if not self.compress or self._compress_failures >= 3:
             return False
-        used = self._context_size()
-        return used > self.context_window * self.compress_threshold
+        return self._context_size() > self._full_trigger()
+
+    def _full_trigger(self) -> int:
+        """全量压缩触发线：百分比阈值与「窗口 − 绝对预留」孰早，再以窗口一半封底。
+
+        百分比阈值（默认 80%）在大窗口下余量充足（128k → 剩 25.6k）；小窗口下
+        太薄（8k → 剩 1.6k，一轮大工具结果就撞墙），绝对预留保证至少留出
+        reserve_tokens（默认 16384，pi 同值）。窗口 ≥ reserve/0.2 时与纯百分比
+        行为完全一致；窗口 ≤ 2×reserve 时以一半窗口封底（预留不可能超过半窗）。
+        """
+        window = self.context_window
+        by_pct = window * self.compress_threshold
+        by_reserve = window - self.reserve_tokens
+        return int(max(min(by_pct, by_reserve), window * 0.5))
 
     def _should_microcompress(self) -> bool:
         """微压缩（Q8）：阈值低于全量压缩，无 LLM，只清理大块旧工具结果。
@@ -1070,15 +1138,30 @@ class Agent:
             previous = self._last_summary
             if self.profile.supports_inplace_tool_edit:
                 compacted = compact_messages(
-                    self.llm, self.history, keep, query, previous_summary=previous
+                    self.llm,
+                    self.history,
+                    keep,
+                    query,
+                    previous_summary=previous,
+                    on_usage=self._record_summary_usage,
                 )
                 if compacted is None:
                     compacted = compact_restart(
-                        self.llm, self.history, keep, query, previous_summary=previous
+                        self.llm,
+                        self.history,
+                        keep,
+                        query,
+                        previous_summary=previous,
+                        on_usage=self._record_summary_usage,
                     )
             else:
                 compacted = compact_restart(
-                    self.llm, self.history, keep, query, previous_summary=previous
+                    self.llm,
+                    self.history,
+                    keep,
+                    query,
+                    previous_summary=previous,
+                    on_usage=self._record_summary_usage,
                 )
         except Exception:  # noqa: BLE001 - 摘要调用失败不该让任务失败
             self._compress_failures += 1

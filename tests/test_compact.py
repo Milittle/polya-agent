@@ -356,3 +356,121 @@ def test_full_context_fails_locally_and_preserves_history():
         agent.run("x" * 32000)
     assert llm.calls == []
     assert agent.history[0]["content"] == "x" * 32000
+
+
+# ---------- 触发线（绝对预留下限） / 超窗恢复 / 摘要计费 ----------
+
+
+def test_full_trigger_absolute_reserve_floor():
+    """触发线 = min(窗口×阈值, 窗口−reserve)，半窗封底；大窗口与纯百分比一致。"""
+    llm = ScriptedLLM([])
+    # 大窗口（20% 余量 ≥ reserve 16384）：行为与原百分比完全一致
+    assert Agent(llm=llm, compress=True, context_window=128_000)._full_trigger() == 102_400
+    assert Agent(llm=llm, compress=True, context_window=1_000_000)._full_trigger() == 800_000
+    # 中小窗口：绝对预留先于百分比，保证触发时留出 reserve
+    assert Agent(llm=llm, compress=True, context_window=64_000)._full_trigger() == 47_616
+    # 窗口 < 2×reserve：预留放不进 20% 余量，以半窗封底
+    assert Agent(llm=llm, compress=True, context_window=32_000)._full_trigger() == 16_000
+    assert Agent(llm=llm, compress=True, context_window=8_000)._full_trigger() == 4_000
+    # reserve 可调：大预留把触发线拉得更早
+    agent = Agent(llm=llm, compress=True, context_window=100_000, reserve_tokens=50_000)
+    assert agent._full_trigger() == 50_000
+
+
+def test_overflow_error_compacts_and_retries_once():
+    from polya.llm import is_context_overflow
+
+    class OverflowScriptLLM(ScriptedLLM):
+        """剧本里混入 Exception 时抛出而不返回（usage 不消费，保持对齐）。"""
+
+        def chat(self, messages, tools=None, on_delta=None):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            message = self._replies.pop(0)
+            if isinstance(message, Exception):
+                raise message
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], usage=self._usages.pop(0)
+            )
+
+    overflow = RuntimeError(
+        "Error code: 400 - {'error': {'message': \"This model's maximum context length "
+        'is 8192 tokens. However, you requested 9000 tokens."}}'
+    )
+    assert is_context_overflow(overflow)
+
+    llm = OverflowScriptLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "echo", '{"text": "x"}')]),
+            overflow,  # 第二次主请求超窗
+            make_message(content="#3: 大结果已压成一句"),
+            make_message(content="完成"),
+        ],
+        usages=[usage(prompt=100), usage(prompt=40, completion=80), usage(prompt=60)],
+    )
+    agent = Agent(
+        llm=llm, tools=[echo], compress=True, context_window=100_000, keep_recent=0, max_steps=4
+    )
+    assert agent.run("干活") == "完成"
+
+    # 调用序列：主(工具) / 主(超窗) / 压缩 / 主(重试成功)
+    assert [c["tools"] is None for c in llm.calls] == [False, False, True, False]
+    # 摘要计费：压缩调用 40+80 计入 total_usage（连同主调用）
+    assert agent.total_usage["prompt_tokens"] == 100 + 40 + 60
+    assert agent.total_usage["completion_tokens"] == 1 + 80 + 1
+    # 超窗的那次工具结果已替换为摘要
+    assert any(
+        m.get("role") == "tool" and (m.get("content") or "").startswith(COMPRESS_MARKER)
+        for m in agent.history
+    )
+
+
+def test_second_overflow_raises_after_single_recovery():
+    class OverflowScriptLLM(ScriptedLLM):
+        def chat(self, messages, tools=None, on_delta=None):
+            self.calls.append({"messages": list(messages), "tools": tools})
+            message = self._replies.pop(0)
+            if isinstance(message, Exception):
+                raise message
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], usage=self._usages.pop(0)
+            )
+
+    import pytest
+
+    overflow = RuntimeError("Error: prompt is too long: 9000 tokens > 8192 maximum")
+    llm = OverflowScriptLLM(
+        [
+            make_message(tool_calls=[make_tool_call("c1", "echo", '{"text": "x"}')]),
+            overflow,
+            make_message(content="#3: 摘要"),
+            overflow,  # 重试后仍超窗：原样上抛，不再恢复
+        ],
+        usages=[usage(prompt=100), usage(prompt=40)],
+    )
+    agent = Agent(
+        llm=llm, tools=[echo], compress=True, context_window=100_000, keep_recent=0, max_steps=4
+    )
+    with pytest.raises(RuntimeError, match="prompt is too long"):
+        agent.run("干活")
+    assert len(llm.calls) == 4
+    assert agent._compress_failures == 0  # 压缩本身成功，不是熔断路径
+
+
+def test_restart_summary_uses_fixed_sections():
+    """摘要重启的压缩请求带固定小节模板（进展三态、关键决策与理由等）。"""
+    reply = make_message(content="1. 目标与验收：修好解析器\n9. 未完成事项与下一步：补测试")
+    llm = ScriptedLLM([reply])
+    compact_restart(llm, sample_history(), keep=3, query="修复解析器")
+    request = llm.calls[0]["messages"][1]["content"]
+    for section in (
+        "目标与验收",
+        "用户约束与偏好",
+        "已完成 / 进行中 / 受阻",
+        "关键决策与理由",
+        "已读/已改文件",
+        "验证证据",
+        "失败路径",
+        "已加载技能",
+        "未完成事项与下一步",
+    ):
+        assert section in request

@@ -78,7 +78,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--context-window",
         type=int,
         default=None,
-        help="上下文窗口（token），超过 80%% 触发压缩（默认取模型档案，如 128000）",
+        help="上下文窗口（token），触发压缩的阈值由此推算（默认取模型档案，如 128000）",
+    )
+    parser.add_argument(
+        "--reserve-tokens",
+        type=int,
+        default=16384,
+        help="全量压缩的绝对预留（token）：小窗口下先于 80%% 触发，保证留出响应空间（默认 16384）",
     )
     parser.add_argument(
         "--keep-recent",
@@ -206,6 +212,7 @@ def build_agent(
         micro_threshold=None if args.no_microcompact else 0.6,
         keep_recent=args.keep_recent,
         keep_recent_tokens=args.keep_recent_tokens,
+        reserve_tokens=args.reserve_tokens,
         profile=profile,
         prefix_check=args.prefix_check,
         stream=not args.no_stream,
