@@ -381,11 +381,13 @@ class InputBox:
         # select_first=True)：那是 menu-complete 语义，会把首项增量写进输入框；
         # 也不能无守卫地在加载期改 complete_index——会废掉库对「唯一无增量
         # 补全」（打全命令名）的重置，留下僵尸菜单。这里同步复刻同一条
-        # 判定：命中即让路，由库收起菜单。
+        # 判定：命中即让路，由库收起菜单；随后 _preselect_first 的空态分支
+        # 以重建态重开（见 _reopen_complete_command，票 04）。
         def _preselect_first(buffer) -> None:
             state = buffer.complete_state
             if state is None:
                 self._menu_complete = False  # 空结果重置：Tab 运行已结束，撤销标记
+                self._reopen_complete_command(buffer)
                 return
             if self._menu_complete:
                 return  # Tab 的 select_first 路径由库收尾（含插入与无增量重置）
@@ -448,6 +450,49 @@ class InputBox:
         )
         session.app.timeoutlen = 0.5
         return session
+
+    def _reopen_complete_command(self, buffer) -> None:
+        """命令名打全后重开菜单（票 04）：库的「唯一无增量」重置会把它收起。
+
+        CC/Codex 形态：输入完整的 `/help` 时菜单仍列出该命令（选中态 + 说明），
+        Enter 照常执行、Esc 关闭。与 _submit 的选项器同款手法：公开
+        CompletionState 构造 + 手动 fire；下一次文本变化由 _text_changed 清空
+        重启，不会僵尸化。仅在库收起（state 为 None）的事件里调用——Esc 走
+        cancel_completion，不触发本事件，关闭后不会回弹。
+        """
+        document = buffer.document
+        text = document.text
+        if (
+            not text.startswith("/")
+            or "\n" in text
+            or document.text_after_cursor
+            or any(char.isspace() for char in text)
+        ):
+            return
+        query = text.lower()
+        command = next(
+            (
+                c
+                for c in COMMANDS
+                if query in (c.name.lower(), *(alias.lower() for alias in c.aliases))
+            ),
+            None,
+        )
+        if command is None:
+            return
+        buffer.complete_state = CompletionState(
+            buffer.document,
+            [
+                Completion(
+                    command.name,
+                    start_position=-len(text),
+                    display=command.name,
+                    display_meta=_command_meta(command),
+                )
+            ],
+            0,
+        )
+        buffer.on_completions_changed.fire()
 
     # ---- 渲染 ----
 
@@ -591,8 +636,8 @@ class InputBox:
         elif buffer.text.lstrip().startswith("/"):
             command, _ = parse_command(buffer.text)
             if command is not None:
-                # 命令打全后补全菜单收起（_preselect_first 的唯一无增量重置），
-                # 描述不能随之消失：底栏接过参数提示与说明。
+                # 菜单收起时（如 Esc 关闭、参数阶段）描述不能随之消失：
+                # 底栏接过参数提示与说明；菜单打开时说明在菜单里，不重复。
                 hint = " · ".join(p for p in (command.argument_hint, command.description) if p)
         elif buffer.text and not busy:
             hint = "Ctrl+J 换行 · Alt+Enter 追加"

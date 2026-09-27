@@ -184,6 +184,11 @@ status line above the editor is unchanged. Narrow terminals drop provider → th
 
 ### Fixed
 
+- Typing a slash command to its full name (e.g. `/help`) keeps the completion menu
+  visible with that command selected and its description, matching Claude Code / Codex;
+  previously prompt_toolkit's unique-no-increment reset collapsed the menu exactly when
+  the confirmation mattered most. Esc still closes it (without reopening), Enter still
+  executes, and the zombie-state guard from the menu-reopen fix is preserved.
 - Completion menu now reopens after deleting back to a matching prefix (prompt_toolkit
   only restarts completion on insertion, not deletion) and auto-popup preselects the
   first candidate without inserting its text; Tab keeps its insert-first behavior and

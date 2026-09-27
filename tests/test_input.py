@@ -183,17 +183,32 @@ def test_auto_popup_preselects_first_completion(tmp_path):
         asyncio.run(scenario())
 
 
-def test_full_command_closes_menu_without_zombie(tmp_path):
-    """打全命令名（唯一无增量补全）菜单应关闭，且后续回删还能重开（僵尸回归）。"""
+def test_full_command_keeps_menu_without_zombie(tmp_path):
+    """打全命令名（唯一无增量补全）菜单仍显示该命令（票 04：CC/Codex 形态），
+    且状态不是僵尸——complete_index 指向非空补全列表，回删还能重开。"""
     with make_box(tmp_path) as (box, pipe):
 
         async def scenario():
             task = asyncio.ensure_future(box.ask_async({}))
             await until(lambda: box._session.app.is_running)
-            pipe.send_text("/help")  # 唯一补全无增量 → 菜单收起
+            pipe.send_text("/help")  # 唯一补全无增量 → 库收起后重建菜单
             buffer = box._session.default_buffer
+
+            def shown():
+                state = buffer.complete_state
+                return (
+                    state is not None
+                    and state.original_document.text == "/help"  # 排除打字中途的旧状态
+                    and [c.text for c in state.completions] == ["/help"]
+                    and state.complete_index == 0  # 预选，且未僵尸化（列表非空）
+                )
+
+            await until(shown)
+            pipe.send_text("\x1b")  # Esc 关闭重建的菜单
             await until(lambda: buffer.complete_state is None)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
+            assert buffer.complete_state is None  # cancel 同值短路，不回弹
+            assert buffer.text == "/help"
             pipe.send_text("\x7f")  # 回删 → "/hel"：若状态僵尸化，重启会被拦截
             await until(
                 lambda: (
