@@ -586,18 +586,25 @@ class Agent:
         self.tree.reset_with_system(self.system_prompt, self._prompt.sections())
         self._adopt_session()
 
-    def switch_model(self, llm, profile: ModelProfile | None = None) -> None:
-        """会话中换模型（/models，票 14）：只在迭代边界调用（驱动层 busy 语义保证）。
+    def switch_model(
+        self,
+        llm,
+        profile: ModelProfile | None = None,
+        context_window: int | None = None,
+    ) -> None:
+        """会话中换模型（/model，票 05）：只在迭代边界调用（驱动层 busy 语义保证）。
 
-        端点实例与能力档案一起换——压缩策略、温度纪律、窗口都按新模型走
+        端点实例、能力档案与解析窗口一起换——压缩策略、温度纪律、窗口都按新模型走
         （providers 按名匹配，无需厂商特判）。历史与统计保留，但旧模型的
         ``reasoning_content`` 跨模型不连续，回传陌生端点可能被拒，一律剥离；
-        前缀基线随之作废。``--context-window`` 显式给过的窗口会被新档案覆盖
-        （切换即按新模型档案重置）。
+        前缀基线随之作废。``context_window`` 由驱动层用解析链（条目发现值 → 静态表
+        → 默认）算好后传入；不给则回落能力档案的静态值。
         """
         self.llm = llm
         self.profile = profile or profile_for(getattr(llm, "model", None))
-        self.context_window = self.profile.context_window
+        self.context_window = (
+            context_window if context_window is not None else self.profile.context_window
+        )
         self.compress_threshold = self.profile.compress_threshold
         self.tree.strip_reasoning()
         self._last_prefix = None

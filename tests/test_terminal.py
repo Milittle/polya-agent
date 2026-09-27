@@ -88,7 +88,7 @@ loop.run_repl(agent, str(Path(__file__).parent), TerminalRenderer())
         return len(transcript)
 
     try:
-        read_until("/help")
+        read_until("polya · v")  # banner 版本行：REPL 已启动
         read_until("❯")
         os.write(master, b"hello\r")
         read_until("esc to interrupt)")
@@ -165,7 +165,7 @@ loop.run_repl(agent, str(Path(__file__).parent), TerminalRenderer())
     try:
         read_until("❯")
         os.write(master, b"/")
-        read_until("/todos")  # 菜单行（欢迎语只含 /help，不与菜单混淆）
+        read_until("/todos")  # 菜单行（与 banner / 底栏不混淆）
         read_until("显示当前 TODO 清单")  # 描述列同屏渲染
         os.write(master, b"he")
         read_until("显示命令帮助")  # 过滤收敛到 /help

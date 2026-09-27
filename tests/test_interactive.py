@@ -449,3 +449,27 @@ def test_queued_supplement_receives_delivery_receipt(tmp_path):
         session._boundary()
         assert session.agent.history[-1]["content"] == "keep the interface"
         assert "补充已交给模型" in output.getvalue()
+
+
+def test_ctrl_s_callback_sets_default_model(tmp_path, monkeypatch):
+    from polya.models import ModelEntry, ModelsConfig, ProviderEntry
+
+    path = tmp_path / "models.json"
+    config = ModelsConfig()
+    config.add(
+        "p",
+        ProviderEntry(
+            "https://x.example/v1",
+            "sk-x-12345678",
+            "m-a",
+            [ModelEntry("m-a"), ModelEntry("m-b")],
+        ),
+    )
+    config.save(path)
+    monkeypatch.setattr("polya.models.default_path", lambda: path)
+
+    with session_for(tmp_path, FakeLLM([])) as (session, _, _):
+        assert session.box.on_set_default.__self__ is session  # 驱动已接线
+        message = session.box.on_set_default("p/m-b")
+        assert "已设为默认启动模型" in message
+        assert ModelsConfig.load().active == "p/m-b"

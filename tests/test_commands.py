@@ -20,7 +20,7 @@ from polya.commands import (
 )
 from polya.input import InputBox, SlashCompleter
 from polya.llm import LLM
-from polya.models import ModelsConfig, Profile
+from polya.models import ModelEntry, ModelsConfig, ProviderEntry
 from polya.render import TerminalRenderer
 
 
@@ -208,14 +208,17 @@ def test_invalid_details_never_reaches_renderer():
     assert "用法" in handle_command("/details -1", None, renderer)
 
 
-# ---------- /models：动态 choices + 向导录入 + 会话中切换（票 14） ----------
+# ---------- /login /logout /model：provider 认证与切换（票 04/05） ----------
 
 
-def _write_models(tmp_path, monkeypatch, profiles, active=None):
-    """落一份 models.json 并把 polya.models.default_path 指过去（命令侧真实取数）。"""
+def _write_models(tmp_path, monkeypatch, entries, active=None):
+    """落一份 models.json 并把 polya.models.default_path 指过去（命令侧真实取数）。
+
+    ``entries`` 是 ``{provider_id: ProviderEntry}``。
+    """
     config = ModelsConfig()
-    for profile in profiles:
-        config.add(profile)
+    for provider_id, entry in entries.items():
+        config.add(provider_id, entry)
     if active:
         config.use(active)
     path = tmp_path / "models.json"
@@ -224,12 +227,23 @@ def _write_models(tmp_path, monkeypatch, profiles, active=None):
     return config
 
 
-GLM = Profile("glm-plan", "https://api.z.ai/api/coding/paas/v4", "sk-abcd1234efgh", "glm-4.7")
-CLAUDE = Profile("claude-max", "https://proxy.example/v1", "sk-claude-key-9876", "claude-opus-4-5")
+GLM = ProviderEntry(
+    "https://api.z.ai/api/coding/paas/v4",
+    "sk-abcd1234efgh",
+    "glm-4.7",
+    [ModelEntry("glm-4.7", 200_000), ModelEntry("glm-5.3", 1_000_000)],
+)
+CLAUDE = ProviderEntry(
+    "https://proxy.example/v1",
+    "sk-claude-key-9876",
+    "claude-opus-4-5",
+    [ModelEntry("claude-opus-4-5")],
+)
+FIXTURES = {"glm-plan": GLM, "claude-max": CLAUDE}
 
 
 def _fake_io(monkeypatch, inputs, key):
-    """向导/单行 add 的交互替身：input 按队列出队，key 走 getpass 替身。"""
+    """登录流程的交互替身：input 按队列出队，key 走 getpass 替身。"""
     monkeypatch.setattr("builtins.input", lambda prompt="": inputs.pop(0))
     monkeypatch.setattr("polya.commands.getpass", lambda prompt="": key)
 
@@ -240,25 +254,26 @@ def _ctx(agent, in_terminal=True):
     )
 
 
-def test_models_without_profiles_offers_wizard(tmp_path, monkeypatch):
+def test_model_without_login_prompts_login(tmp_path, monkeypatch):
     monkeypatch.setattr("polya.models.default_path", lambda: tmp_path / "none.json")
     agent = Agent(llm=object(), tools=[])
-    result = handle_command("/models", agent)
-    assert "/models add" in result and "向导" in result
+    result = handle_command("/model", agent)
+    assert "/login" in result
 
 
-def test_models_listing_marks_active_and_masks_keys(tmp_path, monkeypatch):
-    _write_models(tmp_path, monkeypatch, [GLM, CLAUDE], active="glm-plan")
+def test_model_listing_marks_active_and_shows_window(tmp_path, monkeypatch):
+    _write_models(tmp_path, monkeypatch, FIXTURES, active="glm-plan/glm-4.7")
     agent = Agent(llm=object(), tools=[])
     old_llm = agent.llm
-    result = handle_command("/models", agent)
-    assert "● glm-plan" in result and "○ claude-max" in result
-    assert "sk-…efgh" in result and "sk-abcd1234efgh" not in result
+    result = handle_command("/model", agent)
+    assert "● glm-4.7 @ glm-plan · 200k" in result
+    assert "○ claude-opus-4-5 @ claude-max · 200k" in result
+    assert "sk-abcd1234efgh" not in result  # 明文 key 不出现
     assert agent.llm is old_llm  # 仅查看不切换
 
 
-def test_models_switch_replaces_llm_strips_reasoning_writes_active(tmp_path, monkeypatch):
-    _write_models(tmp_path, monkeypatch, [GLM, CLAUDE], active="glm-plan")
+def test_model_switch_replaces_llm_strips_reasoning_without_changing_default(tmp_path, monkeypatch):
+    _write_models(tmp_path, monkeypatch, FIXTURES, active="glm-plan/glm-4.7")
     agent = Agent(llm=object(), tools=[])
     agent.tree.replace_conversation(
         [
@@ -271,9 +286,9 @@ def test_models_switch_replaces_llm_strips_reasoning_writes_active(tmp_path, mon
     agent._last_prefix = [{"role": "system", "content": "x"}]
     renderer = TerminalRenderer(Console(file=StringIO()))
 
-    result = handle_command("/models claude-max", agent, renderer)
+    result = handle_command("/model claude-max/claude-opus-4-5", agent, renderer)
 
-    assert "已切换到 claude-max" in result
+    assert "已切换到 claude-max/claude-opus-4-5" in result
     assert isinstance(agent.llm, LLM)
     assert agent.llm.model == "claude-opus-4-5" and agent.llm.profile_name == "claude-max"
     assert "proxy.example" in str(agent.llm.client.base_url)
@@ -283,89 +298,98 @@ def test_models_switch_replaces_llm_strips_reasoning_writes_active(tmp_path, mon
     assert all("reasoning_content" not in m for m in agent.history)
     assert len(agent.history) == 4  # 对话保留
     assert agent._last_prefix is None  # 前缀基线作废
-    assert ModelsConfig.load().active == "claude-max"  # 写回：下次启动沿用
+    # 切换不写默认（Ctrl+S 才写）：票 05
+    assert ModelsConfig.load().active == "glm-plan/glm-4.7"
 
 
-def test_models_add_wizard_preset_flow(tmp_path, monkeypatch, capsys):
+def test_model_switch_uses_discovered_window(tmp_path, monkeypatch):
+    entry = ProviderEntry(
+        "https://openrouter.ai/api/v1",
+        "sk-or-key-1234",
+        "vendor/model",
+        [ModelEntry("vendor/model", 1_000_000)],
+    )
+    _write_models(tmp_path, monkeypatch, {"openrouter": entry})
+    agent = Agent(llm=object(), tools=[])
+    result = handle_command("/model openrouter/vendor/model", agent)
+    assert "窗口 1M" in result and agent.context_window == 1_000_000
+
+
+def test_login_preset_flow_discovers_and_selects_default(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("polya.models.default_path", lambda: tmp_path / "models.json")
-    _fake_io(monkeypatch, ["2", ""], "sk-wizard-12345678")  # 选 zai-cn 预设，名字回车用默认
-    result = dispatch_command("/models add", _ctx(Agent(llm=object(), tools=[])))
-    assert "已录入 zai-cn" in result and "sk-…5678" in result
+    monkeypatch.setattr(
+        "polya.commands.discover_models",
+        lambda base_url, api_key, timeout=10.0: [ModelEntry("glm-5.3", 1_000_000)],
+    )
+    _fake_io(monkeypatch, [""], "sk-wizard-12345678")  # base_url 回车用预设默认
+    result = dispatch_command("/login zai-coding-cn", _ctx(Agent(llm=object(), tools=[])))
+    assert "已登录 zai-coding-cn" in result and "glm-5.3" in result and "1M" in result
     config = ModelsConfig.load()
-    assert config.active == "zai-cn"  # 首个 profile 自动 active
-    profile = config.find("zai-cn")
-    assert profile.base_url == "https://open.bigmodel.cn/api/coding/paas/v4"
-    assert profile.model == "glm-5.3" and profile.api_key == "sk-wizard-12345678"
-    out = capsys.readouterr().out
-    assert "sk-wizard-12345678" not in out  # 明文 key 不落屏幕
-    assert "国内" in out  # 向导菜单可见预设标签
+    assert config.active == "zai-coding-cn/glm-5.3"  # 首个自动默认
+    entry = config.get("zai-coding-cn")
+    assert entry.base_url == "https://open.bigmodel.cn/api/coding/paas/v4"
+    assert entry.api_key == "sk-wizard-12345678"
+    assert entry.models[0].context_window == 1_000_000
+    assert "sk-wizard-12345678" not in capsys.readouterr().out  # 明文 key 不落屏幕
 
 
-def test_models_add_wizard_custom_flow(tmp_path, monkeypatch):
+def test_login_custom_flow_falls_back_when_discovery_fails(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("polya.models.default_path", lambda: tmp_path / "models.json")
+
+    def _boom(base_url, api_key, timeout=10.0):
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr("polya.commands.discover_models", _boom)
     _fake_io(
         monkeypatch,
-        ["6", "http://localhost:8000/v1", "qwen3", "box"],
+        ["box", "http://localhost:8000/v1", "qwen3"],
         "sk-local-999888777666",
     )
-    result = dispatch_command("/models add", _ctx(Agent(llm=object(), tools=[])))
-    assert "已录入 box" in result
-    profile = ModelsConfig.load().find("box")
-    assert (profile.base_url, profile.model) == ("http://localhost:8000/v1", "qwen3")
+    result = dispatch_command("/login custom", _ctx(Agent(llm=object(), tools=[])))
+    assert "已登录 box" in result and "qwen3" in result
+    entry = ModelsConfig.load().get("box")
+    assert (entry.base_url, entry.model) == ("http://localhost:8000/v1", "qwen3")
+    assert "未能获取模型列表" in capsys.readouterr().out
 
 
-def test_models_add_wizard_bad_choice_cancels(tmp_path, monkeypatch):
+def test_login_requires_key_and_url(tmp_path, monkeypatch):
     monkeypatch.setattr("polya.models.default_path", lambda: tmp_path / "models.json")
-    _fake_io(monkeypatch, ["9"], "sk-never-used")
-    result = dispatch_command("/models add", _ctx(Agent(llm=object(), tools=[])))
-    assert result == "已取消录入。"
-    assert ModelsConfig.load().profiles == []
+    _fake_io(monkeypatch, [""], "")  # key 为空 → 取消
+    result = dispatch_command("/login zai", _ctx(Agent(llm=object(), tools=[])))
+    assert result == "已取消登录。"
+    assert ModelsConfig.load().providers == {}
 
 
-def test_models_add_oneline_preset_and_duplicate(tmp_path, monkeypatch):
-    _write_models(tmp_path, monkeypatch, [GLM])
-    _fake_io(monkeypatch, [], "sk-claude-key-9876")  # 预设连模型带端点，只差 key
-    agent = Agent(llm=object(), tools=[])
-    result = dispatch_command("/models add claude-max zai", _ctx(agent))
-    assert "已录入 claude-max" in result and "glm-5.3 @ api.z.ai" in result
-    assert "已设为 active" not in result  # active 仍是先录入的 glm-plan
-    duplicate = dispatch_command("/models add claude-max zai", _ctx(agent))
-    assert "已存在同名" in duplicate
-    assert len(ModelsConfig.load().profiles) == 2
-
-
-def test_models_add_falls_back_to_getpass_without_terminal(tmp_path, monkeypatch):
+def test_login_rejects_custom_name_collision(tmp_path, monkeypatch):
     monkeypatch.setattr("polya.models.default_path", lambda: tmp_path / "models.json")
-    monkeypatch.setattr("polya.commands.getpass", lambda prompt="": "sk-fallback-9999")
-    result = dispatch_command(
-        "/models add glm zai", _ctx(Agent(llm=object(), tools=[]), in_terminal=False)
-    )
-    assert "已录入 glm" in result and ModelsConfig.load().active == "glm"
+    _fake_io(monkeypatch, ["zai"], "sk-x-12345678")
+    result = dispatch_command("/login custom", _ctx(Agent(llm=object(), tools=[])))
+    assert "重复" in result
 
 
-def test_models_remove_reassigns_active(tmp_path, monkeypatch):
-    _write_models(tmp_path, monkeypatch, [GLM, CLAUDE], active="claude-max")
+def test_logout_removes_and_reassigns_active(tmp_path, monkeypatch):
+    _write_models(tmp_path, monkeypatch, FIXTURES, active="claude-max/claude-opus-4-5")
     agent = Agent(llm=object(), tools=[])
-    result = dispatch_command("/models remove claude-max", _ctx(agent))
-    assert "已移除 claude-max" in result and "active → glm-plan" in result
+    result = dispatch_command("/logout claude-max", _ctx(agent))
+    assert "已登出 claude-max" in result
     config = ModelsConfig.load()
-    assert config.active == "glm-plan" and len(config.profiles) == 1
-    assert "未找到" in dispatch_command("/models remove ghost", _ctx(agent))
+    assert config.active == "glm-plan/glm-4.7" and list(config.providers) == ["glm-plan"]
+    assert "用法" in dispatch_command("/logout ghost", _ctx(agent))
 
 
 @pytest.mark.parametrize(
     "text",
     [
-        "/models add glm",  # 名字后既非预设也非 URL
-        "/models add glm notapreset",
-        "/models add glm ftp://x/v1 m",
-        "/models remove",
-        "/models remove a b",
-        "/models ghost",
+        "/login notaprovider",
+        "/login zai extra",
+        "/logout",
+        "/logout a b",
+        "/model ghost",
+        "/model ghost/model",
     ],
 )
-def test_models_bad_shapes_rejected(tmp_path, monkeypatch, text):
-    _write_models(tmp_path, monkeypatch, [GLM])
+def test_model_entry_bad_shapes_rejected(tmp_path, monkeypatch, text):
+    _write_models(tmp_path, monkeypatch, FIXTURES)
     agent = Agent(llm=object(), tools=[])
     old_llm = agent.llm
     assert "用法" in handle_command(text, agent)
@@ -375,32 +399,41 @@ def test_models_bad_shapes_rejected(tmp_path, monkeypatch, text):
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("/models ", ["glm-plan", "claude-max", "add", "remove"]),
-        ("/models g", ["glm-plan"]),
-        ("/models a", ["add"]),
-        ("/models c", ["claude-max"]),
-        ("/models x", []),
-        ("/models glm-plan ", []),
+        (
+            "/model ",
+            ["glm-plan/glm-4.7", "glm-plan/glm-5.3", "claude-max/claude-opus-4-5"],
+        ),
+        ("/model g", ["glm-plan/glm-4.7", "glm-plan/glm-5.3"]),
+        ("/model c", ["claude-max/claude-opus-4-5"]),
+        ("/model x", []),
+        ("/model glm-plan ", []),
     ],
 )
-def test_models_argument_completion_is_dynamic(tmp_path, monkeypatch, text, expected):
-    _write_models(tmp_path, monkeypatch, [GLM, CLAUDE])
+def test_model_argument_completion_is_dynamic(tmp_path, monkeypatch, text, expected):
+    _write_models(tmp_path, monkeypatch, FIXTURES)
     completions = [c.text for c in SlashCompleter().get_completions(Document(text), None)]
     assert completions == expected
 
 
-def test_models_bare_opens_picker_marking_active(tmp_path, monkeypatch, box):
-    _write_models(tmp_path, monkeypatch, [GLM, CLAUDE], active="glm-plan")
+def test_model_bare_opens_picker_marking_current_and_hints_ctrl_s(tmp_path, monkeypatch, box):
+    _write_models(tmp_path, monkeypatch, FIXTURES, active="glm-plan/glm-4.7")
     sent = []
-    box._state = {"profile": "glm-plan"}
+    box._state = {"profile": "glm-plan", "model": "glm-4.7"}
     buffer = Buffer(accept_handler=lambda b: sent.append(b.text))
-    buffer.document = Document("/models")
+    buffer.document = Document("/model")
     box._submit(buffer)
-    assert buffer.text == "/models " and not sent
+    assert buffer.text == "/model " and not sent
     state = buffer.complete_state
-    assert [c.text for c in state.completions] == ["glm-plan", "claude-max", "add", "remove"]
-    active_meta = next(str(c.display_meta) for c in state.completions if c.text == "glm-plan")
-    assert "当前" in active_meta
+    assert [c.text for c in state.completions] == [
+        "glm-plan/glm-4.7",
+        "glm-plan/glm-5.3",
+        "claude-max/claude-opus-4-5",
+    ]
+    current_meta = next(
+        str(c.display_meta) for c in state.completions if c.text == "glm-plan/glm-4.7"
+    )
+    assert "当前" in current_meta
+    assert "Ctrl+S" in box._hint  # 提示设默认
     buffer.go_to_completion(1)
     box._submit(buffer)
-    assert sent == ["/models claude-max"]  # 选中即一次 Enter 执行（对齐 CC）
+    assert sent == ["/model glm-plan/glm-5.3"]  # 选中即一次 Enter 执行（对齐 CC）

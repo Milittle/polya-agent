@@ -63,3 +63,33 @@ def test_build_agent_injects_project_memory(tmp_path, monkeypatch):
     agent2 = build_agent(parse_args(["--root", str(empty), "--trust"]), llm=FakeLLM())
     assert agent2.system_prompt.startswith(CODING_SYSTEM_PROMPT)
     assert "<project_memory>" not in agent2.system_prompt  # 缺失即不产生该段
+
+
+def test_welcome_banner_reports_identity_not_footer_dupes(tmp_path):
+    from io import StringIO
+
+    from rich.console import Console
+
+    from polya.loop import print_welcome
+
+    buf = StringIO()
+    print_welcome(Console(file=buf, no_color=True, width=100), project_memory="x", trusted=True)
+    text = buf.getvalue()
+    assert "polya · v" in text  # 版本
+    assert "和你一起理解问题、制定计划、完成验证" in text  # 标语
+    assert "已加载项目记忆 AGENTS.md" in text  # 底栏没有的项目级信息
+    assert "/help" not in text  # 快捷键归底栏
+    assert str(tmp_path) not in text  # 目录归底栏
+    assert "gpt-5" not in text and "test-model" not in text  # 模型归底栏
+
+
+def test_welcome_banner_flags_untrusted_directory():
+    from io import StringIO
+
+    from rich.console import Console
+
+    from polya.loop import print_welcome
+
+    buf = StringIO()
+    print_welcome(Console(file=buf, no_color=True, width=120), project_memory=None, trusted=False)
+    assert "未信任" in buf.getvalue()

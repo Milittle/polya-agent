@@ -7,13 +7,12 @@ steering 排队 → ``send`` 回结果。
   on_shell_output=)`` 的 tap 直喂渲染器（装配在 cli.build_agent）——执行期流是
   驱动层事务，不是引擎旁路。
 - 常驻交互：Esc 在事件边界关闭生成器并回填未决工具；Ctrl+C 专职输入框。
-  忙时输入分 steering / follow-up 两类；终端借用仅服务 /models add 向导。
+  忙时输入分 steering / follow-up 两类；终端借用仅服务 /login 向导。
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
 import sys
 import threading
@@ -40,6 +39,7 @@ from .commands import (
 from .executor import execute
 from .filefind import ProjectFiles
 from .input import InputBox, InputSuspended
+from .models import ModelsConfig, format_context_window
 from .render import TerminalRenderer, console
 from .review import Reviewer, is_plan_approval
 
@@ -188,23 +188,36 @@ def _append_project_memory(root: str, text: str, say) -> None:
     say(f"已记入 {path}", "dim")
 
 
-def print_welcome(root: str, model: str, output: Console) -> None:
-    path = str(Path(root).resolve())
-    home = str(Path.home())
-    if path == home or path.startswith(home + os.sep):
-        path = "~" + path[len(home) :]
+def print_welcome(
+    output: Console,
+    *,
+    project_memory: str | None = None,
+    trusted: bool = True,
+) -> None:
+    """日常启动 banner（票 01）：只报身份，不重复底栏的模型/目录/快捷键。
+
+    底栏（`input.py` 的 env/bottom bar）常驻显示模型、窗口、目录、主题、模式与
+    `/help` 提示；banner 一次性滚走，只留版本、标语与底栏没有的项目级信息。
+    """
     output.set_window_title("polya")
     output.print(Text(f"  polya · v{version('polya')}", style="bold cyan"))
     output.print(Text("  和你一起理解问题、制定计划、完成验证", style="dim"))
+    if not trusted:
+        output.print(
+            Text(
+                "  ⚠ 未信任此目录：AGENTS.md / 项目 skills 未加载（/trust 查看）",
+                style="yellow",
+            )
+        )
+    elif project_memory:
+        output.print(Text("  已加载项目记忆 AGENTS.md", style="dim"))
     output.print()
-    output.print(Text(f"  {path} · {model}", style="dim"), overflow="ellipsis", no_wrap=True)
-    output.print(Text("  /help 查看命令\n", style="dim"))
 
 
 class InteractiveSession:
     """输入在主事件循环运行；一个 worker 独占 agent 和命令执行。
 
-    /models add 向导通过握手借用终端，主输入退出后才允许它读 stdin。
+    /login 向导通过握手借用终端，主输入退出后才允许它读 stdin。
     普通消息在下一模型调用前注入；会重置或结束会话的命令需先让任务空闲。
     """
 
@@ -229,6 +242,7 @@ class InteractiveSession:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.box.on_interrupt = self.interrupt
         self.box.on_dequeue = self._dequeue_to_editor
+        self.box.on_set_default = self._set_default_model
         self.renderer.on_status = self._status
         self.box.preview = self.renderer.preview
         self.plan_pending = False
@@ -254,7 +268,7 @@ class InteractiveSession:
         self.renderer._console.print(text, style=style, markup=False)
 
     def _status(self, renderer: TerminalRenderer) -> None:
-        # /models 切换后状态行跟随（llm 实例整个换掉，model/profile_name 都变）
+        # /model 切换后状态行跟随（llm 实例整个换掉，model/profile_name 都变）
         self.state["model"] = self.agent.llm.model
         self.state["topic"] = self.topic
         self.state["profile"] = getattr(self.agent.llm, "profile_name", None)
@@ -262,6 +276,10 @@ class InteractiveSession:
         self.state["mode"] = "plan" if self.agent.plan_mode else "normal"
         self.state["status"] = renderer._status_label()
         self.state["preview_active"] = renderer.has_preview
+        # 窗口大小（票 01）：第二零刻即可显示容量，首次请求后才追加占用百分比。
+        # 只赋值、不 pop：占用在 /clear /new 时由 _run_command 显式清零（见下）。
+        if renderer.context_window:
+            self.state["window"] = format_context_window(renderer.context_window)
         if renderer.context_window and renderer._ctx_used is not None:
             self.state["context"] = f"ctx {renderer._ctx_used * 100 // renderer.context_window}%"
         self.box._session.app.invalidate()
@@ -310,6 +328,16 @@ class InteractiveSession:
         self._sync_queue_state()
         return text
 
+    def _set_default_model(self, ref: str) -> str:
+        """Ctrl+S（/model 选项器内）：把 ref 写为默认启动模型，返回 flash 提示。"""
+        config = ModelsConfig.load()
+        try:
+            provider_id, model = config.use(ref)
+            config.save()
+        except ValueError as exc:
+            return f"[错误] {exc}"
+        return f"已设为默认启动模型：{provider_id}/{model}"
+
     def _dequeue_to_editor(self) -> str:
         """Alt+Up / Esc：把排队消息取回编辑器。"""
         with self.lock:
@@ -324,7 +352,7 @@ class InteractiveSession:
             self.agent,
             self.renderer,
             restart=self._restart,
-            in_terminal=self._borrow_terminal,  # /models add 向导借道终端让位
+            in_terminal=self._borrow_terminal,  # /login 向导借道终端让位
             rename=self._rename,
         )
 
@@ -346,7 +374,11 @@ class InteractiveSession:
             self.steering.clear()
             self.follow_up.clear()
         self._sync_queue_state()
-        print_welcome(self.root, self.agent.llm.model, self.renderer._console)
+        print_welcome(
+            self.renderer._console,
+            project_memory=self.agent.project_memory,
+            trusted=self.agent.trusted,
+        )
         return f"（已丢弃 {dropped} 条排队消息）" if dropped else ""
 
     def _local(self, text: str) -> bool:
@@ -576,7 +608,11 @@ def run_repl(agent: Agent, root: str, renderer: TerminalRenderer) -> None:
         with patch_stdout(raw=True):
             output = Console()
             renderer.use_scrollback(output)
-            print_welcome(root, agent.llm.model, output)
+            print_welcome(
+                output,
+                project_memory=agent.project_memory,
+                trusted=agent.trusted,
+            )
             box = InputBox(files=ProjectFiles(Path(root)))
             asyncio.run(InteractiveSession(agent, root, renderer, box).run())
         return

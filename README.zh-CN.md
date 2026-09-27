@@ -29,28 +29,24 @@ cp .env.example .env
 # 编辑 .env，填入 OPENAI_API_KEY（以及可选的 OPENAI_BASE_URL / OPENAI_MODEL）
 ```
 
-多家厂商或 coding plan 可注册为命名 profile，全程在会话内完成——`/models add`
-进交互向导（存于 `~/.polya/models.json`，权限 0600；录入 key 时输入框让位终端、
-走 getpass 不回显，不进屏幕与输入历史，列表只显示尾四位）：
+多家厂商或 coding plan 全程在会话内登录——`/login` 打开 provider 列表（首批：
+OpenRouter、DeepSeek、z.ai 国际/国内、Moonshot 国际/国内、Groq、Together、
+NVIDIA、Qwen Token Plan 国际/国内，外加「自定义端点」）。base_url 由预置表预填、
+可改；录入 key 时输入框让位终端、走 getpass 不回显，不进屏幕与输入历史。
+凭据存于 `~/.polya/models.json`（权限 0600）：
 
 ```
-/models add
-  可用预设（已知厂商内置，选名字即可）：
-    1. z.ai coding plan（国际） · glm-5.3 @ api.z.ai
-    2. z.ai coding plan（国内 bigmodel） · glm-5.3 @ open.bigmodel.cn
-    3. DeepSeek API · deepseek-flash @ api.deepseek.com
-    4. OpenRouter（跨厂商） · （自填模型名） @ openrouter.ai
-    5. Moonshot Kimi · （自填模型名） @ api.moonshot.cn
-    6. 自定义 OpenAI 兼容端点
-/models add ds deepseek             # 单行捷径：预设名 + 隐藏输 key
-/models add box http://localhost:8000/v1 qwen3    # 自定义端点捷径
-/models remove ds
+/login zai
+  base_url（回车用 https://api.z.ai/api/coding/paas/v4）:
+  api_key（输入不回显）:
+已登录 zai：glm-5.3 @ api.z.ai · 窗口 1M，已设为默认启动模型。/model 切换，Ctrl+S 设默认。
 ```
 
-预设只是预填 base_url 和建议模型——任何 OpenAI 兼容端点都是同一个三元组。
-启动解析优先级：CLI 旗标 > active profile > `OPENAI_*` 环境变量。会话内
-`/models` 随时切换（无参数展开选项器）：对话保留，旧模型的 thinking 剥离，
-选择写回 active。
+登录后 polya 会问 provider 的 `/models` 端点拿模型列表，并在端点报了窗口时读取
+（`context_length` / `max_model_len`），否则回落内置能力表。解析优先级：发现值 >
+内置表 > 128k。`/model` 随时切换（无参数跨已登录 provider 展开选项器，`Ctrl+S`
+把高亮项存为默认启动模型）；`/logout <provider>` 移除凭据。启动解析优先级：
+CLI 旗标 > 默认模型（active）> `OPENAI_*` 环境变量。
 
 ## 运行示例
 
@@ -89,7 +85,9 @@ REPL 斜杠命令：
 | `/help` | 命令列表 |
 | `/todos` `/status` | 查看 TODO 清单 / 会话状态（模式、用量、工具计数） |
 | `/plan on\|go\|off` | 切换规划模式；`go` 批准当前计划进入执行（`exit_plan_mode` 构造时已注册，切换不动工具数组，缓存安全） |
-| `/models [profile]` | 查看 / 切换 / 录入模型 profile：对话保留、旧模型 thinking 剥离、能力档案跟随；无参数展开选项器，`/models add` 进交互向导（预设选名字、key 隐藏输入） |
+| `/login [provider\|custom]` | 登录 provider：provider 列表 → base_url（预填可改）→ 隐藏输 key → 发现模型并选默认；`custom` 自填端点 |
+| `/logout <provider>` | 登出并移除 provider 凭据（若是默认模型则清空 active） |
+| `/model [provider/模型]` | 切换模型：对话保留、旧模型 thinking 剥离、能力档案与窗口跟随；无参数跨已登录 provider 展开选项器，`Ctrl+S` 把高亮项存为默认启动模型 |
 | `/thinking [off\|low\|medium\|high]` | 设置推理档位（一家一策）：o 系/gpt-5 发 `reasoning_effort`，GLM/DeepSeek 发 `thinking` 开关；档案无档位的模型明确提示不可切 |
 | `/details [ID]` | 查看留档块全文：无参数看最近 5 块，带 ID 看指定块——滚动区的折叠块在这里看全量 |
 | `/compact [说明]` | 立即压缩上下文（不等阈值）；可选说明聚焦摘要重点 |
@@ -104,13 +102,13 @@ REPL 斜杠命令：
 | `/new` | 开新会话：分配新会话名，在 `/clear` 之上重置主题、丢弃排队消息并重印启动区 |
 | `/exit` `/quit` | 退出（输入处 Ctrl+D / 空框双击 Ctrl+C 同效） |
 
-`/plan`、`/models` 无参数时在原输入框展开选项，并标记当前值（`/models`
-的选项器尾行带 `add` 向导与 `remove`）；方向键移动，
+`/plan`、`/login`、`/logout`、`/model` 无参数时在原输入框展开选项，并标记当前值；
+`/model` 选项器里 `Ctrl+S` 把高亮项存为默认启动模型。方向键移动，
 Tab / Enter 选中，再按 Enter 执行，Esc 关闭菜单。也可直接输入 `/plan on|go|off`、
-`/models <名字>`，支持参数补全。命令或参数错误时保留草稿并提示；
+`/login zai`、`/logout zai`、`/model zai/glm-5.3`，支持参数补全。命令或参数错误时保留草稿并提示；
 `/details [ID]` 的 ID 只接受正整数（无参数看最近 5 块）。`/help` 的名称、别名与参数
 与补全、执行共用同一平面注册表。命令随到随执行；会改会话树的命令
-（`/clear`、`/new`、`/exit`、`/compact`、`/rewind`、`/jump`、`/edit`、`/load`、`/resume`、`/fork`、`/clone`、`/import`、`/models`、`/reload`、`/save`）
+（`/clear`、`/new`、`/exit`、`/compact`、`/rewind`、`/jump`、`/edit`、`/load`、`/resume`、`/fork`、`/clone`、`/import`、`/model`、`/reload`、`/save`）
 需要无运行中的任务，否则提示先按 Esc 中断。管道 REPL 不显示选项菜单，需要显式提供参数。
 
 **会话**：每个会话有稳定名字与元数据（标题 / 创建 / 更新 / cwd），任务收尾自动落盘到
@@ -165,10 +163,12 @@ YAML frontmatter 声明 `name` 和 `description`；无效条目警告后跳过�
 
 ### 交互与显示
 
-- **启动区**：名称、版本、一句定位、项目路径和模型，只显示一次，随后自然滚走。
+- **启动区**：版本、一句定位与项目级信息（已加载 AGENTS.md，或未信任目录提醒），
+  只显示一次随后自然滚走——模型/目录/快捷键留在常驻底栏，不重复。
 - **常驻输入**：上下边线紧贴编辑区，续行缩进，最多六行后内部滚动。框外第一行显示
-  模型、项目目录和上下文占比，第二行显示会话主题、模式、队列状态与操作提示。
-  窄终端省略上下文、缩短路径与主题，优先保留模型和项目名。运行中仍可编辑草稿。
+  模型、上下文窗口与项目目录（首次请求后追加 `ctx N%`），第二行显示会话主题、模式、
+  队列状态与操作提示。窄终端先舍 `ctx%`、再舍窗口，保住模型与项目名；缩短路径与主题。
+  运行中仍可编辑草稿。
   主题默认取自首条任务，不额外调用模型；`/rename <主题>` 同步修改底部主题与终端标题，
   `/clear` 保留主题，`/new` 重置主题。
 - **输入操作**：Enter 发送（steering：下一模型请求前注入）；Alt+Enter 追加
@@ -290,7 +290,8 @@ agent = Agent(
   档案）改用**摘要重启**：整段旧历史压成一条 `<session_summary>` 消息，模型从摘要冷
   启动（原地替换会使保留的 thinking 全部失效）。`reasoning_passthrough` 控制
   `reasoning_content` 原样保存回传（DeepSeek interleaved thinking）；档案还提供
-  `context_window` 与 `temperature` 默认值（o 系列为 `None` = 不传）。`profile_for(model)`
+  `temperature` 默认值（o 系列为 `None` = 不传）与作为窗口解析链**兑底层**的
+  `context_window`（发现值优先，其次档案，最后 128k）。`profile_for(model)`
   按前缀匹配，未知模型回落安全默认。CLI 的 `--model` 会自动查档案。
 - **前缀不变量断言**（`Agent(prefix_check=True)` / CLI `--prefix-check`）：运行时校验
   每次请求是上一次的严格扩展（深拷贝基线 + 内容比较，有开销故默认关）。破坏前缀对
@@ -361,7 +362,7 @@ polya/
   executor.py    # 工具执行器（loop 与 run() 共用）
   cli.py         # argparse + Agent 装配 + 单任务模式 + AGENTS.md 启动注入
   llm.py         # OpenAI 兼容接口封装：chat(on_delta) 与 chat_iter 双形态
-  models.py      # 模型 profile（~/.polya/models.json）：读写校验、厂商预设、启动解析
+  models.py      # provider 配置（~/.polya/models.json）：读写校验迁移、预置表、模型发现、启动解析
   tools.py       # @tool 装饰器与工具注册表（kind 分类）
   builtin.py     # 内置编码工具 + 编码代理提示词（内容层）
   shell.py       # 持久 bash 会话（读线程 + 哨兵标记协议）

@@ -17,7 +17,16 @@ from typing import TYPE_CHECKING, TypeVar
 from . import session as session_store
 from . import trust as trust_store
 from .llm import LLM
-from .models import PRESETS, ModelsConfig, Profile, host_of, mask_key
+from .models import (
+    PROVIDERS,
+    ModelEntry,
+    ModelsConfig,
+    ProviderEntry,
+    discover_models,
+    format_context_window,
+    host_of,
+    resolve_context_window,
+)
 from .providers import profile_for
 from .todos import _STATUS_LABELS
 
@@ -34,7 +43,7 @@ class CommandContext:
     agent: Agent
     renderer: TerminalRenderer | None = None
     restart: Callable[[], str] | None = None
-    # 终端让位（/models add 向导）：交互会话借道挂起机制运行交互闭包
+    # 终端让位（/login 向导）：交互会话借道挂起机制运行交互闭包
     # （输入框让位、key 走 getpass 不进屏幕与输入历史）；缺省直接跑（管道 stdin）。
     in_terminal: Callable[[Callable[[], _T]], _T] | None = None
     rename: Callable[[str], str] | None = None
@@ -48,10 +57,10 @@ class Command:
     aliases: tuple[str, ...] = ()
     argument_hint: str = ""
     choices: tuple[tuple[str, str], ...] = ()
-    # 动态 choices（票 14）：/models 的选项来自 ~/.polya/models.json，运行时取数。
+    # 动态 choices：/model /login /logout 的选项来自 ~/.polya/models.json，运行时取数。
     # 校验（error）、参数补全与选项器统一走 effective_choices()，三处同源。
     choices_provider: Callable[[], tuple[tuple[str, str], ...]] | None = None
-    # 参数面比 choices 宽的命令（/models 的 add/remove 子动词）自带校验，
+    # 参数面宽于静态 choices 的命令（/login /logout /model）自带 validator，
     # 提供 validator 时接管 error() 的全部判定。
     validator: Callable[[str], str | None] | None = None
     integer: bool = False
@@ -76,7 +85,7 @@ class Command:
             return self.validator(argument)
         choices = self.effective_choices()
         if choices:
-            # 动态 choices（/models）无参放行到处理器：交互层先开选项器拦住
+            # 动态 choices（/model /login /logout）无参放行到处理器：交互层先开选项器拦住
             # （input._submit），非交互落到处理器出清单；静态 choices 维持
             # 「无参即用法错误」（非交互 /plan 不该误触发切换）。
             if argument in dict(choices) or (
@@ -175,175 +184,203 @@ def _new(ctx: CommandContext, arg: str) -> str:
 
 
 def _model_choices() -> tuple[tuple[str, str], ...]:
-    """/models 的动态选项：profile 名 + 「模型 @ 主机」标签 + add/remove 伪选项；
-    坏配置当无 profile。"""
+    """/model 的动态选项：全部已登录 provider 的模型（值 = ``provider/模型``）。"""
     try:
         config = ModelsConfig.load()
     except ValueError:
-        config = ModelsConfig()
-    entries = [(p.name, f"{p.model} @ {host_of(p.base_url)}") for p in config.profiles]
-    entries.extend([("add", "录入新 profile（交互向导）"), ("remove", "移除已有 profile")])
+        return ()
+    return tuple((ref, _model_label(config, ref)) for ref in config.refs())
+
+
+def _model_label(config: ModelsConfig, ref: str) -> str:
+    provider_id, model = ref.split("/", 1)
+    window = resolve_context_window(model, config.get(provider_id))
+    return f"{model} @ {provider_id} · {format_context_window(window)}"
+
+
+def _login_choices() -> tuple[tuple[str, str], ...]:
+    """/login 的 provider 列表 + 自定义端点。"""
+    entries = [(pid, f"{p.label} · {host_of(p.base_url)}") for pid, p in PROVIDERS.items()]
+    entries.append(("custom", "自定义端点（自填 base_url / 模型 / key）"))
     return tuple(entries)
 
 
-_MODELS_USAGE = (
-    "用法 (Usage): /models [profile]\n"
-    f"  /models add                      （交互向导：预设选名字 → 隐藏输 key）\n"
-    f"  /models add <名字> <预设: {'|'.join(PRESETS)}>\n"
-    "  /models add <名字> <base_url> <模型>\n"
-    "  /models remove <名字>"
-)
+def _logout_choices() -> tuple[tuple[str, str], ...]:
+    """/logout 的已登录 provider；坏配置当空。"""
+    try:
+        config = ModelsConfig.load()
+    except ValueError:
+        return ()
+    return tuple(
+        (pid, f"{entry.model} @ {host_of(entry.base_url)}")
+        for pid, entry in config.providers.items()
+    )
 
 
-def _models_validate(argument: str) -> str | None:
-    """/models 的参数面比 choices 宽（add/remove 子动词），自带校验。"""
+_LOGIN_USAGE = "用法 (Usage): /login [provider|custom]（无参数打开 provider 列表）"
+_LOGOUT_USAGE = "用法 (Usage): /logout <provider>（无参数打开已登录列表）"
+_MODEL_USAGE = "用法 (Usage): /model [provider/模型]（无参数打开模型列表，Ctrl+S 设为默认）"
+
+
+def _login_validate(argument: str) -> str | None:
+    if not argument:
+        return None  # 空参进选项器
+    parts = argument.split()
+    if len(parts) == 1 and (parts[0] in PROVIDERS or parts[0] == "custom"):
+        return None
+    return _LOGIN_USAGE
+
+
+def _logout_validate(argument: str) -> str | None:
     if not argument:
         return None
-    parts = argument.split()
-    if parts[0] == "add":
-        if len(parts) == 1:
-            return None  # 裸 add 进向导
-        if len(parts) == 3 and parts[2] in PRESETS:
-            return None
-        if len(parts) == 4 and parts[2].startswith(("http://", "https://")):
-            return None
-        return _MODELS_USAGE
-    if parts[0] == "remove":
-        return None if len(parts) == 2 else _MODELS_USAGE
     try:
-        names = {p.name for p in ModelsConfig.load().profiles}
+        config = ModelsConfig.load()
     except ValueError:
-        names = set()
-    return None if argument in names else _MODELS_USAGE
-
-
-def _ask_profile(name: str, base_url: str, model: str) -> Profile | None:
-    """补齐单行 add 缺的字段（预设无建议模型时问模型名），key 恒隐藏输入。"""
-    if not model:
-        model = input("模型名: ").strip()
-    api_key = getpass("api_key（输入不回显）: ").strip()
-    if not model or not api_key:
-        print("[取消] 模型名与 api_key 不能为空。")
         return None
-    return Profile(name=name, base_url=base_url, api_key=api_key, model=model)
+    return None if argument.strip() in config.providers else _LOGOUT_USAGE
 
 
-def _models_wizard() -> Profile | None:
-    """终端让位窗口里的录入向导：内置预设选个名字，未知信息逐项问，key 隐藏输。"""
-    keys = list(PRESETS)
-    print("可用预设（已知厂商内置，选名字即可）：")
-    for index, key in enumerate(keys, 1):
-        preset = PRESETS[key]
-        model = preset.model or "（自填模型名）"
-        print(f"  {index}. {preset.label} · {model} @ {host_of(preset.base_url)}")
-    print(f"  {len(keys) + 1}. 自定义 OpenAI 兼容端点")
-    choice = input(f"选择 [1-{len(keys) + 1}]（回车 1）: ").strip() or "1"
+def _model_validate(argument: str) -> str | None:
+    if not argument:
+        return None
     try:
-        index = int(choice)
-        picked = 1 <= index <= len(keys) + 1
+        config = ModelsConfig.load()
     except ValueError:
-        picked = False
-    if not picked:
-        print("[取消] 无效选择。")
         return None
-    if index == len(keys) + 1:
-        default_name, base_url = "", input("base_url（OpenAI 兼容端点）: ").strip()
-        model = input("模型名: ").strip()
-    else:
-        key = keys[index - 1]
-        preset = PRESETS[key]
-        default_name, base_url = key, preset.base_url
-        model = preset.model or input("模型名: ").strip()
-    if default_name:
-        name = input(f"profile 名（回车用 {default_name}）: ").strip() or default_name
-    else:
-        name = input("profile 名: ").strip()
-    if not name:
-        print("[取消] profile 名不能为空。")
-        return None
-    return _ask_profile(name, base_url, model)
+    ref = argument.strip()
+    if "/" not in ref:
+        return None if config.get(ref) is not None else _MODEL_USAGE
+    provider_id, model = ref.split("/", 1)
+    entry = config.get(provider_id)
+    if entry is None:
+        return _MODEL_USAGE
+    if model != entry.model and all(item.id != model for item in entry.models):
+        return _MODEL_USAGE
+    return None
 
 
-def _models_add(ctx: CommandContext, parts: list[str]) -> str:
+def _discover(base_url: str, api_key: str) -> tuple[list[ModelEntry], str]:
+    """尽力发现模型列表；失败返回空列表 + 提示语（不阻断登录，票 04 失败语义）。"""
+    try:
+        return discover_models(base_url, api_key), ""
+    except Exception as exc:  # noqa: BLE001 - 网络/鉴权失败只提示，不阻断
+        return [], f"未能获取模型列表（{type(exc).__name__}: {exc}），可手动输入模型名。"
+
+
+def _login(ctx: CommandContext, arg: str) -> str:
     run = ctx.in_terminal or (lambda go: go())  # 非交互/测试：直接跑（管道 stdin）
     try:
-        if not parts:
-            profile = run(_models_wizard)
-        else:  # 单行捷径：预设名或 base_url+模型（key 仍隐藏输入）
-            if len(parts) == 2 and parts[1] in PRESETS:
-                preset = PRESETS[parts[1]]
-                base_url, model = preset.base_url, preset.model
-            else:
-                base_url, model = parts[1], parts[2]
-            profile = run(lambda: _ask_profile(parts[0], base_url, model))
+        return run(lambda: _login_flow(arg.strip()))
     except (InterruptedError, KeyboardInterrupt):
-        return "已取消录入。"
-    if profile is None:
-        return "已取消录入。"
+        return "已取消登录。"
+
+
+def _login_flow(provider_id: str) -> str:
+    """借道终端窗口的登录：base_url（预设为默认，可改）→ 隐藏 key → 发现模型。"""
+    preset = PROVIDERS.get(provider_id)
+    if preset is None and provider_id != "custom":
+        return _LOGIN_USAGE
+    if provider_id == "custom":
+        provider_id = input("provider 名（如 my-gateway）: ").strip()
+        if not provider_id:
+            print("[取消] provider 名不能为空。")
+            return "已取消登录。"
+        if provider_id in PROVIDERS:
+            return f"[错误] provider 名与预置重复：{provider_id}"
+    default_url = preset.base_url if preset else ""
+    suffix = f"（回车用 {default_url}）" if default_url else ""
+    base_url = input(f"base_url{suffix}: ").strip() or default_url
+    if not base_url:
+        print("[取消] base_url 不能为空。")
+        return "已取消登录。"
+    api_key = getpass("api_key（输入不回显）: ").strip()
+    if not api_key:
+        print("[取消] api_key 不能为空。")
+        return "已取消登录。"
+    default_model = preset.model if preset else ""
+    models, note = _discover(base_url, api_key)
+    if note:
+        print(note)
+    if models:
+        model = default_model if any(item.id == default_model for item in models) else models[0].id
+    else:
+        model = default_model or input("模型名: ").strip()
+        if not model:
+            print("[取消] 模型名不能为空。")
+            return "已取消登录。"
+        models = [ModelEntry(model)]
     config = ModelsConfig.load()
     try:
-        config.add(profile)
+        config.upsert(provider_id, ProviderEntry(base_url, api_key, model, models))
         config.save()
     except ValueError as exc:
         return f"[错误] {exc}"
-    note = "，已设为 active" if config.active == profile.name else ""
-    endpoint = f"{profile.model} @ {host_of(profile.base_url)}"
-    masked = mask_key(profile.api_key)
+    window = resolve_context_window(model, config.get(provider_id))
+    default_note = "，已设为默认启动模型" if config.active == f"{provider_id}/{model}" else ""
     return (
-        f"已录入 {profile.name}：{endpoint} · key {masked}{note}。/models {profile.name} 即刻切换。"
+        f"已登录 {provider_id}：{model} @ {host_of(base_url)} · "
+        f"窗口 {format_context_window(window)}{default_note}。/model 切换，Ctrl+S 设默认。"
     )
 
 
-def _models_remove(parts: list[str]) -> str:
+def _logout(ctx: CommandContext, arg: str) -> str:
+    provider_id = arg.strip()
+    if not provider_id:
+        return _LOGOUT_USAGE  # 无参：交互层先开选项器，非交互落到这里
     config = ModelsConfig.load()
     try:
-        removed = config.remove(parts[0])
+        removed = config.remove(provider_id)
         config.save()
-    except (ValueError, IndexError) as exc:
+    except ValueError as exc:
         return f"[错误] {exc}"
-    note = f"，active → {config.active}" if config.active else "（已无 profile）"
-    return f"已移除 {removed.name}{note}。"
+    note = ""
+    if getattr(ctx.agent.llm, "profile_name", None) == provider_id:
+        note = "；当前会话仍在使用该端点，重启后需重新 /login"
+    if config.active is None:
+        note += "；已无已登录 provider，请 /login"
+    return f"已登出 {provider_id}（{removed.model} @ {host_of(removed.base_url)}）{note}。"
 
 
-def _models(ctx: CommandContext, arg: str) -> str:
-    parts = arg.split()
-    if parts and parts[0] == "add":
-        return _models_add(ctx, parts[1:])
-    if parts and parts[0] == "remove":
-        return _models_remove(parts[1:])
+def _model(ctx: CommandContext, arg: str) -> str:
     config = ModelsConfig.load()
-    if not arg:
-        if not config.profiles:
-            return "还没有模型 profile：/models add 进向导录入（预设选名字，key 隐藏输入）。"
+    ref = arg.strip()
+    if not ref:
+        if not config.providers:
+            return "还没有登录任何 provider：/login 选厂商并输入 key（隐藏输入）。"
         rows = [
-            f"{'●' if p.name == config.active else '○'} {p.name} · {p.model} @ "
-            f"{host_of(p.base_url)} · key {mask_key(p.api_key)}"
-            for p in config.profiles
+            f"{'●' if item == config.active else '○'} {_model_label(config, item)}"
+            for item in config.refs()
         ]
-        return "模型 profile（/models <名字> 切换，对话保留；add/remove 录入移除）：\n" + "\n".join(
-            rows
-        )
-    profile = config.find(arg)
-    if profile is None:  # 双保险：_models_validate 已拦截未知名
-        return _MODELS_USAGE
-    # 动态 choices（/models）：无参走选项器/清单，生成器存活时不触碰会话
-    new_profile = profile_for(profile.model)
+        return "已登录模型（/model <provider/模型> 切换，Ctrl+S 设默认）：\n" + "\n".join(rows)
+    if "/" in ref:
+        provider_id, model = ref.split("/", 1)
+    else:
+        provider_id, model = ref, ""
+    entry = config.get(provider_id)
+    if entry is None:
+        return _MODEL_USAGE
+    model = model or entry.model
+    profile = profile_for(model)
+    window = resolve_context_window(model, entry)
+    # 动态 choices（/model）：无参走选项器/清单，生成器存活时不触碰会话
     ctx.agent.switch_model(
         LLM(
-            model=profile.model,
-            base_url=profile.base_url,
-            api_key=profile.api_key,
-            temperature=new_profile.temperature,
-            profile_name=profile.name,
+            model=model,
+            base_url=entry.base_url,
+            api_key=entry.api_key,
+            temperature=profile.temperature,
+            profile_name=provider_id,
         ),
-        new_profile,
+        profile,
+        window,
     )
-    config.use(arg)
-    config.save()  # 写回 active：下次启动沿用
     if ctx.renderer is not None:
         ctx.renderer.context_window = ctx.agent.context_window  # 状态行占用比例跟随
-    endpoint = f"{profile.name}（{profile.model} @ {host_of(profile.base_url)}）"
-    return f"已切换到 {endpoint}；对话保留，旧模型 thinking 已剥离。"
+    return (
+        f"已切换到 {provider_id}/{model}（窗口 {format_context_window(window)}）；"
+        "对话保留，旧模型 thinking 已剥离。"
+    )
 
 
 def _compact(ctx: CommandContext, arg: str) -> str:
@@ -683,12 +720,31 @@ COMMANDS = (
         validator=_rename_error,
     ),
     Command(
-        "/models",
-        "查看/切换/录入模型 profile（add 进交互向导）",
-        _models,
-        argument_hint="[profile|add|remove]",
+        "/login",
+        "登录 provider（选厂商 → base_url → 隐藏输 key → 发现模型）",
+        _login,
+        argument_hint="[provider|custom]",
+        choices_provider=_login_choices,
+        validator=_login_validate,
+        idle=True,
+    ),
+    Command(
+        "/logout",
+        "登出并移除 provider 凭据",
+        _logout,
+        argument_hint="<provider>",
+        choices_provider=_logout_choices,
+        validator=_logout_validate,
+        idle=True,
+    ),
+    Command(
+        "/model",
+        "切换模型（Ctrl+S 设为默认启动模型）",
+        _model,
+        aliases=("/models",),
+        argument_hint="[provider/模型]",
         choices_provider=_model_choices,
-        validator=_models_validate,
+        validator=_model_validate,
         idle=True,
     ),
     Command(

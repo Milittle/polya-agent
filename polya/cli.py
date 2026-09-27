@@ -31,7 +31,7 @@ from .agent import Agent
 from .builtin import CODING_SYSTEM_PROMPT, default_tools
 from .llm import LLM
 from .loop import run_repl, run_tool_call
-from .models import resolve_connection
+from .models import ModelsConfig, resolve_connection, resolve_context_window
 from .providers import profile_for
 from .render import TerminalRenderer, console, ui
 from .skills import SkillCatalog
@@ -138,13 +138,20 @@ def build_agent(
     """按 CLI 参数构建 Agent。``llm`` 参数供测试注入假实现。"""
     todos = TodoStore()
     if llm is None:
-        # 启动解析（票 14）：旗标 > active profile（~/.polya/models.json）> 环境变量。
-        # 模型档案决定温度等默认参数（o 系列不接受自定义温度），Agent 侧再用
-        # 同一份档案决定压缩策略与前缀纪律
+        # 启动解析（票 14/03）：旗标 > active provider（~/.polya/models.json）> 环境变量。
+        # 模型档案决定温度等默认参数（o 系列不接受自定义温度）；窗口走解析链
+        # （条目发现值 → 静态表 → 默认，票 03），显式 --context-window 优先。
+        config = ModelsConfig.load()
         model, base_url, api_key, profile_name = resolve_connection(
-            args.model, args.base_url, args.api_key
+            args.model, args.base_url, args.api_key, config
         )
         profile = profile_for(model)
+        active = config.active_entry()
+        context_window = (
+            args.context_window
+            if args.context_window is not None
+            else resolve_context_window(model, active[1] if active else None)
+        )
         llm = LLM(
             model=model,
             base_url=base_url,
@@ -154,6 +161,7 @@ def build_agent(
         )
     else:
         profile = profile_for(getattr(llm, "model", None))
+        context_window = args.context_window
     interactive = sys.stdin.isatty()
     # 项目信任门（trust.py，pi 模型）：未信任不加载项目资源（AGENTS.md / 项目
     # skills），防陌生仓库的指令注入；工具仍以进程权限在 root 内运行。
@@ -194,7 +202,7 @@ def build_agent(
         plan_capable=True,  # exit_plan_mode 构造时注册，/plan 随时切换而不动工具数组
         max_steps=args.max_steps,
         compress=not args.no_compress,
-        context_window=args.context_window,
+        context_window=context_window,
         micro_threshold=None if args.no_microcompact else 0.6,
         keep_recent=args.keep_recent,
         keep_recent_tokens=args.keep_recent_tokens,

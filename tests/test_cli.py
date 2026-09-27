@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from polya import Agent, tool
 from polya.cli import build_agent, main, parse_args
 from polya.loop import handle_command
-from polya.models import ModelsConfig, Profile
+from polya.models import ModelsConfig, ProviderEntry
 from polya.render import TerminalRenderer
 from polya.todos import TodoStore
 
@@ -199,7 +199,7 @@ def test_rule_and_prompt_message_lay_out():
 def test_build_agent_resolves_active_profile(tmp_path, monkeypatch):
     path = tmp_path / "models.json"
     config = ModelsConfig()
-    config.add(Profile("p", "https://x.example/v1", "sk-profile-key-1234", "m-x"))
+    config.add("p", ProviderEntry("https://x.example/v1", "sk-profile-key-1234", "m-x"))
     config.save(path)
     monkeypatch.setattr("polya.models.default_path", lambda: path)
     agent = build_agent(parse_args(["--root", str(tmp_path)]))
@@ -211,7 +211,7 @@ def test_build_agent_resolves_active_profile(tmp_path, monkeypatch):
 def test_build_agent_flags_override_active_profile_fieldwise(tmp_path, monkeypatch):
     path = tmp_path / "models.json"
     config = ModelsConfig()
-    config.add(Profile("p", "https://x.example/v1", "sk-profile-key-1234", "m-x"))
+    config.add("p", ProviderEntry("https://x.example/v1", "sk-profile-key-1234", "m-x"))
     config.save(path)
     monkeypatch.setattr("polya.models.default_path", lambda: path)
     agent = build_agent(parse_args(["--root", str(tmp_path), "--model", "flag-model"]))

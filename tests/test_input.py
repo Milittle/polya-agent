@@ -125,6 +125,118 @@ def test_enter_opens_picker_for_choice_commands(tmp_path):
         assert state.complete_index == 0  # 公开 CompletionState 构造预选首项
 
 
+def test_menu_reopens_after_backspace(tmp_path):
+    """打错的命令删回匹配前缀后，菜单要重新弹出。
+
+    PT 默认只在插入时触发自动补全；backspace 只清空状态不重启，菜单会一直
+    藏到下一次插入。"""
+    with make_box(tmp_path) as (box, pipe):
+
+        async def scenario():
+            task = asyncio.ensure_future(box.ask_async({}))
+            await until(lambda: box._session.app.is_running)
+            pipe.send_text("/heq")  # 无匹配：菜单收起
+            buffer = box._session.default_buffer
+            await until(lambda: buffer.complete_state is None)
+            await asyncio.sleep(0.1)  # 等补全任务彻底收敛（真实人手节奏），避免任务延迟掩盖 bug
+            assert buffer.complete_state is None
+            pipe.send_text("\x7f")  # backspace → "/he"
+            await until(
+                lambda: (
+                    buffer.complete_state is not None
+                    and [c.text for c in buffer.complete_state.completions] == ["/help"]
+                )
+            )
+            pipe.send_text("\x03")
+            await until(lambda: "已清空" in box._hint)
+            pipe.send_text("\x03")
+            pipe.send_text("\x03")
+            await until(lambda: task.done())
+
+        asyncio.run(scenario())
+
+
+def test_auto_popup_preselects_first_completion(tmp_path):
+    """输入过滤命中多个候选时，弹出即预选首项（CC/Codex 同款），而非空选。"""
+    with make_box(tmp_path) as (box, pipe):
+
+        async def scenario():
+            task = asyncio.ensure_future(box.ask_async({}))
+            await until(lambda: box._session.app.is_running)
+            pipe.send_text("/re")  # 命中 /reload /resume /rewind /rename
+            buffer = box._session.default_buffer
+
+            def picked():
+                state = buffer.complete_state
+                return (
+                    state is not None and len(state.completions) > 1 and state.complete_index == 0
+                )
+
+            await until(picked)
+            assert buffer.complete_state.completions[0].text == "/reload"
+            pipe.send_text("\x03")
+            await until(lambda: "已清空" in box._hint)
+            pipe.send_text("\x03")
+            pipe.send_text("\x03")
+            await until(lambda: task.done())
+
+        asyncio.run(scenario())
+
+
+def test_full_command_closes_menu_without_zombie(tmp_path):
+    """打全命令名（唯一无增量补全）菜单应关闭，且后续回删还能重开（僵尸回归）。"""
+    with make_box(tmp_path) as (box, pipe):
+
+        async def scenario():
+            task = asyncio.ensure_future(box.ask_async({}))
+            await until(lambda: box._session.app.is_running)
+            pipe.send_text("/help")  # 唯一补全无增量 → 菜单收起
+            buffer = box._session.default_buffer
+            await until(lambda: buffer.complete_state is None)
+            await asyncio.sleep(0.1)
+            pipe.send_text("\x7f")  # 回删 → "/hel"：若状态僵尸化，重启会被拦截
+            await until(
+                lambda: (
+                    buffer.complete_state is not None
+                    and [c.text for c in buffer.complete_state.completions] == ["/help"]
+                )
+            )
+            pipe.send_text("\x03")
+            await until(lambda: "已清空" in box._hint)
+            pipe.send_text("\x03")
+            pipe.send_text("\x03")
+            await until(lambda: task.done())
+
+        asyncio.run(scenario())
+
+
+def test_escape_closes_menu_and_it_stays_closed(tmp_path):
+    """Esc 关菜单后不能自动重开：cancel 会恢复文本，若文本变化驱动不区分
+    cancel 与人工编辑，菜单会立刻弹回，永远关不掉。"""
+    with make_box(tmp_path) as (box, pipe):
+
+        async def scenario():
+            task = asyncio.ensure_future(box.ask_async({}))
+            await until(lambda: box._session.app.is_running)
+            pipe.send_text("/re")  # 菜单弹出（多候选，预选首项）
+            buffer = box._session.default_buffer
+            await until(
+                lambda: buffer.complete_state is not None and buffer.complete_state.completions
+            )
+            pipe.send_text("\x1b")  # Esc 关闭
+            await until(lambda: buffer.complete_state is None)
+            await asyncio.sleep(0.2)
+            assert buffer.complete_state is None  # 不回弹
+            assert buffer.text == "/re"  # 关闭不改动输入
+            pipe.send_text("\x03")
+            await until(lambda: "已清空" in box._hint)
+            pipe.send_text("\x03")
+            pipe.send_text("\x03")
+            await until(lambda: task.done())
+
+        asyncio.run(scenario())
+
+
 def test_tab_selects_first_completion_and_enter_runs_it(tmp_path):
     with make_box(tmp_path) as (box, pipe):
 
@@ -212,6 +324,31 @@ def test_at_completer_ignores_plain_text(tmp_path):
     assert list(completer.get_completions(Document("读一下 src/ap"), None)) == []
 
 
+# ---------- 补全菜单样式 ----------
+
+
+def test_completion_menu_style_is_background_free():
+    """菜单样式裁决（原型变体 B）：无底色、无反白；选中行亮青加粗。
+
+    PT 默认会给菜单浅灰块、选中行白底反白；漏写任一类都会渗透回默认色块。"""
+    from prompt_toolkit.styles import Style, merge_styles
+    from prompt_toolkit.styles.defaults import default_ui_style
+
+    from polya.input import MENU_STYLE
+
+    merged = merge_styles([default_ui_style(), Style.from_dict(MENU_STYLE)])
+    current = merged.get_attrs_for_style_str(
+        "class:completion-menu class:completion-menu.completion.current"
+    )
+    meta = merged.get_attrs_for_style_str(
+        "class:completion-menu class:completion-menu.meta.completion"
+    )
+    for attrs in (current, meta):
+        assert attrs.bgcolor in (None, "default"), attrs
+        assert not attrs.reverse, attrs
+    assert current.bold and current.color == "ansibrightcyan"
+
+
 # ---------- 状态栏 ----------
 
 
@@ -221,12 +358,19 @@ def _bar_text(box) -> str:
 
 def test_bottom_bar_shows_state_and_hints(tmp_path):
     with make_box(tmp_path) as (box, _):
-        box._state = {"mode": "规划", "model": "deepseek-chat", "context": "12.8k/128k", "rules": 2}
+        box._state = {
+            "mode": "规划",
+            "model": "deepseek-chat",
+            "window": "128k",
+            "context": "ctx 12%",
+            "rules": 2,
+        }
         text = _bar_text(box)
         for part in ("规划", KEY_HINTS):
             assert part in text, part
         environment = "".join(t for _, t in box._environment_bar())
-        assert "deepseek-chat" in environment and "12.8k/128k" in environment
+        for part in ("deepseek-chat", "128k", "ctx 12%"):
+            assert part in environment, part
 
         box._flash_hint("再按一次 Ctrl+C 退出")
         assert "再按一次 Ctrl+C 退出" in _bar_text(box)
@@ -279,6 +423,7 @@ def test_footer_preserves_model_project_and_topic_with_unicode(tmp_path, width):
         box = InputBox(tmp_path / "history", input=pipe, output=Output())
         box._state = {
             "model": "test-model",
+            "window": "200k",
             "project": "/very/long/parent/项目",
             "topic": "修复输入框和工具反馈",
             "context": "ctx 23%",
@@ -290,7 +435,8 @@ def test_footer_preserves_model_project_and_topic_with_unicode(tmp_path, width):
         assert "test-model" in environment and "项目" in environment
         assert "修" in footer and "normal" in footer
         if width >= 80:
-            assert "ctx 23%" in environment and "修复输入框和工具反馈" in footer
+            assert "200k" in environment and "ctx 23%" in environment
+            assert "修复输入框和工具反馈" in footer
 
 
 def test_working_bar_uses_actual_phase(tmp_path):

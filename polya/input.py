@@ -1,6 +1,6 @@
 """常驻多行输入：编辑、补全、粘贴折叠和自适应状态栏。
 
-同步 ask() 用于独立输入，ask_async()/suspend() 支持后台任务与 /models 向导的终端
+同步 ask() 用于独立输入，ask_async()/suspend() 支持后台任务与 /login 向导的终端
 让位。草稿以 Document 保留光标，粘贴登记直到提交才清空。状态由驱动注入。
 """
 
@@ -32,6 +32,17 @@ from .filefind import ProjectFiles
 PASTE_FOLD_THRESHOLD = 10  # 粘贴超过此行数即折叠为占位符
 QUIT_WINDOW_S = 2.0  # 空框双击 Ctrl+C 的判定窗口（秒）
 KEY_HINTS = "Enter 发送 · /help"
+
+# 补全菜单样式（2026-09 样式原型裁决，变体 B「极简暗色」）：无底色，未选中
+# 暗灰、选中亮青加粗。每个类都显式 bg:default——PT 默认样式是浅灰块 +
+# 选中白底反白，漏写任一类都会渗透回默认色块（见 issues/01-menu-style.md）。
+MENU_STYLE: dict[str, str] = {
+    "completion-menu": "bg:default fg:#808080 noreverse",
+    "completion-menu.completion": "bg:default",
+    "completion-menu.completion.current": "bg:default fg:ansibrightcyan bold noreverse",
+    "completion-menu.meta.completion": "bg:default fg:#5f5f5f",
+    "completion-menu.meta.completion.current": "bg:default fg:#d7d7d7",
+}
 
 
 def _display_width(text: str) -> int:
@@ -142,6 +153,7 @@ class InputBox:
         self._state: dict = {}
         self.on_interrupt = lambda: None
         self.on_dequeue = lambda: ""  # Alt+Up：由驱动提供排队消息文本
+        self.on_set_default = lambda ref: ""  # Ctrl+S：由驱动写默认模型并返回提示
         self.last_kind = "steering"  # 上次提交语义：steering（Enter）/ follow-up（Alt+Enter）
         self.preview = lambda width, max_lines: ""
         self._draft = Document("")
@@ -150,6 +162,7 @@ class InputBox:
         self._last_cancel = 0.0
         self._hint = ""
         self._hint_until = 0.0
+        self._menu_complete = False  # Tab 发起的 menu-complete 运行标记（见 _tab）
         # rg 索引懒构建：不触发 @ 补全的会话不会运行子进程（测试与非交互路径零成本）。
         self._files = files or ProjectFiles(Path.cwd())
         self._session = self._build(history_path, input, output)
@@ -210,6 +223,23 @@ class InputBox:
             # Ctrl+J：换行（Enter=发送，Alt+Enter=追加）
             event.current_buffer.insert_text("\n")
 
+        @bindings.add("c-s")
+        def _save_default(event):
+            # Ctrl+S：在 /model 选项器里把当前高亮设为默认启动模型（票 05）；
+            # 返回值由驱动提供（写 models.json.active），空串表示未处理。
+            buffer = event.current_buffer
+            state = buffer.complete_state
+            command, _ = parse_command(buffer.text)
+            if command is None or command.name != "/model" or state is None:
+                return
+            completion = state.current_completion
+            if completion is None:
+                return
+            message = self.on_set_default(completion.text)
+            if message:
+                self._flash_hint(message)
+            event.app.invalidate()
+
         @bindings.add("enter")
         def _enter(event):
             self._submit(event.current_buffer, "steering")
@@ -237,9 +267,10 @@ class InputBox:
             if state is not None and state.completions:
                 buffer.apply_completion(state.current_completion or state.completions[0])
             else:
-                # select_first=True：Tab 打开菜单即预选中第一项（对齐 CC/Codex）。
-                # 勿用 on_completions_changed 钩子做自动弹出的预选中——加载期设
-                # complete_index 会废掉库的「唯一无增量补全重置」，留下僵尸菜单。
+                # select_first=True：Tab 打开菜单即插入首项（menu-complete，对齐
+                # CC/Codex）。_menu_complete 标记让 _preselect_first 钩子给这条
+                # 显式路径让路（钩子先改 index 会废掉库的插入与无增量重置）。
+                self._menu_complete = True
                 buffer.start_completion(select_first=True)
 
         @bindings.add("c-c")
@@ -274,6 +305,9 @@ class InputBox:
             prompt_continuation=lambda width, number, soft: [("class:continuation", "  ")],
             erase_when_done=True,
             refresh_interval=0.5,
+            # 自动补全统一由下方 _auto_complete 驱动（插入与删除都触发）；
+            # 库自带的 insert 驱动只覆盖插入且重复起任务，关掉保持单一来源。
+            complete_while_typing=False,
             placeholder=[("class:placeholder", "输入任务，或用 @ 引用文件")],
             style=Style.from_dict(
                 {
@@ -282,6 +316,7 @@ class InputBox:
                     "bottom-toolbar": "bg:default fg:ansibrightblack",
                     "continuation": "dim",
                     "placeholder": "dim",
+                    **MENU_STYLE,
                 }
             ),
             history=FileHistory(str(history_path)),
@@ -301,6 +336,49 @@ class InputBox:
         main = container.children[0].alternative_content  # type: ignore[attr-defined]
         main.floats[0].content = CompletionsMenu(extra_filter=to_filter(False))
         buffer = session.default_buffer
+
+        # PT 只在插入时重启自动补全：打错回删到匹配前缀后菜单不会回来。
+        # 改由文本变化驱动（插入与删除都触发），触发条件与两个 completer
+        # 的入口条件对齐：行首单行命令，或光标前 @ 开头的词。
+        def _auto_complete(buffer) -> None:
+            self._menu_complete = False  # 任何文本变化都终结 Tab 发起的补全运行
+            document = buffer.document
+            if document.text.startswith("/"):
+                wants = "\n" not in document.text and not document.text_after_cursor
+            else:
+                before = document.text_before_cursor
+                token = before.rsplit(None, 1)[-1] if before.split() else ""
+                wants = token.startswith("@")
+            if wants:
+                buffer.start_completion()
+
+        # 自动弹出即预选首项（CC/Codex 同款）。不能用 start_completion(
+        # select_first=True)：那是 menu-complete 语义，会把首项增量写进输入框；
+        # 也不能无守卫地在加载期改 complete_index——会废掉库对「唯一无增量
+        # 补全」（打全命令名）的重置，留下僵尸菜单。这里同步复刻同一条
+        # 判定：命中即让路，由库收起菜单。
+        def _preselect_first(buffer) -> None:
+            state = buffer.complete_state
+            if state is None:
+                self._menu_complete = False  # 空结果重置：Tab 运行已结束，撤销标记
+                return
+            if self._menu_complete:
+                return  # Tab 的 select_first 路径由库收尾（含插入与无增量重置）
+            if state.complete_index is not None or not state.completions:
+                return
+            document = buffer.document
+            first = state.completions[0]
+            replaced = document.text_before_cursor[
+                len(document.text_before_cursor) + first.start_position :
+            ]
+            if len(state.completions) == 1 and replaced == first.text:
+                return  # 唯一无增量：让库重置状态并收起菜单
+            state.complete_index = 0
+
+        buffer.on_text_changed.add_handler(_auto_complete)
+        buffer.on_completions_changed.add_handler(_preselect_first)
+
+        buffer.on_text_changed.add_handler(_auto_complete)
 
         def menu_visible() -> bool:
             state = buffer.complete_state
@@ -382,23 +460,40 @@ class InputBox:
         return [("class:rule", _fit(text, width))]
 
     def _environment_bar(self) -> list:
-        """Keep model and project identity visible before optional context usage."""
-        width = max(0, self._session.output.get_size().columns - 2)
+        """Model · window · project stay visible before the optional context usage.
+
+        窗口大小（票 01）在第二零刻即有值（cli 启动时灌入 renderer.context_window），
+        首次请求后由 `_status` 追加 `ctx N%`。
+        """
+        width = max(0, self._session.output.get_size().columns - 3)
         model = self._state.get("model") or "—"
+        window = self._state.get("window")
         project = self._state.get("project") or "—"
         home = str(Path.home())
         if project == home or project.startswith(home + "/"):
             project = "~" + project[len(home) :]
         context = self._state.get("context")
-        full = f"{model} · {project}"
-        if context and get_cwidth(full + " · " + context) <= width:
-            full += " · " + context
+
+        def compose(with_window: bool, with_context: bool) -> str:
+            segments = [model]
+            if with_window and window:
+                segments.append(window)
+            segments.append(project)
+            if with_context and context:
+                segments.append(context)
+            return " · ".join(segments)
+
+        full = compose(True, True)
+        if get_cwidth(full) > width:
+            full = compose(True, False)  # 窄屏先舍 ctx%（启动时本来也没有）
+        if get_cwidth(full) > width:
+            full = compose(False, False)  # 再舍窗口，保住模型与目录两个身份
         if get_cwidth(full) > width:
             available = max(0, width - 3)
             basename_width = get_cwidth(Path(project).name or project)
             reserved_project = min(basename_width, max(1, available // 2))
-            model_width = min(get_cwidth(model), max(1, available - reserved_project))
-            project_width = max(0, available - model_width)
+            head_width = min(get_cwidth(model), max(1, available - reserved_project))
+            project_width = max(0, available - head_width)
             # Keep the project basename/suffix when its parents don't fit.
             if get_cwidth(project) > project_width:
                 tail = ""
@@ -407,13 +502,13 @@ class InputBox:
                         break
                     tail = char + tail
                 project = ("…" + tail) if project_width else ""
-            full = f"{_fit(model, model_width)} · {project}"
+            full = f"{_fit(model, head_width)} · {project}"
         return [("class:rule", "  " + _fit(full, width))]
 
     def _bottom_bar(self) -> list:
         """Session identity on the left, mode and context-sensitive actions on the right."""
         state = self._state
-        width = max(0, self._session.output.get_size().columns - 2)
+        width = max(0, self._session.output.get_size().columns - 3)
         busy = state.get("busy", False)
         mode = state.get("mode", "normal")
         if state.get("queued"):
@@ -492,15 +587,19 @@ class InputBox:
                 # （prompt_toolkit 3.0.53 验证）；complete_index=0 预选首项。
                 buffer.complete_state = CompletionState(buffer.document, completions, 0)
                 buffer.on_completions_changed.fire()
-                self._flash_hint("选择选项后 Enter 执行 · Esc 关闭")
+                hint = "选择选项后 Enter 执行 · Esc 关闭"
+                if command.name == "/model":
+                    hint = "Enter 切换 · Ctrl+S 设为默认 · Esc 关闭"
+                self._flash_hint(hint)
                 return
         buffer.validate_and_handle()
 
     def _current_choice(self, name: str) -> str:
         if name == "/plan":
             return "on" if self._state.get("mode") == "plan" else "off"
-        if name == "/models":
-            return self._state.get("profile") or ""
+        if name == "/model":
+            profile, model = self._state.get("profile"), self._state.get("model")
+            return f"{profile}/{model}" if profile and model else (model or "")
         if name == "/thinking":
             return self._state.get("thinking") or ""
         return ""

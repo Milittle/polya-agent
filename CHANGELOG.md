@@ -83,6 +83,10 @@ other message keeps revising it read-only.
 
 ### Changed
 
+- Completion menu now renders background-free in dim gray with the selected row in
+  bold bright cyan (variant B of the 2026-09 style prototype), replacing the
+  prompt_toolkit default light-gray block; every class sets `bg:default` explicitly
+  so the defaults cannot bleed through.
 - Tool descriptions, snippets, and guidelines are localized: docstrings remain the
   Chinese source, English overrides live in the catalog, and snippets/guidelines are
   selected by `POLYA_LANG`.
@@ -90,6 +94,15 @@ other message keeps revising it read-only.
 - Invalid tool-argument JSON is reported back to the model instead of being silently
   treated as `{}`.
 - Context-size estimation caches the static prompt/tool-schema part and per-message sizes.
+- `/login` and `/logout`: a provider table (first batch of 8 groups from pi's
+  OpenRouter/DeepSeek/z.ai/Moonshot/Groq/Together/NVIDIA/Qwen catalog) logs in by
+  name, prefills the base URL (overridable), asks for the key via getpass, then asks
+  the endpoint's `/models` for the model list and auto-selects the provider default.
+- `/model`: a picker across every logged-in provider and discovered model; `Ctrl+S`
+  saves the highlighted model as the default startup model.
+- Context windows resolve through discovered endpoint metadata (`context_length` /
+  `max_model_len`) → the built-in capability table → 128k; the resolved value drives
+  compaction, not just the footer.
 - Compaction and micro-compaction now operate on the projection: originals stay in the
   tree and are readable by entry id; the system prompt supports named-section patching
   replayed at projection time.
@@ -107,6 +120,17 @@ other message keeps revising it read-only.
 - Commands are a flat registry; the `busy` three-state and queue pause/resume were
   removed. Session-rewriting commands (`/clear`, `/new`, `/exit`, …) require an idle
   agent and ask for Esc first.
+- The startup banner now reports identity only (version, tagline, project memory /
+  trust), dropping the model, directory and `/help` that the persistent footer already
+  shows. The first footer line adds the model's context window next to the model
+  (`model · 200k · dir`), appending `ctx N%` after the first request; on narrow
+  terminals it drops `ctx%` first, then the window. Both footer lines leave a
+  one-column right margin so the last character is no longer clipped at the edge.
+- `~/.polya/models.json` now keys credentials by provider id with a discovered model
+  catalog (`{active: "provider/model", providers: {id: {base_url, api_key, model,
+  models: [{id, context_window}]}}}`); old free-form `profiles` migrate automatically.
+  Startup resolution is CLI flags > default model (`active`) > `OPENAI_*` env vars.
+  `/models` remains as an alias of `/model`; switching no longer rewrites the default.
 
 ### Removed
 
@@ -116,8 +140,17 @@ other message keeps revising it read-only.
 - `/expand`: merged into `/details [ID]` (no argument shows the last five blocks).
 - `Tool.dangerous` compatibility shim (use `Tool.kind`).
 - `demo.py` / `quicksort.py` moved into `examples/`.
+- `/models add` / `/models remove` and the profile wizard: replaced by `/login` and
+  `/logout`; `/models` is kept only as an alias of `/model`.
 - `polya/history.py` (`HistoryArchive`): whole-history snapshots replaced by per-entry
   immutability + entry-id read-back.
+
+### Fixed
+
+- Completion menu now reopens after deleting back to a matching prefix (prompt_toolkit
+  only restarts completion on insertion, not deletion) and auto-popup preselects the
+  first candidate without inserting its text; Tab keeps its insert-first behavior and
+  typing a full command name still closes the menu.
 
 ## [0.1.0] - 2026-09-26
 

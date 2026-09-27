@@ -36,31 +36,28 @@ Prompts and user-facing messages are localized via `POLYA_LANG` (`zh` default, `
 available). The prompts are evaluated at import time, so the choice is stable for the
 whole session and the KV-cache prefix stays intact.
 
-For multiple providers or coding plans, register named profiles entirely inside
-the REPL — `/models add` opens an interactive wizard (stored in
-`~/.polya/models.json`, mode 0600; the key is entered via getpass while the input
-box yields the terminal, so it never reaches the screen or input history —
-listings show only the last four characters):
+For multiple providers or coding plans, log in entirely inside the REPL. `/login`
+opens the provider list (first batch: OpenRouter, DeepSeek, z.ai global/CN,
+Moonshot global/CN, Groq, Together, NVIDIA, Qwen Token Plan global/CN, plus a
+custom OpenAI-compatible endpoint). The base URL is prefilled from the provider
+table and can be overridden; the key is entered via getpass while the input box
+yields the terminal, so it never reaches the screen or input history. Credentials
+live in `~/.polya/models.json` (mode 0600):
 
 ```
-/models add
-  可用预设（已知厂商内置，选名字即可）：
-    1. z.ai coding plan（国际） · glm-5.3 @ api.z.ai
-    2. z.ai coding plan（国内 bigmodel） · glm-5.3 @ open.bigmodel.cn
-    3. DeepSeek API · deepseek-flash @ api.deepseek.com
-    4. OpenRouter（跨厂商） · （自填模型名） @ openrouter.ai
-    5. Moonshot Kimi · （自填模型名） @ api.moonshot.cn
-    6. 自定义 OpenAI 兼容端点
-/models add ds deepseek            # one-line shortcut: preset + hidden key
-/models add box http://localhost:8000/v1 qwen3   # custom endpoint shortcut
-/models remove ds
+/login zai
+  base_url（回车用 https://api.z.ai/api/coding/paas/v4）:
+  api_key（输入不回显）:
+已登录 zai：glm-5.3 @ api.z.ai · 窗口 1M，已设为默认启动模型。/model 切换，Ctrl+S 设默认。
 ```
 
-Presets are just prefilled `base_url` + suggested model — any OpenAI-compatible
-endpoint fits the same triple. Startup resolution: CLI flags > active profile >
-`OPENAI_*` env vars. In the REPL, `/models` switches mid-session (no arguments
-opens a picker): the conversation is kept, the old model's thinking is stripped,
-and the choice is written back as `active`.
+After login, Polya asks the provider's `/models` endpoint for the model list and
+reads context windows when the endpoint reports them (`context_length` /
+`max_model_len`); otherwise the built-in capability table applies. Resolution:
+discovered value > built-in table > 128k. `/model` switches mid-session (no
+arguments open a picker across every logged-in model; `Ctrl+S` saves the default
+startup model). `/logout <provider>` removes credentials. Startup resolution:
+CLI flags > default model (`active`) > `OPENAI_*` env vars.
 
 ## CLI
 
@@ -82,7 +79,7 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 |---|---|
 | `Enter` | send (steering: injected before the next model request) |
 | `Alt+Enter` | queue a follow-up (runs after the current task) · `Ctrl+J` / trailing `\` + Enter: newline |
-| `/help` `/todos` `/status` `/plan on\|go\|off` `/models [profile]` `/thinking [level]` `/compact [note]` `/details [ID]` `/resume [name]` `/fork <id>` `/clone` `/export [path]` `/import <path>` `/trust [decision]` `/clear` `/new` `/exit` | slash commands (`/` completes with descriptions) |
+| `/help` `/todos` `/status` `/plan on\|go\|off` `/login [provider\|custom]` `/logout <provider>` `/model [provider/model]` `/thinking [level]` `/compact [note]` `/details [ID]` `/resume [name]` `/fork <id>` `/clone` `/export [path]` `/import <path>` `/trust [decision]` `/clear` `/new` `/exit` | slash commands (`/` completes with descriptions) |
 | `@` | file-path completion |
 | `!command` | run a shell command locally; output goes into the conversation |
 | `#note` | append a line to the project memory file (`AGENTS.md`) |
@@ -91,17 +88,17 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 | `Ctrl+C` | clears the input; press twice within 2s on an empty box to quit |
 | big paste | folds to `[Pasted #1 +200 lines]`, expanded again on submit |
 
-`/plan` and `/models` without arguments open options in the input
-box; the current value is marked (the `/models` picker also offers `add` for the
-setup wizard and `remove`). Choose with arrows and Tab/Enter, then Enter to
-execute; Esc closes the menu. You can also type `/plan on|go|off`
-or `/models <profile>`
-directly, with argument completion. Invalid commands and arguments stay in the
+`/plan`, `/login`, `/logout` and `/model` without arguments open options in the
+input box; the current value is marked. `Ctrl+S` inside the `/model` picker saves
+the highlighted model as the default startup model. Choose with arrows and
+Tab/Enter, then Enter to execute; Esc closes the menu. You can also type
+`/plan on|go|off`, `/login zai`, `/logout zai` or `/model zai/glm-5.3` directly,
+with argument completion. Invalid commands and arguments stay in the
 editor with a hint; `/details [ID]` takes an optional positive integer (no argument shows
 the last five blocks).
 `/help` lists all commands and aliases from the same flat registry. Commands run
 immediately; the ones that rewrite the session (`/clear`, `/new`, `/exit`, `/compact`,
-`/rewind`, `/jump`, `/edit`, `/load`, `/resume`, `/fork`, `/clone`, `/import`, `/models`, `/reload`, `/save`)
+`/rewind`, `/jump`, `/edit`, `/load`, `/resume`, `/fork`, `/clone`, `/import`, `/model`, `/reload`, `/save`)
 need an idle agent
 and ask you to press Esc first when a task is running. In a piped REPL, supply options
 explicitly.
@@ -192,12 +189,15 @@ the input; `-p` retains Ctrl+C interruption.
 
 ### Display
 
-The startup header shows the version, project and model once, then scrolls away.
-A persistent input area sits below the conversation, with adjoining rules and a
-two footer lines. It grows to six lines, then scrolls internally. The first footer
-shows model, project directory and optional context usage; the second shows the
-session topic, mode, queue state and action hints. Narrow terminals shorten paths
-from the left to retain the project name, and shorten the topic before hiding context.
+The startup header shows the version, tagline and project-level status (AGENTS.md
+loaded, or an untrusted-directory warning) once, then scrolls away. A persistent
+input area sits below the conversation, with adjoining rules and two footer lines.
+It grows to six lines, then scrolls internally. The first footer shows model, its
+context window and the project directory, then appends `ctx N%` once the first
+request reports usage; the second shows the session topic, mode, queue state and
+action hints. Narrow terminals drop `ctx%` first, then the window, keep model and
+project, shorten paths from the left to retain the project name, and shorten the
+topic before hiding context.
 `/rename <topic>` changes the topic and terminal title (one line, up to 120 characters).
 `/clear` preserves the topic; `/new` resets it. The topic starts from the first task,
 without an extra model request.
@@ -290,7 +290,8 @@ Notable knobs:
   `/new`; they are not conversation persistence. When tool-only compaction has no
   targets, a full summary restart can compact the remaining conversation.
 - `ModelProfile` (providers): capability-driven behavior — reasoning passthrough,
-  in-place tool edit vs summary restart, context window and temperature defaults.
+  in-place tool edit vs summary restart, and temperature defaults. Its context
+  window is the static fallback layer under discovered provider values.
   Unknown models fall back to safe defaults.
 - `Agent(prefix_check=True)`: runtime assert that each request strictly extends the
   previous one (append-only between compaction points).
@@ -355,7 +356,7 @@ polya/
   executor.py    # shared tool executor (loop and run())
   cli.py         # argparse + assembly + one-shot mode
   llm.py         # OpenAI-compatible client; chat_iter streaming
-  models.py      # model profiles (~/.polya/models.json): load/save/validate, presets
+  models.py      # provider config (~/.polya/models.json): load/save/validate/migrate, presets, discovery
   skills.py      # skill discovery, metadata catalog and read-only resource loading
   history.py     # temporary pre-compaction history snapshots and paginated reads
   tools.py       # @tool decorator & registry (kind: read/write/exec)
