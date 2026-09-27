@@ -20,7 +20,7 @@ ADR 0007 把单轮预算从硬上限改成软检查点，并允许 `--max-steps 
    （复用 `last_run_exhausted`，`-p` 输出 `[未完成]` + 退出码 1）。
 4. **与预算独立**：`max_steps` / `max_continuations` 管「轮数里程碑」，熔断管「无进展」，
    两者正交；`--max-steps 0` 时熔断仍生效，是唯一护栏。
-5. **默认策略**：CLI 默认开启（`--loop-repeat-limit N` 调阈值，`0` 关闭）；`Agent()`
+5. **默认策略**：CLI 始终开启、不设开关（阈值用 Agent 默认 3）；`Agent()`
    库默认关（与 `compress` 同款：库保守、CLI 开启）；子代理不启用（已有 `max_steps=20`
    硬边界，不叠加）。
 6. **状态每任务**：streak 挂在单次 `steps()` 运行，任务结束清零、不落盘。

@@ -71,7 +71,6 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 (start in plan mode), `--trust` / `--no-trust` (save and apply a project-trust decision;
 `--trust` is needed for non-interactive runs in a fresh directory), `--max-steps N` (default 100;
 soft checkpoint that auto-continues, `0` = unbounded), `--max-continuations N` (default 4),
-`--loop-repeat-limit N` (no-progress breaker, default 3; `0` disables),
 `--model/--base-url/--api-key`, `--no-stream`, `--no-compress`, `--no-microcompact`,
 `--context-window N` (default 128000), `--keep-recent N`, `--keep-recent-tokens N`,
 `--reserve-tokens N` (absolute compaction reserve, default 16384), `--prefix-check`.
@@ -180,10 +179,9 @@ effect on the next start. Non-interactive runs never prompt; use `--trust` / `--
 for an explicit decision (`--trust` also loads project resources when none is saved).
 `/permissions` and session authorization rules are gone.
 
-**No-progress breaker** (default on) watches for the same tool call repeated with
-identical arguments: the `--loop-repeat-limit`-th (default 3) repetition nudges the
-model, and the next one stops the turn resumably (history preserved; send another
-message to continue). It is independent of `--max-steps` — with `--max-steps 0` it is
+**No-progress breaker** (always on) watches for the same tool call repeated with
+identical arguments: the third repetition nudges the model, and the next one stops the
+turn resumably (history preserved; send another message to continue). It is independent of `--max-steps` — with `--max-steps 0` it is
 the only guard — and waiting tools like `bash_output` polling are exempt (`Tool.poll`).
 
 **Plan mode** is a two-phase read-only stance. `exit_plan_mode` prints the plan to

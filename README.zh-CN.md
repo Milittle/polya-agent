@@ -70,8 +70,7 @@ uv run polya -p "修复 pytest 失败的测试" --plan   # 单任务模式：执
 规划模式、`--trust` / `--no-trust` 保存并应用项目信任决定（`--trust` 加载其 `AGENTS.md` / 项目 skills，非交互场景必需）、
 `--max-steps N`（默认 100；软检查点，到点自动续跑，0 表示无界）、
 `--max-continuations N`（检查点后自动续跑次数，默认 4）、
-`--loop-repeat-limit N`（无进展熔断：同工具同参数连续重复达该次数先提醒、再犯即停止；
-0 关闭，默认 3）、`--model/--base-url/
+`--model/--base-url/
 --api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启）、`--no-microcompact`
 关闭微压缩、`--context-window N`
 （默认 128000）、`--keep-recent N`
@@ -244,10 +243,10 @@ agent = Agent(
 - `max_steps` 是**软检查点周期**而非硬上限：每走满该轮数发一次 `BudgetCheckpoint` 并
   自动续跑，连跳 `max_continuations` 次后发 `BudgetExhausted` 收尾（历史完整保留，发下一条
   消息即可继续）；`max_steps=0` 表示无界（pi 语义）。不再抛「超过最大步数」。
-- **无进展熔断**（CLI 默认开启）：同一工具、同一参数**连续**重复时，第
-  `--loop-repeat-limit`（默认 3）次把提醒拼进工具结果，再犯即**可续停止**（历史保留，
-  发消息可继续）。与 `max_steps` 独立，`--max-steps 0` 下仍生效；`bash_output` 等
-  `poll` 等待工具豁免（相同参数的轮询是合法等待）；`--loop-repeat-limit 0` 关闭。
+- **无进展熔断**（始终开启，无 CLI 开关）：同一工具、同一参数**连续**重复时，第 3 次把
+  提醒拼进工具结果，再犯即**可续停止**（历史保留，发消息可继续）。与 `max_steps` 独立，
+  `--max-steps 0` 下仍生效；`bash_output` 等 `poll` 等待工具豁免（相同参数的轮询是合法
+  等待）。阈值等策略在库 API `Agent(loop_guard=..., loop_repeat_limit=...)` 可调。
 - `status_bar=True` 开启 Agent 状态栏：每轮迭代以 user 消息在上下文**末尾**追加
   `<agent_status>` 元信息（迭代号、各工具累计调用次数、token 用量、时间），工具结果
   也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易

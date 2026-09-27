@@ -22,12 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- No-progress breaker: repeating the same tool call with identical arguments
-  (`--loop-repeat-limit`, default 3) first nudges the model (the nudge is appended to
-  the tool result), then stops the turn resumably; `--loop-repeat-limit 0` disables it. It is
+- No-progress breaker (always on, no CLI switch): repeating the same tool call with
+  identical arguments first nudges the model at the third repetition (the nudge is
+  appended to the tool result), then stops the turn resumably on the next one. It is
   independent of `--max-steps` and stays active with `--max-steps 0`. Waiting tools are
   exempt via the new `Tool.poll` flag (e.g. `bash_output` polling); sub-agents keep
-  their hard `max_steps` bound instead.
+  their hard `max_steps` bound instead. The limit stays tunable through the library API
+  (`Agent(loop_guard=…, loop_repeat_limit=…)`).
 - `/new`, `/clear` and `/reset` now wipe the screen (erase display + cursor home)
   before reprinting the startup banner, so the terminal reads like a freshly
   launched session instead of stacking on the old scrollback.
