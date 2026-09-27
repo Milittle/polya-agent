@@ -151,16 +151,19 @@ def test_status_computes_uncached_input_and_cost(tmp_path):
         assert session.state["subscribed"] is False
 
 
-def test_clear_keeps_session_identity_and_queue(tmp_path):
-    with session_for(tmp_path, FakeLLM([])) as (session, _, _):
+def test_clear_alias_starts_fresh_session_and_drops_queue(tmp_path):
+    with session_for(tmp_path, FakeLLM([])) as (session, _, output):
+        session.agent.history.append({"role": "user", "content": "stale"})
         session.topic = "old-topic"
         session.state["busy"] = True
         session._submit_input("later message")
         session.state["busy"] = False
         session._local("/clear")
-        assert session.topic == "old-topic"
-        assert list(session.steering) == ["later message"]
-        assert not session.agent.history
+        assert not session.agent.history and session.topic is None
+        assert not session.steering and not session.follow_up
+        assert session.state["queued"] == 0
+        assert "已开始新会话" in output.getvalue()
+        assert "已丢弃 1 条排队消息" in output.getvalue()
 
 
 def test_new_resets_topic_queue_and_reprints_banner(tmp_path):
@@ -394,18 +397,16 @@ def test_task_timer_survives_tool_events_and_resets_for_new_task(tmp_path, monke
         assert session.state["started_at"] == 120.0
 
 
-def test_session_identity_rename_clear_and_new(tmp_path):
+def test_session_identity_rename_and_new_session(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
         assert session.state["project"] == str(tmp_path)
         session._local("/rename 修复输入框")
         assert session.topic == session.state["topic"] == "修复输入框"
-        session._local("/clear")
-        assert session.state["topic"] == "修复输入框"
         session._local("/rename")
         assert session.topic == "修复输入框"
         session._local("/rename bad\x1btitle")
         assert session.topic == "修复输入框"
-        session._local("/new")
+        session._local("/clear")  # /clear 现同为开新会话：主题重置
         assert session.topic is None and session.state["topic"] is None
         assert session.state["project"] == str(tmp_path)
         assert "已更新会话主题" in output.getvalue()

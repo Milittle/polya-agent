@@ -418,6 +418,20 @@ def test_bottom_bar_without_state_shows_hints_only(tmp_path):
         assert KEY_HINTS in _bar_text(box)
 
 
+def test_bottom_bar_keeps_command_description_when_menu_closed(tmp_path):
+    """命令打全后补全菜单收起（无增量重置），底栏须接过说明而不是只回显命令名。"""
+    with make_box(tmp_path) as (box, _):
+        buffer = Buffer()  # 不挂补全钩子，隔离底栏渲染
+        buffer.document = Document("/new")
+        box._session.default_buffer = buffer
+        text = _bar_text(box)
+        assert "旧会话保留" in text
+
+        buffer.document = Document("/rename")
+        assert "重命名当前会话主题" in _bar_text(box)
+        assert "<主题>" in _bar_text(box)  # 仍需参数时保留用法
+
+
 def test_working_bar_explains_escape_and_stopping(tmp_path):
     from prompt_toolkit.completion import Completion
 

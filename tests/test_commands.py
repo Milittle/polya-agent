@@ -180,10 +180,9 @@ def test_edit_and_remove_entry_change_projection_only():
     assert "原始任务" in agent.tree.read(2)
 
 
-def test_clear_new_and_reset_alias_split_session_scopes():
-    """/clear 只清 agent；/new 另触发会话级 restart；/reset 是 /clear 的别名。"""
+def test_new_clear_reset_all_start_fresh_session():
+    """/new /clear /reset 统一为开新会话：换名 + 清空 + 会话级 restart（旧会话可 /resume）。"""
     agent = Agent(llm=object(), tools=[])
-    agent.append_user_message("keep")
     calls = []
 
     def restart() -> str:
@@ -191,15 +190,17 @@ def test_clear_new_and_reset_alias_split_session_scopes():
         return "（已丢弃 2 条排队消息）"
 
     context = CommandContext(agent, restart=restart)
-    assert "已清空" in dispatch_command("/clear", context)
-    assert agent.history == [] and calls == []  # /clear 不动会话级状态
-    agent.append_user_message("again")
-    result = dispatch_command("/new", context)
-    assert agent.history == [] and calls == [1]
-    assert "新会话" in result and "已丢弃 2 条排队消息" in result
-    agent.append_user_message("once more")
-    assert "已清空" in dispatch_command("/reset", context)  # 别名走同一处理器
-    assert agent.history == [] and calls == [1]
+    names = []
+    for command in ("/clear", "/new", "/reset"):
+        agent.append_user_message("stale")
+        result = dispatch_command(command, context)
+        assert agent.history == []
+        assert "新会话" in result and "旧会话保留" in result
+        names.append(agent.session_name)
+
+    assert calls == [1, 1, 1]
+    assert "已丢弃 2 条排队消息" in result
+    assert len(set(names)) == 3  # 每次重新分配会话名，旧会话保留在 /resume
 
 
 def test_invalid_details_never_reaches_renderer():

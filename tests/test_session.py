@@ -68,7 +68,7 @@ def test_load_session_resets_derived_state(tmp_path, monkeypatch):
     assert target.todos.as_dicts() == []
 
 
-def test_new_session_assigns_name_and_clear_keeps_it(tmp_path, monkeypatch):
+def test_new_session_assigns_name_and_clear_also_starts_fresh(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     agent = _seed(_agent())
     context = CommandContext(agent, restart=lambda: "")
@@ -79,8 +79,9 @@ def test_new_session_assigns_name_and_clear_keeps_it(tmp_path, monkeypatch):
     assert agent.session_name and agent.session_title is None
     first = agent.session_name
 
-    assert "已清空" in dispatch_command("/clear", context)
-    assert agent.session_name == first  # /clear 不改会话身份
+    result = dispatch_command("/clear", context)
+    assert "新会话" in result
+    assert agent.session_name != first  # /clear 同为开新会话，旧会话可 /resume 找回
 
 
 def test_resume_lists_and_switches(tmp_path, monkeypatch):

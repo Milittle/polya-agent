@@ -84,16 +84,14 @@ def test_plan_toggle_without_registered_tool_warns():
     assert "未注册 exit_plan_mode" in result
 
 
-def test_clear_new_and_reset_alias_clear_session():
-    agent = make_agent(ScriptedLLM([make_message("好"), make_message("好")]))
+def test_new_clear_reset_all_start_fresh_session():
+    agent = make_agent(ScriptedLLM([make_message("好")] * 4))
     agent.run("hi")
     agent.todos.rewrite([{"content": "任务", "status": "pending"}])
-    assert "已清空" in handle_command("/clear", agent)
-    assert agent.history == [] and len(agent.todos) == 0
-    agent.run("again")
-    assert "新会话" in handle_command("/new", agent)  # 非交互无会话级状态，仅清空
-    assert agent.history == []
-    assert "已清空" in handle_command("/reset", agent)  # 别名保持兼容
+    for command in ("/clear", "/new", "/reset"):
+        assert "已开始新会话" in handle_command(command, agent)  # 非交互无会话级状态，仅换会话
+        assert agent.history == [] and len(agent.todos) == 0
+        agent.run("again")
 
 
 def test_unknown_command():

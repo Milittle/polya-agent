@@ -170,17 +170,14 @@ def _rename_error(argument: str) -> str | None:
     return "用法 (Usage): /rename <主题>（1–120 字，单行）"
 
 
-def _clear(ctx: CommandContext, arg: str) -> str:
-    ctx.agent.reset()
-    return "已清空对话历史、TODO 与统计。"
-
-
 def _new(ctx: CommandContext, arg: str) -> str:
+    """统一 /new /clear /reset：开新会话，旧会话保留可 /resume 找回。"""
     name = ctx.agent.new_session()
+    note = "（旧会话保留，/resume 找回）"
     if ctx.restart is None:
-        return f"已开始新会话 {name}。"
+        return f"已开始新会话 {name}{note}。"
     # 会话级重置（主题、排队消息）由驱动层提供；返回附注（如丢弃条数）
-    return f"已开始新会话 {name}：主题与排队消息已重置。" + ctx.restart()
+    return f"已开始新会话 {name}{note}：主题与排队消息已重置。" + ctx.restart()
 
 
 def _model_choices() -> tuple[tuple[str, str], ...]:
@@ -748,13 +745,12 @@ COMMANDS = (
         idle=True,
     ),
     Command(
-        "/clear",
-        "清空对话历史、TODO 与统计",
-        _clear,
-        aliases=("/reset",),
+        "/new",
+        "开新会话：清空上下文，旧会话保留可 /resume 找回",
+        _new,
+        aliases=("/clear", "/reset"),
         idle=True,
     ),
-    Command("/new", "开新会话：分配新名、重置主题与排队消息", _new, idle=True),
     Command("/exit", "退出", _exit, aliases=("/quit",), idle=True),
 )
 BY_NAME = {name: command for command in COMMANDS for name in (command.name, *command.aliases)}
