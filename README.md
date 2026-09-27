@@ -71,7 +71,7 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 `--trust` is needed for non-interactive runs in a fresh directory), `--max-steps N` (default 25),
 `--model/--base-url/--api-key`, `--no-stream`, `--no-compress`, `--no-microcompact`,
 `--context-window N` (default 128000), `--keep-recent N`, `--keep-recent-tokens N`,
-`--prefix-check`.
+`--reserve-tokens N` (absolute compaction reserve, default 16384), `--prefix-check`.
 
 ### REPL
 
@@ -79,7 +79,7 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 |---|---|
 | `Enter` | send (steering: injected before the next model request) |
 | `Alt+Enter` | queue a follow-up (runs after the current task) · `Ctrl+J` / trailing `\` + Enter: newline |
-| `/help` `/todos` `/status` `/plan on\|go\|off` `/login [provider\|custom]` `/logout <provider>` `/model [provider/model]` `/thinking [level]` `/compact [note]` `/details [ID]` `/resume [name]` `/fork <id>` `/clone` `/export [path]` `/import <path>` `/trust [decision]` `/clear` `/new` `/exit` | slash commands (`/` completes with descriptions) |
+| `/help` `/todos` `/status` `/plan on\|go\|off` `/login [provider\|custom]` `/logout <provider>` `/model [provider/model]` `/thinking [level]` `/compact [note]` `/details [ID]` `/resume [name]` `/fork <id>` `/clone` `/export [path]` `/import <path>` `/trust [decision]` `/new` `/clear` `/reset` `/exit` | slash commands (`/` completes with descriptions) |
 | `@` | file-path completion |
 | `!command` | run a shell command locally; output goes into the conversation |
 | `#note` | append a line to the project memory file (`AGENTS.md`) |
@@ -97,7 +97,7 @@ with argument completion. Invalid commands and arguments stay in the
 editor with a hint; `/details [ID]` takes an optional positive integer (no argument shows
 the last five blocks).
 `/help` lists all commands and aliases from the same flat registry. Commands run
-immediately; the ones that rewrite the session (`/clear`, `/new`, `/exit`, `/compact`,
+immediately; the ones that rewrite the session (`/new`, `/exit`, `/compact`,
 `/rewind`, `/jump`, `/edit`, `/load`, `/resume`, `/fork`, `/clone`, `/import`, `/model`, `/reload`, `/save`)
 need an idle agent
 and ask you to press Esc first when a task is running. In a piped REPL, supply options
@@ -119,10 +119,10 @@ rebuilt, honoring `compaction` and `context_edit`).
 per-vendor (`reasoning_effort` for o-series/gpt-5, `thinking` toggle for GLM/DeepSeek);
 models whose profile has no reasoning style report that no level is available.
 
-`/clear` (alias `/reset`) clears the conversation — history, todos, stats — while
-keeping the session identity, topic and queued messages. `/new` starts a
-fresh session: it additionally assigns a new session name, resets the topic (re-derived
-from the next task), drops queued messages and reprints the banner.
+`/new` (aliases `/clear`, `/reset`) starts a fresh session: the conversation —
+history, todos, stats — is replaced, a new session name is assigned, the topic resets
+(re-derived from the next task), queued messages are dropped and the banner reprints.
+The previous session is kept on disk and can be recovered with `/resume`.
 
 **Project memory**: if the working directory is trusted and has an `AGENTS.md`, it is
 read once at startup and appended to the system prompt (quasi-static: it never changes
@@ -191,22 +191,23 @@ the input; `-p` retains Ctrl+C interruption.
 
 The startup header shows the version, tagline and project-level status (AGENTS.md
 loaded, or an untrusted-directory warning) once, then scrolls away. A persistent
-input area sits below the conversation, with adjoining rules and two footer lines.
-It grows to six lines, then scrolls internally. The first footer shows model, its
-context window and the project directory, then appends `ctx N%` once the first
-request reports usage; the second shows the session topic, mode, queue state and
-action hints. Narrow terminals drop `ctx%` first, then the window, keep model and
-project, shorten paths from the left to retain the project name, and shorten the
-topic before hiding context.
+input area sits below the conversation, with adjoining rules and three footer lines.
+It grows to six lines, then scrolls internally. The first footer is identity: the
+project (`~`-shortened) with its git branch and the session topic on the left, and
+`(provider) model • thinking` on the right. The second is usage: cumulative
+`↑input ↓output CRcache CHhit% $cost` followed by `ctx %/window (auto)`. The third
+holds mode and queue state on the left and context-sensitive action hints on the
+right. Narrow terminals drop provider, thinking, branch, topic and usage details in
+that order, always keeping the model, project name and mode.
 `/rename <topic>` changes the topic and terminal title (one line, up to 120 characters).
-`/clear` preserves the topic; `/new` resets it. The topic starts from the first task,
-without an extra model request.
+`/new` (and its aliases `/clear`, `/reset`) resets the topic; it is re-derived from
+the first task, without an extra model request.
 
 You can keep typing while the agent runs. `Enter` sends a **steering** message: it is
 injected before the next model request, after **all** results of the current tool batch
 are recorded. `Alt+Enter` queues a **follow-up** that runs after the current task ends.
 `Alt+Up` pulls queued messages back into the editor; Esc-aborting does the same.
-`/clear`, `/new`, `/exit` and `/quit` need an idle agent — press Esc first.
+`/new` (and its aliases `/clear`, `/reset`), `/exit` and `/quit` need an idle agent — press Esc first.
 Enter selects a completion when its menu is open; otherwise it
 submits at the end of the buffer or inserts a newline inside the text.
 
@@ -275,19 +276,23 @@ Notable knobs:
 - `status_bar=True`: appends an `<agent_status>` snapshot (iteration, per-tool call
   counts, token usage, todos) to the **end** of the context each round — the model
   never has to count from its own trajectory. Append-only, cache-friendly.
-- `Agent(compress=True)`: compaction at 80% of the context window — old tool results
+- `Agent(compress=True)`: compaction triggers at `min(window × threshold, window −
+  reserve_tokens)` (default 80% / 16384, floored at half the window — small windows
+  never head into the thin 20% tail) — old tool results
   are batch-replaced by summaries (or the whole history is summarized into a restart
   message for thinking-bound models, per `ModelProfile`). Preflight uses the latest
   prompt usage plus estimated new input, with a UTF-8 size estimate when usage is
   missing; it is approximate, never cumulative usage. Empty summaries preserve the
   original history. Three consecutive failures trip a breaker; at an estimated 95%
   of the window, the task stops locally with history intact instead of sending an
-  oversized request. Switch to a larger model window to continue.
+  oversized request, and a provider context-overflow error triggers one
+  compact-and-retry per task. Switch to a larger model window to continue.
   Compaction carries active skill references and TODOs, and asks the summary to retain
-  constraints, edits, verification evidence and next steps. `history_read` retrieves
+  constraints, edits, verification evidence and next steps; the restart summary follows
+  a fixed nine-section template, and summarization calls count toward `total_usage`. `history_read` retrieves
   pre-compaction messages by snapshot, message number and character offset. These
-  temporary archives last for this process/session and are cleared by `/clear` or
-  `/new`; they are not conversation persistence. When tool-only compaction has no
+  temporary archives last for this process/session and are cleared by `/new`,
+  `/clear` or `/reset`; they are not conversation persistence. When tool-only compaction has no
   targets, a full summary restart can compact the remaining conversation.
 - `ModelProfile` (providers): capability-driven behavior — reasoning passthrough,
   in-place tool edit vs summary restart, and temperature defaults. Its context

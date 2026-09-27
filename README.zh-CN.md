@@ -69,11 +69,11 @@ uv run polya -p "修复 pytest 失败的测试" --plan   # 单任务模式：执
 常用参数：`--root DIR` 工作目录（默认 `.`，文件操作被限制在内）、`--plan` 启动进入
 规划模式、`--trust` / `--no-trust` 保存并应用项目信任决定（`--trust` 加载其 `AGENTS.md` / 项目 skills，非交互场景必需）、
 `--max-steps N`（默认 25）、`--model/--base-url/
---api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启，用量超窗口 80%
-时批量压缩旧工具结果）、`--no-microcompact` 关闭微压缩、`--context-window N`
+--api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启）、`--no-microcompact`
+关闭微压缩、`--context-window N`
 （默认 128000）、`--keep-recent N`
 （压缩保留区消息数，默认 30）、`--keep-recent-tokens N`（按 token 预算定保留区，
-优先于 `--keep-recent`）。
+优先于 `--keep-recent`）、`--reserve-tokens N`（全量压缩绝对预留，默认 16384）。
 
 提示词与用户可见文案由 `POLYA_LANG` 选择语言（`zh` 默认，`en` 面向英文受众）；
 提示词在导入时求值，会话内稳定，不破 KV Cache 前缀。
@@ -91,7 +91,6 @@ REPL 斜杠命令：
 | `/thinking [off\|low\|medium\|high]` | 设置推理档位（一家一策）：o 系/gpt-5 发 `reasoning_effort`，GLM/DeepSeek 发 `thinking` 开关；档案无档位的模型明确提示不可切 |
 | `/details [ID]` | 查看留档块全文：无参数看最近 5 块，带 ID 看指定块——滚动区的折叠块在这里看全量 |
 | `/compact [说明]` | 立即压缩上下文（不等阈值）；可选说明聚焦摘要重点 |
-| `/clear` | 清空对话历史、TODO 与统计（别名 `/reset`；保留会话主题与排队消息） |
 | `/rename <主题>` | 重命名当前会话主题与终端标题（单行，最多 120 字） |
 | `/resume [名称]` | 恢复已保存会话：无参数在原输入框选择（名字 · 主题 · 更新时间）；自动落盘的会话都在这 |
 | `/fork <id>` | 从指定入口分叉出新会话（复制根→该入口的祖先路径，`/tree` 看 id） |
@@ -99,7 +98,7 @@ REPL 斜杠命令：
 | `/export [路径]` | 导出当前会话：`.md` 为 Markdown（默认 `~/.polya/exports/<名字>.md`），`.jsonl` 为原始会话 |
 | `/import <路径>` | 从任意路径导入会话为新会话：支持 polya JSONL 与 pi 会话格式（按 pi 规则重建活动分支，含 compaction / context_edit） |
 | `/trust [决定]` | 查看/保存项目信任决定：`trust` / `trust-parent` / `untrust` / `clear`（true/false/null，父目录继承；下次启动生效） |
-| `/new` | 开新会话：分配新会话名，在 `/clear` 之上重置主题、丢弃排队消息并重印启动区 |
+| `/new` | 开新会话：清空历史、TODO 与统计，分配新会话名，重置主题、丢弃排队消息并重印启动区；旧会话保留可 `/resume` 找回（别名 `/clear`、`/reset`） |
 | `/exit` `/quit` | 退出（输入处 Ctrl+D / 空框双击 Ctrl+C 同效） |
 
 `/plan`、`/login`、`/logout`、`/model` 无参数时在原输入框展开选项，并标记当前值；
@@ -108,7 +107,7 @@ Tab / Enter 选中，再按 Enter 执行，Esc 关闭菜单。也可直接输入
 `/login zai`、`/logout zai`、`/model zai/glm-5.3`，支持参数补全。命令或参数错误时保留草稿并提示；
 `/details [ID]` 的 ID 只接受正整数（无参数看最近 5 块）。`/help` 的名称、别名与参数
 与补全、执行共用同一平面注册表。命令随到随执行；会改会话树的命令
-（`/clear`、`/new`、`/exit`、`/compact`、`/rewind`、`/jump`、`/edit`、`/load`、`/resume`、`/fork`、`/clone`、`/import`、`/model`、`/reload`、`/save`）
+（`/new`、`/exit`、`/compact`、`/rewind`、`/jump`、`/edit`、`/load`、`/resume`、`/fork`、`/clone`、`/import`、`/model`、`/reload`、`/save`）
 需要无运行中的任务，否则提示先按 Esc 中断。管道 REPL 不显示选项菜单，需要显式提供参数。
 
 **会话**：每个会话有稳定名字与元数据（标题 / 创建 / 更新 / cwd），任务收尾自动落盘到
@@ -165,12 +164,13 @@ YAML frontmatter 声明 `name` 和 `description`；无效条目警告后跳过�
 
 - **启动区**：版本、一句定位与项目级信息（已加载 AGENTS.md，或未信任目录提醒），
   只显示一次随后自然滚走——模型/目录/快捷键留在常驻底栏，不重复。
-- **常驻输入**：上下边线紧贴编辑区，续行缩进，最多六行后内部滚动。框外第一行显示
-  模型、上下文窗口与项目目录（首次请求后追加 `ctx N%`），第二行显示会话主题、模式、
-  队列状态与操作提示。窄终端先舍 `ctx%`、再舍窗口，保住模型与项目名；缩短路径与主题。
-  运行中仍可编辑草稿。
+- **常驻输入**：上下边线紧贴编辑区，续行缩进，最多六行后内部滚动。框外三行：身份行
+  左侧是项目（`~` 缩写）、git 分支与会话主题，右侧是 `(provider) 模型 • 思考档`；
+  用量行是累计 `↑输入 ↓输出 CR缓存 CH命中% $费用` 与 `ctx 占比/窗口 (auto)`；操作行
+  左侧模式与队列，右侧随上下文变化的操作提示。窄终端依次舍 provider、思考档、分支、
+  主题与用量细节，保住模型、项目名与模式。运行中仍可编辑草稿。
   主题默认取自首条任务，不额外调用模型；`/rename <主题>` 同步修改底部主题与终端标题，
-  `/clear` 保留主题，`/new` 重置主题。
+  `/new`（及别名 `/clear`、`/reset`）重置主题。
 - **输入操作**：Enter 发送（steering：下一模型请求前注入）；Alt+Enter 追加
   （follow-up：本任务结束后运行）；Ctrl+J / 行尾 `\` + Enter 换行；Alt+Up 取回排队
   消息；补全菜单打开时 Enter 选择候选。`/` 补命令，`@` 补文件；候选最多六行；
@@ -178,7 +178,7 @@ YAML frontmatter 声明 `name` 和 `description`；无效条目警告后跳过�
 - **忙时排队**：运行中仍可输入。Enter 的 steering 消息在当前批次的所有工具结果回填后、
   下次模型请求前注入；Alt+Enter 的 follow-up 在当前任务结束后作为下一任务运行。
   Alt+Up 把排队消息取回编辑器；Esc 中断也会把排队消息送回编辑器，不静默丢弃。
-  `/clear`、`/new`、`/exit` 等需先按 Esc 让任务空闲。
+  `/new`（及别名 `/clear`、`/reset`）、`/exit` 等需先按 Esc 让任务空闲。
 - **内容区**：保留原生终端滚动与复制。正文无需等换行，在输入框上方的尾窗持续
   显示 Markdown 尾部（最多八行正文，矮终端自动减少）；消息完成后一次写入滚动区，
   保留表格、列表与代码块排版。中断时保留已生成的正文并标记未完成。
@@ -270,8 +270,9 @@ agent = Agent(
   批准时调 `agent.leave_plan_mode()` 翻转为执行。状态栏会显示当前模式。
   工具数组全程不变（中途增删 tools 会破坏 KV Cache 前缀），模式切换只是运行时状态。
 - **上下文压缩**：`Agent(compress=True)`（CLI 默认开启，`--no-compress` 关闭）。最近一次
-  请求的 prompt tokens 加新增输入估算超过 `context_window × compress_threshold`
-  （默认 128K × 80%）时，
+  请求的 prompt tokens 加新增输入估算超过触发线
+  （`min(窗口×阈值, 窗口−reserve_tokens)`，默认 128K×80%、预留 16384——小窗口下绝对
+  预留先于百分比触发，保证留出一轮响应的空间，`--reserve-tokens` 可调）时，
   在两次 API 调用之间**批量压缩**保留区（最近 `keep_recent=30` 条）之外的旧 tool 结果：
   一次 LLM 调用（合并式，注入当前任务做任务感知压缩）把它们原地替换为带 `[COMPRESSED]`
   标记的摘要（防重复处理），消息条数与 tool_call_id 配对不变，对话脉络完整；同区的旧
@@ -281,8 +282,11 @@ agent = Agent(
   压缩失败熔断。估算达到窗口 95% 时保留历史并停止请求，可切换更大窗口模型继续。
   没有可压工具结果时回退到完整摘要重启；切点保证同批工具结果已全部回填。
   压缩交接保留已加载技能来源与 TODO，摘要要求保留用户修正、验收条件、改动、实际
-  验证结果和下一步。`history_read(snapshot="1", message=1, offset=0)` 可回查压缩前
-  原始消息，每次最多 8000 字符。快照只在当前进程/会话有效，`/clear` 与 `/new` 清除，
+  验证结果和下一步；摘要重启按固定九节模板（目标与验收/约束与偏好/进展三态/
+  关键决策与理由/文件/验证证据/失败路径/技能/下一步）组织，摘要调用的用量计入
+  `total_usage`；provider 报上下文超窗错误时压缩后原地重试一次（每任务一次）。
+  `history_read(snapshot="1", message=1, offset=0)` 可回查压缩前
+  原始消息，每次最多 8000 字符。快照只在当前进程/会话有效，`/new`（`/clear`、`/reset`）清除，
   不是跨进程会话恢复。
 - **模型能力声明**（`polya.providers.ModelProfile`）：Agent 只问能力、不特判模型名。
   压缩策略按 `supports_inplace_tool_edit` 自动切换——OpenAI 式模型（不回传 reasoning）

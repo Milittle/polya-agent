@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Compaction trigger now guarantees an absolute reserve (`--reserve-tokens`, default
+  16384, matching pi's `reserveTokens`): the trigger is
+  `min(window × threshold, window − reserve)` floored at half the window, so small
+  windows compact earlier instead of heading into the thin 20% tail with ~1.6k of
+  headroom; windows ≥ 80k behave exactly as before.
+- Provider context-overflow errors (`maximum context length`, `prompt is too long`, …)
+  now trigger one compact-and-retry per task (`llm.is_context_overflow`), mirroring
+  pi's recovery; the truncated-continue path reuses the same compaction-apply path.
+- Summarization calls count toward `total_usage` via an `on_usage` callback on
+  `compact_messages` / `compact_restart` (previously invisible to session totals).
+- The restart summary follows a fixed nine-section template (goal & acceptance /
+  constraints & preferences / progress done-in-progress-blocked / key decisions &
+  rationale / files / verification evidence / dead ends / skills / next steps), and
+  the per-piece summary prompt asks for explicit progress states.
+- `PRICES` is documented as a static table refreshed per release; the comment records
+  the future dynamic path (pi's remote catalog: ETag conditional requests,
+  lastModified-vs-bundled competition, 4h throttle, silent fallback).
+
 - Tool schema inference now supports `Literal`, `Enum`, `Annotated[T, "description"]`,
   `dict[str, T]`, and nested `dataclasses`; unknown types get no constraint instead of
   being silently downgraded to `string`.
@@ -80,6 +98,13 @@ mode's read-only rule.
 messages back into the editor, and Esc-aborting returns them there too.
 - `/plan go` (or an exact `批准`/`go`-style message) approves a submitted plan; any
 other message keeps revising it read-only.
+- `polya/gitinfo.py`: reads the current git branch straight from `.git/HEAD`
+(worktrees and detached HEAD included) with an mtime cache, no subprocess.
+- Cost estimation: `providers.estimate_cost` prices cumulative tokens against a prefix
+  table `PRICES` (input / output / cacheRead / cacheWrite, USD per 1M) taken from pi's
+  generated model catalog for the bundled providers; `SUBSCRIPTION_PROVIDERS`
+  (coding / token plans) annotate the figure with `(sub)`. Like pi, the `↑input` count
+  excludes cache reads, which are billed at the separate `cacheRead` rate.
 
 ### Changed
 
@@ -118,8 +143,14 @@ other message keeps revising it read-only.
 - `Agent` takes `reviewer` instead of `approve` / `approve_plan`; plan state is
   released by the driver via `leave_plan_mode()`.
 - Commands are a flat registry; the `busy` three-state and queue pause/resume were
-  removed. Session-rewriting commands (`/clear`, `/new`, `/exit`, …) require an idle
+  removed. Session-rewriting commands (`/new`, `/exit`, …) require an idle
   agent and ask for Esc first.
+- The status area under the editor is now three lines aligned with pi's footer:
+identity (project with `~` and git branch, topic, and `(provider) model • thinking`
+on the right), usage (`↑input ↓output CRcache CHhit% $cost ctx %/window (auto)`), and
+actions (mode + queue on the left, context-sensitive hints on the right). The busy
+status line above the editor is unchanged. Narrow terminals drop provider → thinking
+→ branch → topic → usage details, always keeping the model, project basename, and mode.
 - The startup banner now reports identity only (version, tagline, project memory /
   trust), dropping the model, directory and `/help` that the persistent footer already
   shows. The first footer line adds the model's context window next to the model
@@ -131,6 +162,12 @@ other message keeps revising it read-only.
   models: [{id, context_window}]}}}`); old free-form `profiles` migrate automatically.
   Startup resolution is CLI flags > default model (`active`) > `OPENAI_*` env vars.
   `/models` remains as an alias of `/model`; switching no longer rewrites the default.
+- `/new`, `/clear` and `/reset` are now one command (`/new`, with `/clear` and `/reset`
+  as aliases): starting a fresh session always clears the context, assigns a new session
+  name, resets the topic, drops queued messages and reprints the banner. The previous
+  session is preserved on disk and recoverable via `/resume`; the old in-place `/clear`
+  (which kept the session name and let the next auto-save overwrite the old transcript)
+  is gone.
 
 ### Removed
 
@@ -151,6 +188,10 @@ other message keeps revising it read-only.
   only restarts completion on insertion, not deletion) and auto-popup preselects the
   first candidate without inserting its text; Tab keeps its insert-first behavior and
   typing a full command name still closes the menu.
+- The footer keeps showing a command's description (and argument hint) after the name is
+  typed in full and the completion menu closes; previously it fell back to the bare
+  command name, dropping the description. A duplicate `on_text_changed` handler that ran
+  auto-completion twice per keystroke was also removed.
 
 ## [0.1.0] - 2026-09-26
 
