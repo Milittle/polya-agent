@@ -80,8 +80,9 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 
 | Key / prefix | Action |
 |---|---|
-| `Enter` | send · `Alt+Enter` / `Ctrl+J` / trailing `\` + Enter: newline |
-| `/help` `/todos` `/status` `/plan on\|off` `/models [profile]` `/compact [note]` `/expand [N]` `/clear` `/new` `/exit` | slash commands (`/` completes with descriptions) |
+| `Enter` | send (steering: injected before the next model request) |
+| `Alt+Enter` | queue a follow-up (runs after the current task) · `Ctrl+J` / trailing `\` + Enter: newline |
+| `/help` `/todos` `/status` `/plan on\|go\|off` `/models [profile]` `/thinking [level]` `/compact [note]` `/details [ID]` `/resume [name]` `/fork <id>` `/clone` `/export [path]` `/import <path>` `/trust [decision]` `/clear` `/new` `/exit` | slash commands (`/` completes with descriptions) |
 | `@` | file-path completion |
 | `!command` | run a shell command locally; output goes into the conversation |
 | `#note` | append a line to the project memory file (`AGENTS.md`) |
@@ -96,11 +97,30 @@ setup wizard and `remove`). Choose with arrows and Tab/Enter, then Enter to
 execute; Esc closes the menu. You can also type `/plan on|go|off`
 or `/models <profile>`
 directly, with argument completion. Invalid commands and arguments stay in the
-editor with a hint; `/details ID` and `/expand [N]` require positive integers.
-`/help` lists all commands, aliases and busy behavior from the same registry.
-Queued commands run before the next model request; `/clear`, `/new`, `/exit` and
-`/quit` wait until the current task ends, preserving queue order. `/resume` immediately
-resumes a queue paused after interruption, rejection or failure; it waits for an active stop to finish. In a piped REPL, supply options explicitly.
+editor with a hint; `/details [ID]` takes an optional positive integer (no argument shows
+the last five blocks).
+`/help` lists all commands and aliases from the same flat registry. Commands run
+immediately; the ones that rewrite the session (`/clear`, `/new`, `/exit`, `/compact`,
+`/rewind`, `/jump`, `/edit`, `/load`, `/resume`, `/fork`, `/clone`, `/import`, `/models`, `/reload`, `/save`)
+need an idle agent
+and ask you to press Esc first when a task is running. In a piped REPL, supply options
+explicitly.
+
+**Sessions** get a stable name and metadata (title, created/updated, cwd) and are
+auto-saved to `~/.polya/sessions/<name>.jsonl` after every task, so `/resume` lists
+conversations you actually had. `/resume` with no argument opens a picker in the input
+box (name · title · updated); `/resume <name>` switches directly. `/fork <id>` derives a
+new session from the ancestor path up to entry `#id` (`/tree` shows ids); `/clone`
+duplicates the current session. Switching resets stats, todos and file tracking so
+sessions never bleed into each other. `/export [path]` writes the active branch as
+Markdown (default `~/.polya/exports/<name>.md`); `/save` keeps the raw JSONL for `/load`.
+`/export <path>.jsonl` writes a raw session for `/import`; `/import <path>` loads a session
+from any path, accepting both polya JSONL and pi's session format (the pi active branch is
+rebuilt, honoring `compaction` and `context_edit`).
+
+`/thinking [off|low|medium|high]` sets the reasoning level. The request field is
+per-vendor (`reasoning_effort` for o-series/gpt-5, `thinking` toggle for GLM/DeepSeek);
+models whose profile has no reasoning style report that no level is available.
 
 `/clear` (alias `/reset`) clears the conversation — history, todos, stats — while
 keeping the session identity, topic and queued messages. `/new` starts a

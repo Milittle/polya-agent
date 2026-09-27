@@ -35,6 +35,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-streaming when an endpoint rejects streaming.
 - Type checking: `mypy` configuration and a CI step.
 - `examples/` package for runnable demos, moved out of the repository root.
+- Session tree + deterministic projection (ADR 0005): `polya/tree.py` introduces an
+  immutable `Entry` with stable ids, a `SessionTree` (append / move_to / rewind /
+  branch / override), and a deterministic `project()`. The raw history is never
+  rewritten; the model context is a projection of the active branch, so KV-cache
+  prefix friendliness is a structural guarantee rather than a discipline.
+- entry-id history read-back: `history_read(entry_id, offset)` replaces the snapshot +
+  message-number addressing.
+- Skills hot reload: `/reload` re-scans skill directories and patches the `<skills>`
+  prompt section via a new system entry (a legal restart point).
+- Branch navigation and history editing: `/rewind [N]`, `/jump <id>`, `/tree`
+  (fork points + all branches), and `/edit <id> <新内容|remove>` (projection-level
+  context edit; the original stays readable via `history_read(entry_id)`).
+- Session persistence: `/save [名称]`, `/sessions`, and `/load <名称>`; the session
+  tree serializes to JSONL under `~/.polya/sessions/`.
+- Session lifecycle (`polya/session.py`): sessions get a stable name and metadata
+  (title / created / updated / cwd) in the JSONL header, and auto-save after every
+  task. New commands: `/resume [名称]` (picker listing name · title · updated),
+  `/fork <id>` (new session from an ancestor path), `/clone` (duplicate the current
+  session), and `/export [路径]` (Markdown transcript of the active branch).
+  Switching sessions resets stats, todos and file tracking so they never bleed
+  across conversations. `SessionTree` gains `ancestry` / `copy_branch_upto` / `copy`.
+- Session import (`polya/importer.py`) and JSONL export: `/export <path>.jsonl` writes a
+  raw session, `/import <path>` loads one from any path. Both polya JSONL and pi's
+  session format are accepted; pi's active branch is rebuilt honoring `compaction`
+  (`firstKeptEntryId`) and `context_edit` (mapped to polya projection overrides).
+- Per-vendor reasoning levels: `/thinking [off|low|medium|high]`; `ModelProfile.reasoning_style`
+  selects the request shape (`reasoning_effort` for o-series/gpt-5, `thinking` toggle for
+  GLM/DeepSeek, `none` otherwise) via `providers.reasoning_params`.
+
+- `polya/review.py`: a pluggable `Reviewer` seam (`allow`/`deny`) called before every
+tool call; the default `AllowAllReviewer` allows everything and only enforces plan
+mode's read-only rule.
+- `polya/trust.py`: a project trust gate in pi's shape. `~/.polya/trust.json` maps
+  canonical paths to `true | false | null`, with **parent-directory inheritance** (the
+  closest decision wins; `null` = no decision). Untrusted directories do not load
+  `AGENTS.md` or project/ancestor skills; tools still run. The gate only asks when a
+  directory actually has protected resources. `/trust` shows the saved decision and its
+  inheritance source and saves Trust / Trust parent folder / Do not trust / Clear (next
+  start); `--trust` / `--no-trust` cover non-interactive runs. Legacy
+  `{"trusted": [...]}` stores migrate on read.
+- pi-style input semantics: `Enter` steers (injected before the next model request),
+`Alt+Enter` queues a follow-up (runs after the current task), `Alt+Up` pulls queued
+messages back into the editor, and Esc-aborting returns them there too.
+- `/plan go` (or an exact `批准`/`go`-style message) approves a submitted plan; any
+other message keeps revising it read-only.
 
 ### Changed
 

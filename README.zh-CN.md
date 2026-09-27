@@ -93,19 +93,31 @@ REPL 斜杠命令：
 | `/thinking [off\|low\|medium\|high]` | 设置推理档位（一家一策）：o 系/gpt-5 发 `reasoning_effort`，GLM/DeepSeek 发 `thinking` 开关；档案无档位的模型明确提示不可切 |
 | `/details [ID]` | 查看留档块全文：无参数看最近 5 块，带 ID 看指定块——滚动区的折叠块在这里看全量 |
 | `/compact [说明]` | 立即压缩上下文（不等阈值）；可选说明聚焦摘要重点 |
-| `/clear` | 清空对话历史、TODO 与统计（别名 `/reset`；保留会话主题、授权规则与排队消息） |
-| `/rename <主题>` | 重命名当前会话主题与终端标题（单行，最多 120 字）；忙时下一轮请求前生效 |
-| `/new` | 开新会话：在 `/clear` 之上重置主题、清空授权规则、丢弃排队消息并重印启动区 |
+| `/clear` | 清空对话历史、TODO 与统计（别名 `/reset`；保留会话主题与排队消息） |
+| `/rename <主题>` | 重命名当前会话主题与终端标题（单行，最多 120 字） |
+| `/resume [名称]` | 恢复已保存会话：无参数在原输入框选择（名字 · 主题 · 更新时间）；自动落盘的会话都在这 |
+| `/fork <id>` | 从指定入口分叉出新会话（复制根→该入口的祖先路径，`/tree` 看 id） |
+| `/clone` | 复制当前会话为新会话（含投影编辑与主题） |
+| `/export [路径]` | 导出当前会话：`.md` 为 Markdown（默认 `~/.polya/exports/<名字>.md`），`.jsonl` 为原始会话 |
+| `/import <路径>` | 从任意路径导入会话为新会话：支持 polya JSONL 与 pi 会话格式（按 pi 规则重建活动分支，含 compaction / context_edit） |
+| `/trust [决定]` | 查看/保存项目信任决定：`trust` / `trust-parent` / `untrust` / `clear`（true/false/null，父目录继承；下次启动生效） |
+| `/new` | 开新会话：分配新会话名，在 `/clear` 之上重置主题、丢弃排队消息并重印启动区 |
 | `/exit` `/quit` | 退出（输入处 Ctrl+D / 空框双击 Ctrl+C 同效） |
 
 `/plan`、`/models` 无参数时在原输入框展开选项，并标记当前值（`/models`
 的选项器尾行带 `add` 向导与 `remove`）；方向键移动，
-Tab / Enter 选中，再按 Enter 执行，Esc 关闭菜单。也可直接输入 `/plan on|off`、
-`/permissions ask|all`、`/models <名字>`，支持参数补全。命令或参数错误时保留草稿并提示；
-`/details ID`、`/expand [N]` 只接受正整数。`/help` 的名称、别名、参数和忙时策略
-与补全、执行共用定义。普通命令在下一次模型请求前执行；`/clear`、`/new`、`/exit`、`/quit`
-等待当前任务结束，后续输入保持队列顺序；`/resume` 恢复中断、拒绝或异常后暂停的队列；正在停止时需等当前操作结束。
-管道 REPL 不显示选项菜单，需要显式提供参数。
+Tab / Enter 选中，再按 Enter 执行，Esc 关闭菜单。也可直接输入 `/plan on|go|off`、
+`/models <名字>`，支持参数补全。命令或参数错误时保留草稿并提示；
+`/details [ID]` 的 ID 只接受正整数（无参数看最近 5 块）。`/help` 的名称、别名与参数
+与补全、执行共用同一平面注册表。命令随到随执行；会改会话树的命令
+（`/clear`、`/new`、`/exit`、`/compact`、`/rewind`、`/jump`、`/edit`、`/load`、`/resume`、`/fork`、`/clone`、`/import`、`/models`、`/reload`、`/save`）
+需要无运行中的任务，否则提示先按 Esc 中断。管道 REPL 不显示选项菜单，需要显式提供参数。
+
+**会话**：每个会话有稳定名字与元数据（标题 / 创建 / 更新 / cwd），任务收尾自动落盘到
+`~/.polya/sessions/<名字>.jsonl`，所以 `/resume` 列出的是真正用过的会话。无参 `/resume`
+在原输入框展开选择器（名字 · 主题 · 更新时间），`/resume <名字>` 直切。切会话会清零统计、
+TODO 与读改追踪，互不串味。`/fork <id>` 从祖先路径派生新会话，`/clone` 复制当前会话。
+`/export [路径]` 按当前分支导出 Markdown；`/save` 仍落原始 JSONL 供 `/load`。
 
 **输入前缀**：`!command` 本地跑 shell、输出进上下文（8000 字符截断）；`#note`
 追加一行到项目记忆 `AGENTS.md`（下节）；`@` 触发文件路径补全；`/` 补全命令并带说明列。

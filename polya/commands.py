@@ -409,8 +409,35 @@ def _clone(ctx: CommandContext, arg: str) -> str:
     return ctx.agent.clone_session()
 
 
+def _export(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.export_session(arg or None)
+
+
+def _export_validate(argument: str) -> str | None:
+    # 自由路径参数（可空）；校验器接管 error()，放行任意单参数。
+    return None
+
+
 def _thinking(ctx: CommandContext, arg: str) -> str:
     return ctx.agent.set_thinking(arg)
+
+
+def _import_validate(argument: str) -> str | None:
+    if not argument:
+        return "用法 (Usage): /import <路径>"
+    return None
+
+
+def _import(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.import_session(arg)
+
+
+_TRUST_CHOICES = (
+    ("trust", "信任当前目录"),
+    ("trust-parent", "信任父目录（清除本目录决定）"),
+    ("untrust", "不信任当前目录"),
+    ("clear", "清除本目录决定（回退继承）"),
+)
 
 
 def _load(ctx: CommandContext, arg: str) -> str:
@@ -518,6 +545,14 @@ COMMANDS = (
         idle=True,
     ),
     Command(
+        "/import",
+        "从路径导入会话（polya JSONL / pi 格式）",
+        _import,
+        argument_hint="<路径>",
+        validator=_import_validate,
+        idle=True,
+    ),
+    Command(
         "/fork",
         "从指定入口分叉出新会话",
         _fork,
@@ -526,6 +561,13 @@ COMMANDS = (
         idle=True,
     ),
     Command("/clone", "复制当前会话为新会话", _clone, idle=True),
+    Command(
+        "/export",
+        "导出当前会话为 Markdown（.jsonl 落原始会话）",
+        _export,
+        argument_hint="[路径]",
+        validator=_export_validate,
+    ),
     Command(
         "/thinking",
         "设置推理档位（一家一策）",

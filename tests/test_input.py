@@ -163,7 +163,7 @@ def test_slash_completer_carries_descriptions():
 def test_slash_completer_matches_case_insensitive():
     assert [c.text for c in SlashCompleter().get_completions(Document("/HE"), None)] == ["/help"]
     texts = [c.text for c in SlashCompleter().get_completions(Document("/EX"), None)]
-    assert set(texts) == {"/exit"}  # 前缀桶内保持声明序
+    assert texts == ["/export", "/exit"]  # 前缀桶内保持声明序
 
 
 def test_slash_completer_alias_yields_canonical_name():

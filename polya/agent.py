@@ -469,6 +469,97 @@ class Agent:
         self.autosave()  # 克隆结果立刻可见于 /resume
         return f"已复制当前会话为 {self.session_name}（{len(self.tree)} 个入口）。"
 
+    def render_transcript(self) -> str:
+        """按 active 分支渲染 Markdown 转录（走投影覆盖，反映 /edit）。"""
+        lines = [f"# 会话 {self.session_name or '(未命名)'}", ""]
+        if self.session_title:
+            lines.append(f"> 主题：{self.session_title}")
+        if self.cwd:
+            lines.append(f"> 工作目录：{self.cwd}")
+        lines += [f"> 入口数：{len(self.tree)}", ""]
+        for entry in self.tree.active_branch():
+            if entry.kind == KIND_SYSTEM:
+                continue
+            payload = self.tree.effective_payload(entry.id)
+            if payload is None:
+                continue
+            if entry.kind == KIND_USER:
+                lines += ["## 用户", "", str(payload.get("content", "")), ""]
+            elif entry.kind == KIND_ASSISTANT:
+                lines.append("## 助手")
+                lines.append("")
+                if payload.get("reasoning_content"):
+                    lines += [
+                        "<details><summary>推理</summary>",
+                        "",
+                        str(payload["reasoning_content"]),
+                        "",
+                        "</details>",
+                        "",
+                    ]
+                lines += [str(payload.get("content") or "（仅工具调用）"), ""]
+                for call in payload.get("tool_calls") or []:
+                    function = call.get("function", {}) if isinstance(call, dict) else {}
+                    name = function.get("name", "?")
+                    arguments = function.get("arguments", "")
+                    lines.append(f"- 工具调用 `{name}`：`{arguments}`")
+                if payload.get("tool_calls"):
+                    lines.append("")
+            elif entry.kind == KIND_TOOL:
+                lines += ["## 工具结果", "", "```", str(payload.get("content", "")), "```", ""]
+            elif entry.kind == KIND_SUMMARY:
+                lines += ["## 摘要", "", str(payload.get("content", "")), ""]
+        return "\n".join(lines)
+
+    def export_session(self, target: str | None = None) -> str:
+        """导出会话：``.jsonl`` 落原始会话（可被 /import、/load 读），否则 Markdown。
+
+        默认 ``~/.polya/exports/<name>.md``。
+        """
+        name = self._ensure_session_name()
+        path = Path(target).expanduser() if target else session_store.exports_dir() / f"{name}.md"
+        if path.suffix == ".jsonl":
+            lines = [
+                json.dumps(self.session_meta().header(), ensure_ascii=False),
+                *self.tree.to_jsonl(),
+            ]
+            content = "\n".join(lines) + "\n"
+        else:
+            content = self.render_transcript()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return f"无法导出：{exc}"
+        return f"已导出会话到 {path}"
+
+    def import_session(self, path: str) -> str:
+        """从任意路径导入会话（polya JSONL / pi 格式）为新会话（session-lifecycle）。"""
+        from . import importer  # 局部导入：仅导入路径需要，避免启动期开销
+
+        target = Path(path).expanduser()
+        payload = {"content": self.system_prompt, "sections": self._prompt.sections()}
+        try:
+            meta, tree = importer.import_file(target, system_payload=payload)
+        except OSError as exc:
+            return f"无法导入 {path}：{exc}"
+        except ValueError as exc:
+            return f"无法导入 {path}：{exc}"
+        if len(tree) == 0:
+            return f"无法导入 {path}：没有任何可用的会话入口。"
+        self.tree = tree
+        projected = self.tree.project()
+        if projected and projected[0]["role"] == "system":
+            self.system_prompt = projected[0]["content"]
+        base = target.stem if session_store.valid_name(target.stem) else None
+        self.session_name = session_store.unique_name(base)
+        self.session_title = meta.title
+        self.session_created = meta.created or session_store.iso_now()
+        self.session_updated = self.session_created
+        self._adopt_session()
+        self.autosave()
+        return f"已导入 {target.name} → 新会话 {self.session_name}（{len(self.tree)} 个入口）。"
+
     def _adopt_session(self) -> None:
         """切换/加载会话后重置派生状态（统计 / TODO / 读改追踪 / 压缩累积）。"""
         self.last_usage = None

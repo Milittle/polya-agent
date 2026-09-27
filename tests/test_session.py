@@ -132,6 +132,27 @@ def test_clone_session_duplicates_tree(tmp_path, monkeypatch):
     assert agent.history == before
 
 
+def test_export_markdown_contains_transcript(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = _seed(_agent())
+    agent.tree.append(
+        "assistant",
+        {
+            "content": "调用工具",
+            "tool_calls": [{"id": "c1", "function": {"name": "bash", "arguments": "{}"}}],
+        },
+    )
+    agent.tree.append("tool", {"tool_call_id": "c1", "content": "命令输出"})
+
+    target = tmp_path / "out" / "session.md"
+    assert "已导出会话" in dispatch_command(f"/export {target}", CommandContext(agent))
+    text = target.read_text(encoding="utf-8")
+    assert "## 用户" in text and "任务一" in text
+    assert "## 助手" in text and "调用工具" in text
+    assert "`bash`" in text
+    assert "## 工具结果" in text and "命令输出" in text
+
+
 def test_autosave_creates_resumable_session(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     agent = _seed(_agent())
