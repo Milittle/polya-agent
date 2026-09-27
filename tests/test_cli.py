@@ -215,6 +215,18 @@ def test_topic_from_local_fallbacks():
     assert _topic_from("fix\n  输入框") == "fix 输入框"
 
 
+def test_topic_from_prefers_first_sentence():
+    from polya.loop import _topic_from
+
+    assert _topic_from("修复登录。顺便看下缓存") == "修复登录。"
+    assert _topic_from("Fix the bug! Then run tests") == "Fix the bug!"
+    assert _topic_from("why does this fail? because...") == "why does this fail?"
+    # 英文句点须后接空白/结束才算句末：文件名、版本号与小数不被误切成半句
+    assert _topic_from("edit polya.py now") == "edit polya.py now"
+    assert _topic_from("bump deps to 1.5 please") == "bump deps to 1.5 please"
+    assert _topic_from("update README. Then commit") == "update README."
+
+
 def test_rule_and_prompt_message_lay_out():
     from polya.input import _rule, prompt_message
 

@@ -181,10 +181,34 @@ def run_task(
         gen.close()
 
 
+_TOPIC_MAX = 48  # 主题长度上限（字符）；超出截断并补 …
+
+# 句末标点：中英文强句末。英文句点须后接空白或结束才算句末，避免把
+# ``polya.py`` / ``1.5`` 这类写法误切成半句。
+_TOPIC_SENTENCE_ENDS = "。！？!?"
+
+
+def _first_sentence(text: str) -> str:
+    """截到首句末（含标点）；整段没有句末标点则原样返回。"""
+    for index, char in enumerate(text):
+        if char in _TOPIC_SENTENCE_ENDS:
+            return text[: index + 1]
+        if char == "." and (index + 1 == len(text) or text[index + 1].isspace()):
+            return text[: index + 1]
+    return text
+
+
 def _topic_from(first_input: str) -> str:
-    """A readable local provisional topic; never make an extra model request."""
-    text = " ".join(first_input.split())
-    return "".join(char for char in text if char.isprintable())[:48] or "新会话"
+    """A readable local provisional topic; never make an extra model request.
+
+    取首条任务的首句（按中英文句末标点切），折叠空白、去不可打印字符，超过
+    48 字则截断补 ``…``。
+    """
+    text = "".join(char for char in " ".join(first_input.split()) if char.isprintable())
+    sentence = _first_sentence(text).strip()
+    if len(sentence) > _TOPIC_MAX:
+        return sentence[: _TOPIC_MAX - 1].rstrip() + "…"
+    return sentence or "新会话"
 
 
 def _run_shell_bang(agent: Agent, root: str, command: str, say) -> None:
@@ -503,6 +527,9 @@ class InteractiveSession:
                 if self.topic is None:
                     self.topic = _topic_from(text)
                     self.state["topic"] = self.topic
+                    # 自动主题也写进会话元数据（title）：autosave 落盘后 /resume
+                    # 才显示得住主题，而不是只剩时间戳名。
+                    self.agent.set_session_title(self.topic)
                     self.renderer._console.set_window_title(f"polya · {self.topic}")
                 self.say("❯ " + text, "cyan")
                 task_outcome = run_task(

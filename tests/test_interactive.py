@@ -475,6 +475,16 @@ def test_session_identity_rename_and_new_session(tmp_path):
         assert "已更新会话主题" in output.getvalue()
 
 
+def test_first_task_topic_is_persisted_as_session_title(tmp_path, monkeypatch):
+    """自动主题写进会话元数据：autosave 落盘后 /resume 看得到主题，而非只剩时间戳名。"""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with session_for(tmp_path, FakeLLM([reply(content="done")])) as (session, _, _):
+        session._work("修复登录页面")
+        assert session.topic == session.agent.session_title == "修复登录页面"
+        saved = tmp_path / ".polya" / "sessions" / f"{session.agent.session_name}.jsonl"
+        assert '"title": "修复登录页面"' in saved.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize("command", ["/new", "/clear", "/reset"])
 def test_session_commands_wipe_screen_before_welcome(tmp_path, command):
     """/new /clear /reset 清屏后重印启动区：终端像刚启动的新会话。"""

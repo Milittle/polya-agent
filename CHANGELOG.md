@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `-p` now saves the session on every exit path (success, budget-exhausted, interrupt,
   error), so one-shot runs are resumable and auditable; hitting the continuation limit
   prints `[未完成]` and exits 1.
+- The auto session topic now takes the **first sentence** of the first task (Chinese and
+  English sentence-final punctuation; an English period ends a sentence only when followed
+  by whitespace or end-of-input, so `polya.py` / `1.5` are not split), then collapses
+  whitespace and caps at 48 characters with a trailing `…`.
+
+### Fixed
+
+- The topic derived from the first task is now **persisted as the session `title`**, so
+  `/resume` and `/sessions` show a readable topic instead of only the timestamp name
+  (previously only `/rename` wrote a title, and the auto topic was lost on save).
 
 ### Added
 
