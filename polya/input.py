@@ -1,7 +1,7 @@
 """常驻多行输入：编辑、补全、粘贴折叠和自适应状态栏。
 
-同步 ask() 用于独立输入，ask_async()/suspend() 支持后台任务与审批让位。
-草稿以 Document 保留光标，粘贴登记直到提交才清空。状态由驱动注入。
+同步 ask() 用于独立输入，ask_async()/suspend() 支持后台任务与 /models 向导的终端
+让位。草稿以 Document 保留光标，粘贴登记直到提交才清空。状态由驱动注入。
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu, CompletionsMenuControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 
-from .commands import BUSY_HINTS, COMMANDS, command_error, parse_command
+from .commands import COMMANDS, command_error, parse_command
 from .filefind import ProjectFiles
 
 PASTE_FOLD_THRESHOLD = 10  # 粘贴超过此行数即折叠为占位符
@@ -61,7 +61,7 @@ def prompt_message(state: dict) -> list:
 
 
 class InputSuspended(Exception):
-    """审批临时取得终端输入权；草稿和粘贴登记继续保留。"""
+    """/models add 向导临时取得终端输入权；草稿和粘贴登记继续保留。"""
 
 
 class SlashCompleter(Completer):
@@ -141,6 +141,8 @@ class InputBox:
     ):
         self._state: dict = {}
         self.on_interrupt = lambda: None
+        self.on_dequeue = lambda: ""  # Alt+Up：由驱动提供排队消息文本
+        self.last_kind = "steering"  # 上次提交语义：steering（Enter）/ follow-up（Alt+Enter）
         self.preview = lambda width, max_lines: ""
         self._draft = Document("")
         self._pastes: list[str] = []  # 折叠登记：原文按序号存取
@@ -177,6 +179,20 @@ class InputBox:
             self._draft = self._session.default_buffer.document
             self._session.app.exit(exception=InputSuspended())
 
+    def insert_pending(self, text: str) -> None:
+        """把排队消息送回编辑器（Esc 中断 / Alt+Up 取回）；prompt 未在跑时存为草稿。"""
+        if not text:
+            return
+        if self._session.app.is_running and not self._session.app.is_done:
+            buffer = self._session.default_buffer
+            if buffer.text and not buffer.text.endswith("\n"):
+                buffer.insert_text("\n")
+            buffer.insert_text(text)
+            self._session.app.invalidate()
+        else:
+            prefix = self._draft.text
+            self._draft = Document((prefix + "\n" + text) if prefix else text)
+
     def _submitted(self, text: str) -> str:
         self._draft = Document("")
         expanded = self._expand_pastes(text)
@@ -189,18 +205,30 @@ class InputBox:
     def _build(self, history_path: Path | None, input, output) -> PromptSession:
         bindings = KeyBindings()
 
-        @bindings.add("escape", "enter")
-        def _newline(event):
-            event.current_buffer.insert_text("\n")
-
         @bindings.add("c-j")
-        def _newline_ctrl_j(event):
-            # Ctrl+J：部分终端吃掉 Alt 键时的换行备用入口
+        def _newline(event):
+            # Ctrl+J：换行（Enter=发送，Alt+Enter=追加）
             event.current_buffer.insert_text("\n")
 
         @bindings.add("enter")
         def _enter(event):
-            self._submit(event.current_buffer)
+            self._submit(event.current_buffer, "steering")
+
+        @bindings.add("escape", "enter")
+        def _follow_up(event):
+            # Alt+Enter：本轮结束后再交给模型（pi follow-up）
+            self._submit(event.current_buffer, "follow-up")
+
+        @bindings.add("escape", "up")
+        def _dequeue(event):
+            # Alt+Up：把排队消息取回编辑器（pi 语义）
+            text = self.on_dequeue()
+            if text:
+                buffer = event.current_buffer
+                if buffer.text and not buffer.text.endswith("\n"):
+                    buffer.insert_text("\n")
+                buffer.insert_text(text)
+            event.app.invalidate()
 
         @bindings.add("c-i")
         def _tab(event):
@@ -382,51 +410,32 @@ class InputBox:
             full = f"{_fit(model, model_width)} · {project}"
         return [("class:rule", "  " + _fit(full, width))]
 
-    def session_footer(self) -> list:
-        """Reuse session identity while an approval selector owns the terminal."""
-        return self._environment_bar() + [("", "\n")] + self._bottom_bar(action="等待审批")
-
-    def _bottom_bar(self, action: str | None = None) -> list:
+    def _bottom_bar(self) -> list:
         """Session identity on the left, mode and context-sensitive actions on the right."""
         state = self._state
         width = max(0, self._session.output.get_size().columns - 2)
         busy = state.get("busy", False)
         mode = state.get("mode", "normal")
-        if state.get("queue_paused"):
-            mode += f" · 队列暂停 {state.get('queued', 0)}"
-        elif state.get("queued"):
+        if state.get("queued"):
             mode += f" · 已排队 {state['queued']} 条"
-        hint = "Enter to queue" if busy else KEY_HINTS
+        hint = "Enter 引导 · Alt+Enter 追加" if busy else KEY_HINTS
         buffer = self._session.default_buffer
         if buffer.complete_state:
             hint = "Tab / Enter 选择 · Esc 关闭"
         elif buffer.text.lstrip().startswith("/"):
             command, _ = parse_command(buffer.text)
             if command is not None:
-                hint = BUSY_HINTS[command.busy] if busy else command.usage
+                hint = command.usage
         elif buffer.text and not busy:
-            hint = "Alt+Enter 换行"
-        elif state.get("queue_paused"):
-            hint = "/resume 恢复"
+            hint = "Ctrl+J 换行 · Alt+Enter 追加"
         flashed = time.monotonic() < self._hint_until
         if flashed:
             hint = self._hint
-        if action is not None:
-            hint = action
-            flashed = True
         topic = state.get("topic") or "新会话"
         right = mode + " · " + hint
         # Keep both session identity and an action visible on narrow terminals.
         if not flashed and get_cwidth(right) + min(get_cwidth(topic), 12) + 2 > width:
-            hint = (
-                "Esc 关闭"
-                if buffer.complete_state
-                else "/resume"
-                if state.get("queue_paused")
-                else "Enter 排队"
-                if busy
-                else "/help"
-            )
+            hint = "Esc 关闭" if buffer.complete_state else "Enter 引导" if busy else "/help"
             right = mode + " · " + hint
         reserve = 0 if flashed else min(8, width // 3) + 2
         right = _fit(right, max(0, width - reserve))
@@ -441,8 +450,9 @@ class InputBox:
 
     # ---- 按键语义（抽出为方法，便于单测直接驱动 Buffer）----
 
-    def _submit(self, buffer) -> None:
+    def _submit(self, buffer, kind: str = "steering") -> None:
         """Enter：命令高亮补全直接执行；文件补全只插入；否则末行提交、行中换行。"""
+        self.last_kind = kind
         state = buffer.complete_state
         if state is not None and state.completions:
             before = state.original_document.text
@@ -491,7 +501,9 @@ class InputBox:
             return "on" if self._state.get("mode") == "plan" else "off"
         if name == "/models":
             return self._state.get("profile") or ""
-        return self._state.get("permissions", "ask")
+        if name == "/thinking":
+            return self._state.get("thinking") or ""
+        return ""
 
     def _on_cancel(self, buffer) -> None:
         """Ctrl+C：有文本先清空；空框 2 秒内双击退出（KeyboardInterrupt 上行）。"""

@@ -194,7 +194,7 @@ def test_web_fetch_wraps_content_with_source_marker(tools, monkeypatch):
         def __exit__(self, *args):
             return False
 
-    monkeypatch.setattr("polya.web.urllib.request.urlopen", lambda req, timeout: FakeResponse())
+    monkeypatch.setattr("polya.web._open_url", lambda req, timeout: FakeResponse())
     monkeypatch.setattr("polya.web._assert_public_url", lambda url: None)  # 测试不做 DNS 解析
     result = tools.call("web_fetch", {"url": "https://example.com/docs"})
 
@@ -220,6 +220,49 @@ def test_web_fetch_blocks_ssrf_targets(tools):
         result = tools.call("web_fetch", {"url": url})
         assert "Error" in result, url
         assert "拒绝" in result, url
+
+
+def test_web_fetch_redirect_to_internal_is_rejected():
+    """重定向目标逐跳校验：公开 URL 302 到内网必须在跟随前拒绝。"""
+    from urllib.request import Request
+
+    from polya.web import _ValidatingRedirectHandler
+
+    handler = _ValidatingRedirectHandler()
+    with pytest.raises(ValueError, match="拒绝"):
+        handler.redirect_request(
+            Request("https://example.com"), None, 302, "Found", {}, "http://127.0.0.1/x"
+        )
+
+
+def test_web_fetch_revalidates_final_url_against_rebinding(tools, monkeypatch):
+    """连接后最终地址再校验：opener 返回的 response.url 指向内网也要拒绝。"""
+
+    class FakeHeaders:
+        def get(self, name, default=""):
+            return "text/plain" if name == "content-type" else default
+
+        def get_content_charset(self):
+            return "utf-8"
+
+    class FakeResponse:
+        status = 200
+        url = "http://127.0.0.1/x"
+        headers = FakeHeaders()
+
+        def read(self, limit=-1):
+            return b"secret"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr("polya.web._open_url", lambda req, timeout: FakeResponse())
+    result = tools.call("web_fetch", {"url": "https://8.8.8.8/"})
+    assert "Error" in result
+    assert "拒绝" in result
 
 
 def test_kinds():

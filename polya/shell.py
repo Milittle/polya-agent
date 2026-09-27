@@ -202,7 +202,10 @@ class ShellSession:
                     self._proc.kill()
             except ProcessLookupError:
                 pass
-            self._proc.wait(timeout=2)
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass  # SIGKILL 后仍未退出：不阻塞清理，进程组已尽力终止
             if self._proc.stdin is not None:
                 self._proc.stdin.close()
             if self._active is not None and self._active.code is None:

@@ -1,8 +1,8 @@
 """Agent 事件的终端渲染器。
 
-常驻交互由 prompt_toolkit 展示 live 区；完成的正文与工具结果一次写入滚动区。
-思考和工具结果保留有界归档，供 /expand 使用；流式 bash 结果不重复打印。
-独立使用时保留 Rich Live 渲染，非终端不创建 Live。
+单一渲染路径：完成的正文与工具结果一次写入滚动区（原生 scrollback）；
+编辑器上方的短尾窗由 prompt_toolkit 通过 ``preview()`` 自取。思考与工具结果
+保留有界归档，供 /details 使用；流式 bash 结果不重复打印。
 """
 
 from __future__ import annotations
@@ -10,17 +10,14 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Callable
 from io import StringIO
 
-from rich.console import Console, Group, RenderableType
-from rich.live import Live
+from rich.console import Console
 from rich.markdown import Markdown
-from rich.spinner import Spinner
 from rich.text import Text
 
 console = Console()  # stdout：只承载答案与命令输出（-p 可安全重定向/管道）
-ui = Console(stderr=True)  # stderr：状态条 / 日志 / 审批面板等“界面”输出
+ui = Console(stderr=True)  # stderr：状态条 / 日志等“界面”输出
 
 # 阶段标签：thinking=等待首个片段 / streaming=正文流入 / tool=工具执行中
 PHASE_THINKING = "thinking"
@@ -116,10 +113,9 @@ def _thinking_summary(reasoning: str) -> Text:
 class TerminalRenderer:
     """Agent 事件 → 终端渲染。驱动将事件翻译后调用 ``update``。
 
-    ``render`` 只读组装（Live 刷新线程会并发调用，沿用无锁模式：共享量只在
-    ``update`` 里原子重绑）。实例本身即上下文管理器：``with renderer:`` 期间
-    live 区刷新、退出即消隐；``pause``/``resume`` 供阻塞输入（审批）前后
-    暂停，避免状态行盖住 ``input`` 正在等待的那一行。
+    单一渲染路径：完成的正文与工具结果一次写入滚动区；编辑器上方的尾窗由
+    prompt_toolkit 通过 ``preview()`` 自取。实例即上下文管理器：``with renderer:``
+    退出时把未提交正文标记为 Partial response 留在滚动区。
     """
 
     def __init__(
@@ -127,11 +123,8 @@ class TerminalRenderer:
         console: Console | None = None,
         *,
         min_render_interval: float = 0.12,
-        text_tail_chars: int = 1200,
-        reasoning_tail_lines: int = 3,
         max_result_lines: int = 3,
         max_result_chars: int = 400,
-        refresh_per_second: int = 10,
         context_window: int = 0,
         tool_output_tail_lines: int = 8,
     ) -> None:
@@ -142,11 +135,8 @@ class TerminalRenderer:
         self.current_tool: str | None = None
         self._console = console if console is not None else Console(stderr=True)
         self._min_render_interval = min_render_interval
-        self._text_tail_chars = text_tail_chars
-        self._reasoning_tail_lines = reasoning_tail_lines
         self._max_result_lines = max_result_lines
         self._max_result_chars = max_result_chars
-        self._refresh_per_second = refresh_per_second
         # 上下文占用展示：context_window 为 0（未知）时不显示；占用取最近一次
         # 请求的 prompt_tokens（usage 事件），压缩后回落可见
         self.context_window = context_window
@@ -157,11 +147,7 @@ class TerminalRenderer:
         self._tool_dropped = 0  # 尾窗装不下而丢弃的行数（渲染 … 标记用）
         self._reasoning_buf: list[str] = []
         self._text_buf: list[str] = []
-        self._live_text: Markdown | None = None  # 节流缓存的正文尾窗
-        self._dirty = False
-        self._last_rebuild = 0.0
-        self._live: Live | None = None
-        self._blocks: list[dict] = []  # 滚动区已提交块的留档（/expand 用）
+        self._blocks: list[dict] = []  # 滚动区已提交块的留档（/details 用）
         self._max_blocks = 20
         self._next_block_id = 1
         self.scrollback = False
@@ -170,7 +156,6 @@ class TerminalRenderer:
         self._preview_at = 0.0
         self._current_arguments: dict = {}
         self.on_status = lambda renderer: None
-        self.session_footer: Callable[[], list] | None = None
 
     def use_scrollback(self, console: Console) -> None:
         """常驻输入模式：仅追加输出，终端刷新完全交给 prompt_toolkit。"""
@@ -238,23 +223,17 @@ class TerminalRenderer:
             self.phase_t0 = time.monotonic()
             self._reasoning_buf.clear()
             self._text_buf.clear()
-            self._live_text = None
-            self._dirty = False
             self._tool_out.clear()
             self._tool_dropped = 0
         elif event == "reasoning_delta":
             self._reasoning_buf.append(payload.get("delta", ""))
-            self._dirty = True
         elif event == "text_delta":
             self._text_buf.append(payload.get("delta", ""))
             self.phase = PHASE_STREAMING
-            self._dirty = True
-            if not self.scrollback:
-                self._maybe_rebuild()
         elif event == "assistant_message":
             self._commit(payload)
-        elif event in ("tool_review", "tool_approval"):
-            self.phase = "reviewing" if event == "tool_review" else "approval"
+        elif event == "tool_review":
+            self.phase = "reviewing"
             self.current_tool = payload.get("name")
             self._current_arguments = dict(payload.get("arguments") or {})
         elif event == "tool_call":
@@ -278,7 +257,7 @@ class TerminalRenderer:
                     self._tool_dropped += overflow
         elif event == "task_progress":
             # 子代理进度（票 04）：同款尾窗，并重申 task 相位——闸门内的
-            # tool_approval 事件会改写单槽，须归位到父 task。
+            # 闸门内的事件会改写单槽，须归位到父 task。
             line = payload.get("line")
             if line:
                 self._tool_out.append(str(line))
@@ -288,18 +267,9 @@ class TerminalRenderer:
                     self._tool_dropped += overflow
             self.current_tool = "task"
             self.phase = PHASE_TOOL
-        elif event == "plan_approval":
-            self.phase = "approval"
-        elif event == "plan_result":
+        elif event == "plan_submitted":
             self.phase = PHASE_THINKING
-            self._console.print(
-                Text(
-                    "✔ 计划已批准，继续执行。" if payload.get("approved") else "计划已拒绝。",
-                    style="green" if payload.get("approved") else "yellow",
-                )
-            )
-        elif event == "approval_granted":
-            self._print_approval(payload)
+            self._print_plan(payload.get("plan") or "")
         elif event == "tool_result":
             self._print_tool_result(payload)
             self.current_tool = None
@@ -346,34 +316,18 @@ class TerminalRenderer:
             self._console.print(Markdown(content))
         self._reasoning_buf.clear()
         self._text_buf.clear()
-        self._live_text = None
-        self._dirty = False
 
-    def _print_approval(self, payload: dict) -> None:
-        name = payload["name"]
-        arguments = dict(payload["arguments"])
-        block_id = self._record_block(
-            {
-                "kind": "approval",
-                "name": name,
-                "arguments": arguments,
-                "scope": payload.get("scope", "This call only"),
-            }
+    def _print_plan(self, plan: str) -> None:
+        """计划提交：全文进滚动区（不再弹阻断式选择器）。"""
+        if not plan.strip():
+            return
+        if self._blocks and self._blocks[-1]["kind"] == "tool":
+            self._console.print()
+        self._console.print(Text("⏺ 计划已提交", style="cyan"))
+        self._console.print(Markdown(plan))
+        self._console.print(
+            Text("  /plan go 开始执行 · 或直接输入修改意见（仍在计划模式）", style="dim")
         )
-        command = arguments.get("command")
-        summary = (
-            str(command)
-            if command is not None
-            else (display_tool_name(name) + " " + _header_arg(name, arguments))
-        )
-        summary = " ".join(summary.splitlines())
-        if len(summary) > 100:
-            summary = summary[:100] + "…"
-        receipt = Text("✔ ", style="green")
-        receipt.append("You approved polya to run ")
-        receipt.append(summary, style="dim")
-        self._console.print(receipt)
-        self._console.print(Text(f"  + Show details: /details {block_id}", style="dim"))
 
     def _print_tool_header(self, name: str, arguments: dict) -> None:
         self._console.print()  # 块间空行分组
@@ -463,98 +417,34 @@ class TerminalRenderer:
             return f"✻ 思考全文（{len(content)} 字）：\n{content}"
         name = display_tool_name(block["name"])
         arguments = json.dumps(block["arguments"], ensure_ascii=False, indent=2)
-        if block["kind"] == "approval":
-            return f"Approved {name}\nScope: {block['scope']}\n{arguments}"
         return f"{block['status']} {name} · {block['duration_s']}s\n{arguments}\n{block['result']}"
 
-    # ---------- live 区 ----------
-
-    def _maybe_rebuild(self) -> None:
-        """节流重建正文尾窗：脏且距上次重建超过间隔才动（首帧恒立即）。"""
-        if not self._dirty:
-            return
-        if time.monotonic() - self._last_rebuild < self._min_render_interval:
-            return
-        text = "".join(self._text_buf)[-self._text_tail_chars :]
-        self._live_text = Markdown(text) if text else None
-        self._dirty = False
-        self._last_rebuild = time.monotonic()
+    # ---------- 状态标签（preview 头行用） ----------
 
     def _status_label(self) -> str:
         if self.phase == PHASE_TOOL:
             return f"Running {display_tool_name(self.current_tool or '')}"
         if self.phase == "reviewing":
             return "Reviewing"
-        if self.phase == "approval":
-            return "Awaiting approval"
         if self.phase == PHASE_STREAMING:
             return "Responding"
         if self._reasoning_buf:
             return "Thinking"
         return "Waiting for model"
 
-    def render(self) -> RenderableType:
-        """live 区内容：思考尾窗 / 正文尾窗 / 工具实时输出尾窗 / 状态行（纯读）。"""
-        parts: list[RenderableType] = []
-        if self.phase == PHASE_THINKING and self._reasoning_buf:
-            lines = "".join(self._reasoning_buf).splitlines()
-            tail = lines[-self._reasoning_tail_lines :]
-            if len(tail) < len(lines):
-                tail = ["…", *tail]
-            parts.append(Text("\n".join(tail), style="dim italic"))
-        if self._live_text is not None:
-            parts.append(self._live_text)
-        if self.phase == PHASE_TOOL and self._tool_out:
-            # 长命令运行中不再只有 spinner 干转：输出尾窗实时滚动（全量仍由
-            # tool_result 的 ⎿ 块承载，这里只解盲等）
-            tail = ["…", *self._tool_out] if self._tool_dropped else list(self._tool_out)
-            parts.append(Text("\n".join(tail), style="dim"))
-        elapsed = int(time.monotonic() - self.phase_t0)
-        label = f" {self._status_label()} · step {self.step}/{self.max_steps} · {elapsed}s"
-        if self.context_window and self._ctx_used:
-            percent = self._ctx_used * 100 // self.context_window
-            label += (
-                f" · {_fmt_tokens(self._ctx_used)}/{_fmt_tokens(self.context_window)}（{percent}%）"
-            )
-            if self._ctx_cached:
-                cache_percent = self._ctx_cached * 100 // self._ctx_used
-                label += f" · cache {cache_percent}%"
-        parts.append(Spinner("dots", text=Text(label, style="cyan")))
-        return Group(*parts)
-
     # ---------- 生命周期 ----------
 
     def __enter__(self) -> TerminalRenderer:
-        if self._console.is_terminal and not self.scrollback:
-            self._live = Live(
-                get_renderable=self.render,
-                console=self._console,
-                transient=True,
-                refresh_per_second=self._refresh_per_second,
-            )
-            self._live.start()
         return self
 
     def __exit__(self, *exc) -> None:
-        if self.scrollback:
-            partial = "".join(self._text_buf)
-            self._text_buf.clear()
-            self.current_tool = None
-            self._tool_out.clear()
-            self._preview_key = None
-            if partial.strip():
-                self._console.print(Text("⏺ Partial response", style="dim"))
-                self._console.print(Markdown(partial))
-            self.on_status(self)
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
-
-    def pause(self) -> None:
-        """暂停刷新（如审批 ``input`` 前），避免状态行盖住输入行。非终端 no-op。"""
-        if self._live is not None:
-            self._live.stop()
-
-    def resume(self) -> None:
-        if self._live is not None:
-            self._live.start()
+        # 中断时把尚未提交的正文标记为 Partial response 留在滚动区，清理 tail。
+        partial = "".join(self._text_buf)
+        self._text_buf.clear()
+        self.current_tool = None
+        self._tool_out.clear()
+        self._preview_key = None
+        if partial.strip():
+            self._console.print(Text("⏺ Partial response", style="dim"))
+            self._console.print(Markdown(partial))
+        self.on_status(self)

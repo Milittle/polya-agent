@@ -28,7 +28,6 @@ from rich.markdown import Markdown
 from rich_argparse import RichHelpFormatter
 
 from .agent import Agent
-from .approval import ApprovalGate, terminal_approve_plan
 from .builtin import CODING_SYSTEM_PROMPT, default_tools
 from .llm import LLM
 from .loop import run_repl, run_tool_call
@@ -38,6 +37,8 @@ from .render import TerminalRenderer, console, ui
 from .skills import SkillCatalog
 from .subagent import SubagentRunner
 from .todos import TodoStore
+from .trust import has_trust_requiring_resources, is_trusted, set_decision
+from .trust import trust as trust_path
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -50,16 +51,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-p",
         "--prompt",
-        help="单任务模式：执行一次任务后打印答案并退出（不做交互确认，需配合 --yes）",
+        help="单任务模式：执行一次任务后打印答案并退出（默认放行，以进程权限运行）",
     )
     parser.add_argument(
         "--plan", action="store_true", help="启动时进入规划模式（先探查提计划，批准后才动写操作）"
-    )
-    parser.add_argument(
-        "-y",
-        "--yes",
-        action="store_true",
-        help="自动批准一切审批（危险工具与计划）；仅在信任任务时使用",
     )
     parser.add_argument(
         "--max-steps", type=int, default=25, help="单次任务的最大迭代轮数（默认 25）"
@@ -102,7 +97,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="开启前缀不变量断言：每次请求必须是上一次的严格扩展（调试用，有比较开销）",
     )
+    parser.add_argument(
+        "--trust",
+        action="store_true",
+        help="信任当前目录：加载项目 AGENTS.md / 项目 skills（非交互场景必需）",
+    )
+    parser.add_argument(
+        "--no-trust",
+        action="store_true",
+        help="不信任当前目录：落 false 决定并按未信任启动（覆盖父目录继承）",
+    )
     return parser.parse_args(argv)
+
+
+def _confirm_trust(root: str) -> bool:
+    """交互式信任门：一行 y/N（普通 input，不抢终端）。默认不信任。"""
+    path = str(Path(root).resolve())
+    ui.print(f"首次在此目录使用 polya：{path}")
+    ui.print("信任后才能加载该目录的 AGENTS.md 与项目 skills（工具照常以进程权限运行）。")
+    try:
+        answer = input("信任此目录并继续？[y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer in ("y", "yes", "是")
 
 
 def _project_memory(root: str) -> str | None:
@@ -138,12 +155,16 @@ def build_agent(
     else:
         profile = profile_for(getattr(llm, "model", None))
     interactive = sys.stdin.isatty()
-    # 项目记忆（AGENTS.md）启动读一次，作为独立的 <project_memory> section 注入
-    # ——会话内不变，不违「系统提示词静态」铁律的精神（铁律防的是逐轮变更破缓存；
-    # # 前缀写入后下次会话生效）。缺失即跳过。
-    memory = _project_memory(args.root)
-    # 一个 gate 同时服务父会话审批与子代理审批（会话规则 / allow_all 共享，Q4）
-    gate = ApprovalGate(interactive, renderer, root=args.root)
+    # 项目信任门（trust.py，pi 模型）：未信任不加载项目资源（AGENTS.md / 项目
+    # skills），防陌生仓库的指令注入；工具仍以进程权限在 root 内运行。
+    # --trust / --no-trust 覆盖；否则查 trust.json（含父目录继承）。
+    if args.trust:
+        trusted = True
+    elif args.no_trust:
+        trusted = False
+    else:
+        trusted = is_trusted(args.root)
+    memory = _project_memory(args.root) if trusted else None
     runner = SubagentRunner(root=args.root, memory=memory, renderer=renderer)
     tools = [
         *default_tools(
@@ -165,8 +186,8 @@ def build_agent(
         system_prompt=CODING_SYSTEM_PROMPT,
         project_memory=memory,
         cwd=args.root,
-        approve=None if args.yes else gate.as_approve(),
-        approve_plan=None if args.yes else terminal_approve_plan(interactive, renderer),
+        # 默认放行：审查器缝在 Agent（review.py，AllowAllReviewer）；plan 只读
+        # 约束由它实现。未来模型审查器（Jev 类）实现同一协议接入。
         status_bar=not args.no_status,
         todos=todos,
         plan_mode=args.plan,
@@ -180,26 +201,16 @@ def build_agent(
         profile=profile,
         prefix_check=args.prefix_check,
         stream=not args.no_stream,
-        skills=SkillCatalog.discover(args.root),
+        skills=SkillCatalog.discover(args.root, trusted=trusted),
     )
     runner.attach(agent)
-    # 默认 runner（-p / 管道）：共享同一 gate；子审批走闸门（-p 无 --yes 时
-    # interactive=False 非交互默认拒绝，不旁路）。交互 REPL 会在 InteractiveSession
-    # 里重绑到会话 gate 并将 progress 接入渲染器。
-    runner.bind(gate, None, interactive)
-    parent_unrestricted = args.yes
+    agent.trusted = trusted  # /trust 状态查询用（会话启动时的实际信任态）
+    # 默认 runner（-p / 管道）：走子 Agent 自带审查器（继承父 reviewer）。交互
+    # REPL 会在 InteractiveSession 里重绑 dispatch 到父渲染器与共享审查器。
+    runner.bind(None, interactive)
 
     def _child_dispatch(child, ev):
-        return run_tool_call(
-            child,
-            renderer,
-            ev,
-            interactive,
-            gate,
-            unrestricted=parent_unrestricted,
-            origin="子任务",
-            progress=None,
-        )
+        return run_tool_call(child, renderer, ev, child.reviewer, origin="子任务")
 
     runner.dispatch = _child_dispatch
     return agent
@@ -209,6 +220,21 @@ def main(argv: list[str] | None = None) -> int:
     # profile 的录入与管理全部在会话内 /models（add 交互向导），无外置子命令
     args = parse_args(argv)
     load_dotenv()  # 与 demo.py 一致：从项目 .env 读取 OPENAI_* 配置
+    # 信任门：--trust / --no-trust 直接落盘；交互首次进「有可保护资源」的陌生
+    # 目录问一次；非交互不弹门（未信任即不加载项目资源，可用 --trust 显式声明）。
+    if args.trust:
+        trust_path(args.root)
+    elif args.no_trust:
+        set_decision(args.root, False)
+    elif (
+        args.prompt is None
+        and sys.stdin.isatty()
+        and has_trust_requiring_resources(args.root)
+        and not is_trusted(args.root)
+    ):
+        if not _confirm_trust(args.root):
+            return 0
+        trust_path(args.root)
     logging.basicConfig(
         level=logging.INFO,
         format="[%(name)s] %(message)s",

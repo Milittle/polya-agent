@@ -1,4 +1,4 @@
-"""两阶段模式（规划 → 执行）的测试：只读约束、计划审批、缓存纪律。"""
+"""两阶段模式（规划 → 执行）的测试：只读约束、计划提交结束本轮、缓存纪律。"""
 
 from __future__ import annotations
 
@@ -46,62 +46,59 @@ def test_exit_plan_mode_registered_only_in_plan_mode():
     assert "exit_plan_mode" in [t.name for t in planner.tools]
 
 
-def test_full_cycle_deny_submit_approve_execute():
-    """规划模式拒写 → 提交计划（默认自动批准）→ 写操作放行。"""
+def test_builtin_run_submits_plan_ends_turn_and_releases_mode():
+    """内置驱动：提交计划即结束本轮并释放 plan 模式，返回计划文本。"""
     llm = ScriptedLLM(
         [
             _message(tool_calls=[_call("c1", "write_thing", '{"content": "x"}')]),  # 被拒
-            _message(tool_calls=[_call("c2", "exit_plan_mode", '{"plan": "三步走"}')]),  # 批准
-            _message(tool_calls=[_call("c3", "write_thing", '{"content": "y"}')]),  # 放行
+            _message(tool_calls=[_call("c2", "exit_plan_mode", '{"plan": "三步走"}')]),  # 提交
+            _message(content="这轮不该被请求"),  # run 在计划提交后结束，不该消费
+        ]
+    )
+    agent = Agent(llm=llm, tools=[add, write_thing], plan_mode=True)
+
+    assert agent.run("做事") == "三步走"
+    assert agent.plan_mode is False  # 展示即释放执行
+    denial = llm.calls[1]["messages"][-1]["content"]
+    assert "规划模式" in denial and "exit_plan_mode" in denial
+    # 工具数组全程不变（缓存纪律）：每次请求的 tools 完全一致
+    assert llm.calls[0]["tools"] == llm.calls[1]["tools"]
+
+
+def test_plan_mode_denies_write_but_allows_read():
+    llm = ScriptedLLM(
+        [
+            _message(tool_calls=[_call("c1", "write_thing", '{"content": "x"}')]),
+            _message(tool_calls=[_call("c2", "add", '{"a": 1, "b": 2}')]),
             _message(content="完成"),
         ]
     )
     agent = Agent(llm=llm, tools=[add, write_thing], plan_mode=True)
-
     assert agent.run("做事") == "完成"
+    assert "规划模式" in llm.calls[1]["messages"][-1]["content"]  # 写被拒
+    assert llm.calls[2]["messages"][-1]["content"] == "3"  # 只读放行
+    assert agent.plan_mode is True  # 未提交计划，保持规划模式
 
-    denial = llm.calls[1]["messages"][-1]["content"]  # 第一轮的 tool 回填
-    assert "规划模式" in denial and "exit_plan_mode" in denial
 
-    approval = llm.calls[2]["messages"][-1]["content"]  # 第二轮的 tool 回填
-    assert "已批准" in approval and "执行模式" in approval
+def test_leave_plan_mode_releases_writes():
+    llm = ScriptedLLM(
+        [
+            _message(tool_calls=[_call("c1", "write_thing", '{"content": "y"}')]),
+            _message(content="完成"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[write_thing], plan_mode=True)
+    agent.leave_plan_mode()
+    assert agent.run("做事") == "完成"
+    assert llm.calls[1]["messages"][-1]["content"] == "已写入: y"
 
-    executed = llm.calls[3]["messages"][-1]["content"]  # 第三轮的 tool 回填
-    assert executed == "已写入: y"
+
+def test_plan_go_command_releases_plan_mode():
+    from polya.commands import handle_command
+
+    agent = Agent(llm=ScriptedLLM([]), tools=[add], plan_mode=True, plan_capable=True)
+    assert "已批准" in handle_command("/plan go", agent)
     assert agent.plan_mode is False
-
-    # 工具数组全程不变（缓存纪律）：每次请求的 tools 完全一致
-    assert llm.calls[0]["tools"] == llm.calls[1]["tools"] == llm.calls[2]["tools"]
-
-
-def test_plan_rejection_keeps_readonly():
-    llm = ScriptedLLM(
-        [
-            _message(tool_calls=[_call("c1", "exit_plan_mode", '{"plan": "烂计划"}')]),
-            _message(tool_calls=[_call("c2", "write_thing", '{"content": "x"}')]),  # 仍被拒
-            _message(content="好吧"),
-        ]
-    )
-    agent = Agent(llm=llm, tools=[write_thing], plan_mode=True, approve_plan=lambda plan: False)
-    agent.run("做事")
-
-    rejection = llm.calls[1]["messages"][-1]["content"]
-    assert "被拒绝" in rejection
-    assert agent.plan_mode is True  # 仍在规划模式
-    still_denied = llm.calls[2]["messages"][-1]["content"]
-    assert "规划模式" in still_denied
-
-
-def test_readonly_tools_work_in_plan_mode():
-    llm = ScriptedLLM(
-        [
-            _message(tool_calls=[_call("c1", "add", '{"a": 1, "b": 2}')]),
-            _message(content="3"),
-        ]
-    )
-    agent = Agent(llm=llm, tools=[add, write_thing], plan_mode=True)
-    assert agent.run("算数") == "3"
-    assert llm.calls[1]["messages"][-1]["content"] == "3"  # 只读工具未被拦截
 
 
 def test_status_bar_shows_plan_mode():
@@ -114,17 +111,3 @@ def test_status_bar_shows_plan_mode():
     agent2 = Agent(llm=llm2, tools=[add], status_bar=True)
     agent2.run("hi")
     assert "规划" not in llm2.calls[0]["messages"][-1]["content"]
-
-
-def test_exit_plan_mode_after_execution_is_noop():
-    llm = ScriptedLLM(
-        [
-            _message(tool_calls=[_call("c1", "exit_plan_mode", '{"plan": "p"}')]),
-            _message(tool_calls=[_call("c2", "exit_plan_mode", '{"plan": "又交"}')]),
-            _message(content="ok"),
-        ]
-    )
-    agent = Agent(llm=llm, tools=[add], plan_mode=True)
-    agent.run("做事")
-    noop = llm.calls[2]["messages"][-1]["content"]
-    assert "已处于执行模式" in noop

@@ -17,6 +17,26 @@ def make_skill(directory, name="develop", body="Read tests before editing.", des
     return path
 
 
+def test_reload_skills_hot_reloads_catalog_into_prompt(tmp_path):
+    from polya.agent import Agent
+
+    home = tmp_path / "home"
+    home.mkdir()
+    root = tmp_path / "repo"
+    root.mkdir()
+    make_skill(root / ".polya/skills", "alpha", description="Alpha skill")
+    catalog = SkillCatalog.discover(root, home / ".polya/skills", home / ".agents/skills")
+    agent = Agent(llm=object(), skills=catalog)
+    assert "alpha" in agent.system_prompt
+
+    make_skill(root / ".polya/skills", "beta", description="Beta skill")
+    result = agent.reload_skills()
+    assert "已重载" in result and "beta" in result
+    assert "alpha" in agent.system_prompt and "beta" in agent.system_prompt
+    # 热加载 = 追加一条 patch system 入口（合法重启点），投影重放后生效
+    assert [e.kind for e in agent.tree.active_branch()].count("system") == 2
+
+
 def test_agents_locations_recursive_discovery(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
@@ -127,7 +147,8 @@ def test_skill_pagination_and_reset(tmp_path):
 def test_cli_assembles_skills_and_static_tools(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     make_skill(tmp_path / ".polya/skills")
-    agent = build_agent(parse_args(["--root", str(tmp_path)]), llm=object())
+    # 项目 skills 受信任门约束：--trust 才加载
+    agent = build_agent(parse_args(["--root", str(tmp_path), "--trust"]), llm=object())
     assert "develop" in agent.system_prompt
     prompt = agent.system_prompt
     schemas = agent.tools.schemas()

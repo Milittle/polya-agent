@@ -10,7 +10,6 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from polya import Agent
-from polya.approval import ApprovalGate
 from polya.commands import (
     BY_NAME,
     COMMANDS,
@@ -34,10 +33,8 @@ def box(tmp_path):
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("/plan ", ["on", "off"]),
+        ("/plan ", ["on", "go", "off"]),
         ("/plan o", ["on", "off"]),
-        ("/permissions a", ["ask", "all"]),
-        ("/permissions al", ["all"]),
         ("/plan on ", []),
         ("/plan on off", []),
         ("hello /pl", []),
@@ -65,15 +62,13 @@ def test_help_lists_commands_and_menu_omits_alias_rows():
         "/new extra",
         "/exit now",
         "/plan yes",
-        "/expand 0",
-        "/expand -3",
-        "/details",
-        "/permissions all extra",
+        "/details 0",
+        "/details -3",
     ],
 )
 def test_bad_arguments_do_not_change_state(text, box):
     agent = Agent(llm=object(), tools=[])
-    agent.history.append({"role": "user", "content": "keep"})
+    agent.append_user_message("keep")
     assert "用法" in handle_command(text, agent)
     assert len(agent.history) == 1 and not agent.plan_mode
     sent = []
@@ -93,10 +88,10 @@ def test_typo_is_suggested_but_never_executed(box):
     assert "/reset" in box._hint
 
 
-@pytest.mark.parametrize("name,choice", [("/plan", "off"), ("/permissions", "all")])
+@pytest.mark.parametrize("name,choice", [("/plan", "off")])
 def test_bare_command_picker_selection_then_submission(box, name, choice):
     sent = []
-    box._state = {"mode": "plan", "permissions": "all"}
+    box._state = {"mode": "plan"}
     buffer = Buffer(accept_handler=lambda b: sent.append(b.text))
     buffer.document = Document(name)
     box._submit(buffer)
@@ -113,11 +108,11 @@ def test_bare_command_picker_selection_then_submission(box, name, choice):
 def test_cancel_picker_keeps_command_without_submission(box):
     sent = []
     buffer = Buffer(accept_handler=lambda b: sent.append(b.text))
-    buffer.document = Document("/permissions")
+    buffer.document = Document("/plan")
     box._submit(buffer)
     buffer.go_to_completion(1)
     buffer.cancel_completion()
-    assert buffer.text == "/permissions " and not sent
+    assert buffer.text == "/plan " and not sent
 
 
 def test_complete_command_is_not_stuck_in_exact_match_menu(box):
@@ -129,21 +124,66 @@ def test_complete_command_is_not_stuck_in_exact_match_menu(box):
     assert sent == ["/status"]
 
 
-def test_permissions_dispatch_uses_session_gate():
-    agent = Agent(llm=object(), tools=[], approve=None)
-    gate = ApprovalGate(True)
-    context = CommandContext(agent, gate=gate)
-    assert "全部允许" in dispatch_command("/permissions\tall", context)
-    assert gate.allow_all
-    assert "逐次审批" in dispatch_command("/permissions ask", context)
-    assert not gate.allow_all and agent.approve is not None
-    assert "逐次审批" in dispatch_command("/status", context)
+def test_rewind_save_sessions_load_roundtrip(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = Agent(llm=object(), tools=[])
+    agent.append_user_message("任务一")
+    agent.tree.append("assistant", {"content": "答一"})
+
+    assert "已回退" in dispatch_command("/rewind 1", CommandContext(agent))
+    assert agent.history == [{"role": "user", "content": "任务一"}]  # assistant 被孤立
+
+    assert "已保存" in dispatch_command("/save demo", CommandContext(agent))
+    assert "demo" in dispatch_command("/sessions", CommandContext(agent))
+
+    restored = Agent(llm=object(), tools=[])
+    assert "已恢复" in dispatch_command("/load demo", CommandContext(restored))
+    assert restored.history == agent.history
+
+
+def test_tree_and_jump_navigate_branch():
+    agent = Agent(llm=object(), tools=[])
+    agent.append_user_message("任务一")
+    agent.tree.append("assistant", {"content": "答一"})
+
+    overview = dispatch_command("/tree", CommandContext(agent))
+    assert "→ 分支1" in overview and "#3 assistant" in overview
+
+    assert "已跳到入口 #2" in dispatch_command("/jump 2", CommandContext(agent))
+    assert agent.history == [{"role": "user", "content": "任务一"}]  # assistant 被孤立
+
+
+def test_tree_shows_forks_and_branches_after_rewind():
+    agent = Agent(llm=object(), tools=[])
+    agent.append_user_message("任务一")
+    agent.tree.append("assistant", {"content": "答一"})
+    agent.rewind(1)  # 回到 user，答一 成孤儿分支
+    agent.tree.append("assistant", {"content": "答二"})  # 新分支
+
+    overview = dispatch_command("/tree", CommandContext(agent))
+    assert "分叉点：#2" in overview
+    assert "分支1" in overview and "分支2" in overview
+    assert "→ 分支2" in overview  # 当前分支是新的
+
+
+def test_edit_and_remove_entry_change_projection_only():
+    agent = Agent(llm=object(), tools=[])
+    agent.append_user_message("原始任务")
+    assert "已编辑" in dispatch_command("/edit 2 新任务", CommandContext(agent))
+    assert agent.history == [{"role": "user", "content": "新任务"}]
+    assert "原始任务" in agent.tree.read(2)  # 原文保留
+
+    assert "已从投影移除" in dispatch_command("/edit 2 remove", CommandContext(agent))
+    assert agent.history == []
+    assert "原始任务" in agent.tree.read(2)
 
 
 def test_clear_new_and_reset_alias_split_session_scopes():
     """/clear 只清 agent；/new 另触发会话级 restart；/reset 是 /clear 的别名。"""
     agent = Agent(llm=object(), tools=[])
-    agent.history.append({"role": "user", "content": "keep"})
+    agent.append_user_message("keep")
     calls = []
 
     def restart() -> str:
@@ -153,19 +193,19 @@ def test_clear_new_and_reset_alias_split_session_scopes():
     context = CommandContext(agent, restart=restart)
     assert "已清空" in dispatch_command("/clear", context)
     assert agent.history == [] and calls == []  # /clear 不动会话级状态
-    agent.history.append({"role": "user", "content": "again"})
+    agent.append_user_message("again")
     result = dispatch_command("/new", context)
     assert agent.history == [] and calls == [1]
     assert "新会话" in result and "已丢弃 2 条排队消息" in result
-    agent.history.append({"role": "user", "content": "once more"})
+    agent.append_user_message("once more")
     assert "已清空" in dispatch_command("/reset", context)  # 别名走同一处理器
     assert agent.history == [] and calls == [1]
 
 
-def test_invalid_expand_never_reaches_renderer():
+def test_invalid_details_never_reaches_renderer():
     renderer = TerminalRenderer(Console(file=StringIO()))
-    renderer.expand_blocks = lambda *_: pytest.fail("invalid count must not render")
-    assert "用法" in handle_command("/expand -1", None, renderer)
+    renderer.expand_blocks = lambda *_: pytest.fail("invalid id must not render")
+    assert "用法" in handle_command("/details -1", None, renderer)
 
 
 # ---------- /models：动态 choices + 向导录入 + 会话中切换（票 14） ----------
@@ -220,12 +260,14 @@ def test_models_listing_marks_active_and_masks_keys(tmp_path, monkeypatch):
 def test_models_switch_replaces_llm_strips_reasoning_writes_active(tmp_path, monkeypatch):
     _write_models(tmp_path, monkeypatch, [GLM, CLAUDE], active="glm-plan")
     agent = Agent(llm=object(), tools=[])
-    agent.history = [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "a", "reasoning_content": "thinking"},
-        {"role": "tool", "content": "ok"},
-        {"role": "assistant", "content": "b", "tool_calls": [], "reasoning_content": "t2"},
-    ]
+    agent.tree.replace_conversation(
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "a", "reasoning_content": "thinking"},
+            {"role": "tool", "content": "ok"},
+            {"role": "assistant", "content": "b", "tool_calls": [], "reasoning_content": "t2"},
+        ]
+    )
     agent._last_prefix = [{"role": "system", "content": "x"}]
     renderer = TerminalRenderer(Console(file=StringIO()))
 

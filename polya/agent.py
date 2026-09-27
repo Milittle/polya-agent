@@ -2,9 +2,9 @@
 
 生成器协议（ADR 0002）：:meth:`Agent.steps` 是一个生成器，``yield`` 统一事件
 （词表见 :class:`Event` 各子类），``result = yield ToolCall(...)`` 把工具的执行权
-与审批交给消费方（驱动层）。:meth:`Agent.run` 是内置驱动——消费生成器 + approve
-审批策略 + 执行器，库用法、``-p`` 模式与测试复用之；需要自定义审批或实时渲染的
-前端直接消费 ``steps()``。压缩、状态栏注入、历史管理等上下文管理仍属 agent。
+与审查交给消费方（驱动层）。:meth:`Agent.run` 是内置驱动——消费生成器 + 审查器
++ 执行器，库用法、``-p`` 模式与测试复用之；需要自定义审查或实时渲染的前端直接
+消费 ``steps()``。压缩、状态栏注入、历史管理等上下文管理仍属 agent。
 """
 
 from __future__ import annotations
@@ -15,12 +15,13 @@ import logging
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import ClassVar
 
+from . import session as session_store
 from .compact import (
     COMPRESS_MARKER,
     MICRO_MIN_CHARS,
-    clearable_indices,
     compact_messages,
     compact_restart,
     effective_keep,
@@ -28,15 +29,22 @@ from .compact import (
     microcompact,
 )
 from .executor import execute
-from .history import HistoryArchive
 from .i18n import t, tool_text
-from .permissions import Context, decide
-from .prompt import SystemPrompt, tool_guidelines, tool_snippets
+from .prompt import SystemPrompt, diff_sections, tool_guidelines, tool_snippets
 from .providers import ModelProfile, profile_for
+from .review import AllowAllReviewer, Reviewer
 from .skills import SkillCatalog
 from .status import StatusSnapshot, render_status
 from .todos import TodoStore
 from .tools import Tool, ToolRegistry, tool
+from .tree import (
+    KIND_ASSISTANT,
+    KIND_SUMMARY,
+    KIND_SYSTEM,
+    KIND_TOOL,
+    KIND_USER,
+    SessionTree,
+)
 
 logger = logging.getLogger("polya.agent")
 
@@ -108,7 +116,7 @@ class Compaction(Event):
 
 @dataclass(frozen=True)
 class PlanSubmitted(Event):
-    """规划模式提交计划：驱动层审批（批准则翻转 agent.plan_mode）后回传结果。"""
+    """规划模式提交计划：驱动层展示并结束本轮（批准由调用方翻转 plan_mode）。"""
 
     event: ClassVar[str] = "plan_submitted"
     plan: str
@@ -141,12 +149,11 @@ class Agent:
         tools: list[Tool] | ToolRegistry | None = None,
         system_prompt: str | None = None,
         max_steps: int = 10,
-        approve: Callable[[Tool, dict], bool] | None = None,
         status_bar: bool | Callable[[StatusSnapshot], str] | None = None,
         todos: TodoStore | None = None,
         plan_mode: bool = False,
         plan_capable: bool = False,
-        approve_plan: Callable[[str], bool] | None = None,
+        reviewer: Reviewer | None = None,
         compress: bool = False,
         context_window: int | None = None,
         compress_threshold: float | None = None,
@@ -169,26 +176,37 @@ class Agent:
         self.skills = skills
         if skills is not None:
             self.tools.add(skills.tool())
-        self.archive = HistoryArchive()
         if compress:
-            self.tools.add(self.archive.tool())
+            self.tools.add(self._history_read_tool())
         self.max_steps = max_steps
-        self.approve = approve
+        # 审查器缝（review.py）：默认放行，plan 只读约束在 AllowAllReviewer 内。
+        # 未来模型审查器（Jev 类）实现同一协议即可接入。
+        self.reviewer: Reviewer = reviewer or AllowAllReviewer()
         # 状态栏渲染器：True 用默认渲染，callable 自定义，None/False 关闭。
         # 状态以 user 消息追加在上下文末尾（书 2.6），绝不修改已有消息。
         self.status_bar = render_status if status_bar is True else status_bar or None
+        # 状态栏去重键：实质字段（工具计数/TODO/模式）不变时跳过追加——截断续跑等
+        # 「无工具调用的空转轮」不再重复塞入相同的状态消息。
+        self._last_status_key: tuple | None = None
         # 两阶段模式：plan_mode 是驱动层拥有的运行时状态（Q12——agent 的控制流
         # 不再分支于它；decide() 判定、状态栏显示、驱动层翻转），构造时给定初值。
         # plan_capable 只控制 exit_plan_mode 工具的注册（构造时一次）——两者解耦，
         # CLI 可以随时切换模式而不动工具数组（缓存纪律）。
         self.plan_mode = plan_mode
-        self.approve_plan = approve_plan
         if plan_mode or plan_capable:
             self._register_exit_plan_mode()
         # TODO 存储：todo_write 工具写入（default_tools(todos=...) 接同一个实例），
         # 状态栏每轮把它渲染到上下文末尾——外部记忆，不靠模型回忆。
         self.todos = todos if todos is not None else TodoStore()
-        self.history: list[dict] = []
+        self.tree = SessionTree()
+        # 会话身份（session-lifecycle 票 01）：当前会话名 + 元数据。autosave/`/save`
+        # 写头，`/resume`/`/fork`/`/clone` 读改。
+        self.session_name: str | None = None
+        self.session_title: str | None = None
+        self.session_created: str = ""
+        self.session_updated: str = ""
+        # 项目信任态（CLI 门控的元信息，供 /trust 状态查询；引擎本身不读）。
+        self.trusted: bool = True
         # token 用量统计：只做记录，不进消息历史（保持前缀字节稳定）
         self.last_usage: dict | None = None
         self.total_usage: dict = {
@@ -230,6 +248,7 @@ class Agent:
         self._size_cache: dict[int, int] = {}
         self._size_cache_len = -1
         self.system_prompt = self._build_system_prompt()
+        self.tree.reset_with_system(self.system_prompt, self._prompt.sections())
         # 运行时前缀不变量（可选）：两次压缩点之间请求序列必须严格 append-only。
         # 破坏前缀对纯 KV Cache 只是缓存变贵（2.3）；对回传 thinking 的模型是
         # 推理连续性断裂（2.7）——所以提供可开启的运行时断言。
@@ -241,6 +260,18 @@ class Agent:
         # 子代理渲染/绑定槽（ADR 0004）：驱动层 attach 时挂上 SubagentRunner；
         # agent 不依赖 subagent 模块，避免循环导入。
         self.subagent: object | None = None
+
+    @property
+    def history(self) -> list[dict]:
+        """会话消息（不含 system 入口）的兼容视图：从树确定性投影。
+
+        只读——驱动层注入消息用 :meth:`append_user_message`，压缩用树方法。
+        """
+        return self.tree.conversation()
+
+    def append_user_message(self, content: str) -> None:
+        """驱动层在迭代边界注入一条 user 消息（shell 输出 / 排队输入）。"""
+        self.tree.append(KIND_USER, {"content": content})
 
     def _build_system_prompt(self) -> str:
         """具名 section 装配系统提示词（prompt.SystemPrompt）。
@@ -258,10 +289,188 @@ class Agent:
             prompt.set("project_memory", self.project_memory)
         if self.cwd:
             prompt.set("cwd", self.cwd.replace("\\", "/"))
+        self._prompt = prompt
         return prompt.render()
 
-    def reset(self) -> None:
-        self.history.clear()
+    def reload_skills(self) -> str:
+        """热加载技能目录：重扫 + 追加 patch ``<skills>`` section 的 system 入口。
+
+        合法重启点：前缀基线 / usage 校准 / 尺寸缓存全部重置，投影一次有界 miss。
+        """
+        if self.skills is None:
+            return "未启用技能目录。"
+        previous = self._prompt.sections()
+        self.skills.reload()
+        self._prompt.set("skills", self.skills.prompt().strip())
+        patch = diff_sections(previous, self._prompt.sections())
+        if not patch:
+            return "技能无变化。"
+        self.tree.append(KIND_SYSTEM, {"sections": patch})
+        self.system_prompt = self._prompt.render()
+        self._reset_restart_point()
+        names = "、".join(sorted(self.skills.skills)) or "（无）"
+        return f"已重载技能：{names}"
+
+    def rewind(self, steps: int = 1) -> str:
+        """回退当前分支 steps 步（合法重启点），后续输入从此分叉。"""
+        entry = self.tree.rewind(steps)
+        self._reset_restart_point()
+        return f"已回退到入口 #{entry.id}（{entry.kind}）；后续输入将从此分叉。"
+
+    def jump(self, entry_id: int) -> str:
+        """跳到任意历史入口（合法重启点），后续输入从此分叉。"""
+        entry = self.tree.move_to(entry_id)
+        self._reset_restart_point()
+        return f"已跳到入口 #{entry.id}（{entry.kind}）。"
+
+    def branch_overview(self) -> str:
+        """整棵树概览：分叉点 + 所有分支（当前分支标 →），供 /tree 导航。"""
+        lines: list[str] = []
+        forks = self.tree.fork_points()
+        if forks:
+            lines.append("分叉点：" + "、".join(f"#{e.id}({e.kind})" for e in forks))
+        for index, branch in enumerate(self.tree.branches(), 1):
+            leaf = branch[-1]
+            active = leaf.id == self.tree.active_id
+            marker = "→" if active else " "
+            summary = str(leaf.payload.get("content") or "").replace("\n", " ")[:40]
+            lines.append(
+                f"{marker} 分支{index}：叶 #{leaf.id} {leaf.kind} · {summary} · {len(branch)} 入口"
+            )
+        return "\n".join(lines) or "（空树）"
+
+    def edit_entry(self, entry_id: int, new_content: str) -> str:
+        """在投影里替换某入口内容（原文保留，可 history_read 回查）。"""
+        entry = self.tree.get(entry_id)
+        if entry.kind == "system":
+            return "不能编辑 system 入口。"
+        self.tree.override(entry.id, {**entry.payload, "content": new_content})
+        self._reset_restart_point()
+        return f"已编辑入口 #{entry.id}（投影）；原文仍可 history_read(entry_id={entry.id}) 回查。"
+
+    def remove_entry(self, entry_id: int) -> str:
+        """从投影移除某入口（原文保留，可 history_read 回查）。"""
+        entry = self.tree.get(entry_id)
+        if entry.kind == "system":
+            return "不能移除 system 入口。"
+        self.tree.override(entry.id, None)
+        self._reset_restart_point()
+        return f"已从投影移除入口 #{entry.id}；原文仍可 history_read(entry_id={entry.id}) 回查。"
+
+    def _reset_restart_point(self) -> None:
+        """合法重启点共用的状态重置（回退 / 跳转 / 换模型 / skills 热加载 / 恢复）。"""
+        self._last_prefix = None
+        self.last_usage = None
+        self._request_size = 0
+        self._reset_size_cache()
+
+    # ---------- 会话身份与持久化（session-lifecycle 票 01） ----------
+
+    def session_meta(self) -> session_store.SessionMeta:
+        """当前会话元数据（落盘 / 导出用）。"""
+        return session_store.SessionMeta(
+            name=self.session_name or "",
+            title=self.session_title,
+            cwd=self.cwd or "",
+            created=self.session_created,
+            updated=self.session_updated,
+        )
+
+    def set_session_title(self, title: str) -> None:
+        self.session_title = title
+        self.session_updated = session_store.iso_now()
+
+    def _ensure_session_name(self) -> str:
+        """无名字时生成自动名（不重置会话），供 autosave / 导出用。"""
+        if self.session_name is None:
+            self.session_name = session_store.unique_name()
+            self.session_created = self.session_created or session_store.iso_now()
+        return self.session_name
+
+    def save_session(self, name: str | None = None) -> str:
+        """把会话树与元数据持久化到 ``~/.polya/sessions/<name>.jsonl``。"""
+        if name is None:
+            name = self._ensure_session_name()
+        name = name.strip()
+        if not session_store.valid_name(name):
+            return "会话名不能含空白或路径分隔符。"
+        self.session_name = name
+        meta = session_store.SessionMeta(
+            name=name,
+            title=self.session_title,
+            cwd=self.cwd or "",
+            created=self.session_created or session_store.iso_now(),
+        )
+        path = session_store.write(meta, self.tree.to_jsonl())
+        self.session_created, self.session_updated = meta.created, meta.updated
+        return f"已保存会话 {name} 到 {path}"
+
+    def autosave(self) -> None:
+        """任务收尾静默落盘：有内容才写；无名字则生成。失败不打断会话。"""
+        if not self.history:
+            return
+        self._ensure_session_name()
+        try:
+            self.save_session()
+        except OSError:
+            pass
+
+    def load_session(self, name: str) -> str:
+        """从 ``~/.polya/sessions/<name>.jsonl`` 恢复会话（合法重启点）。"""
+        result = session_store.read(name)
+        if result is None:
+            return f"无法读取会话 {name}：文件不存在或格式错误。"
+        meta, entry_lines = result
+        try:
+            self.tree = SessionTree.from_jsonl(entry_lines)
+        except ValueError as exc:
+            return f"无法读取会话 {name}：{exc}"
+        projected = self.tree.project()
+        if projected and projected[0]["role"] == "system":
+            self.system_prompt = projected[0]["content"]
+        self.session_name = meta.name
+        self.session_title = meta.title
+        self.session_created = meta.created
+        self.session_updated = meta.updated
+        self._adopt_session()
+        return f"已恢复会话 {name}（{len(self.tree)} 个入口）"
+
+    def new_session(self, name: str | None = None) -> str:
+        """开新会话：清树与派生状态，分配新名字（不落盘，首次 autosave 写）。"""
+        self.reset()
+        self.session_name = name.strip() if name else session_store.unique_name()
+        self.session_title = None
+        self.session_created = session_store.iso_now()
+        self.session_updated = self.session_created
+        return self.session_name
+
+    def fork_session(self, entry_id: int, name: str | None = None) -> str:
+        """从根到入口 entry_id 的祖先路径派生新会话（合法重启点）。"""
+        try:
+            forked = self.tree.copy_branch_upto(entry_id)
+        except ValueError as exc:
+            return f"无法分叉：{exc}"
+        self.tree = forked
+        self.session_name = name.strip() if name else session_store.unique_name()
+        self.session_title = None
+        self.session_created = session_store.iso_now()
+        self.session_updated = self.session_created
+        self._adopt_session()
+        self.autosave()  # 分叉结果立刻可见于 /resume
+        return f"已从入口 #{entry_id} 分叉出新会话 {self.session_name}（{len(self.tree)} 个入口）。"
+
+    def clone_session(self, name: str | None = None) -> str:
+        """复制整棵当前会话（含投影覆盖）为新会话，主题沿用。"""
+        self.tree = self.tree.copy()
+        self.session_name = name.strip() if name else session_store.unique_name()
+        self.session_created = session_store.iso_now()
+        self.session_updated = self.session_created
+        self._adopt_session()
+        self.autosave()  # 克隆结果立刻可见于 /resume
+        return f"已复制当前会话为 {self.session_name}（{len(self.tree)} 个入口）。"
+
+    def _adopt_session(self) -> None:
+        """切换/加载会话后重置派生状态（统计 / TODO / 读改追踪 / 压缩累积）。"""
         self.last_usage = None
         self.total_usage = {
             "prompt_tokens": 0,
@@ -277,11 +486,14 @@ class Agent:
         self._read_files.clear()
         self._modified_files.clear()
         self._last_summary = None
-        self._size_cache.clear()
-        self._size_cache_len = -1
-        self.archive.reset()
+        self._reset_size_cache()
+        self._last_status_key = None
         if self.skills is not None:
             self.skills.reset()
+
+    def reset(self) -> None:
+        self.tree.reset_with_system(self.system_prompt, self._prompt.sections())
+        self._adopt_session()
 
     def switch_model(self, llm, profile: ModelProfile | None = None) -> None:
         """会话中换模型（/models，票 14）：只在迭代边界调用（驱动层 busy 语义保证）。
@@ -296,14 +508,13 @@ class Agent:
         self.profile = profile or profile_for(getattr(llm, "model", None))
         self.context_window = self.profile.context_window
         self.compress_threshold = self.profile.compress_threshold
-        for message in self.history:
-            message.pop("reasoning_content", None)
+        self.tree.strip_reasoning()
         self._last_prefix = None
         self.last_usage = None
         self._request_size = 0
         self._compress_failures = 0
-        self._size_cache.clear()
-        self._size_cache_len = -1
+        self._reset_size_cache()
+
 
     # ---------- 生成器协议 ----------
 
@@ -314,24 +525,21 @@ class Agent:
         # 复用的前提），因此在这里冻结注册表，防止运行中途增删工具。
         self.tools.freeze()
         self._truncation_continues = 0
-        self.history.append({"role": "user", "content": user_input})
-        messages = [{"role": "system", "content": self.system_prompt}, *self.history]
+        self.tree.append(KIND_USER, {"content": user_input})
+        messages = self.tree.project()
         schemas = self.tools.schemas() or None
 
         for step in range(1, self.max_steps + 1):
             yield Iteration(step=step, max_steps=self.max_steps)
             # 驱动可在迭代边界追加排队输入。此时上一批 tool_call 已全部回填，
-            # 从 history 重建请求，确保新消息进入本轮且保留前缀不变量。
-            messages = [{"role": "system", "content": self.system_prompt}, *self.history]
+            # 从树重建请求，确保新消息进入本轮且保留前缀不变量。
+            messages = self.tree.project()
             full_applied = False
             if self._should_compress():
                 compacted = self._try_compress(user_input)
                 if compacted is not None:
                     before = self._apply_compaction(compacted)
-                    messages = [
-                        {"role": "system", "content": self.system_prompt},
-                        *self.history,
-                    ]
+                    messages = self.tree.project()
                     full_applied = True
                     yield Compaction(mode="full", before=before, after=len(compacted))
             # 微压缩兜底（Q8）：全量未触发但过 0.6 阈值，或全量失败时，用无 LLM 的
@@ -340,10 +548,7 @@ class Agent:
                 micro = self._try_microcompress()
                 if micro is not None:
                     before, cleared = micro
-                    messages = [
-                        {"role": "system", "content": self.system_prompt},
-                        *self.history,
-                    ]
+                    messages = self.tree.project()
                     yield Compaction(
                         mode="micro",
                         before=before,
@@ -356,9 +561,15 @@ class Agent:
             if self.status_bar is not None:
                 # 状态栏：以 user 角色追加在末尾（书 2.6）。持久追加模式——
                 # 旧状态留在轨迹里不删改，前缀保持字节稳定。
-                status_message = {
-                    "role": "user",
-                    "content": self.status_bar(
+                # 去重：实质字段（工具计数/TODO/模式）不变时跳过追加，避免空转轮
+                # 重复塞入相同状态（时间戳已移除，否则每轮都必然「变化」）。
+                key = (
+                    tuple(sorted(self.tool_counts.items())),
+                    tuple((item["content"], item["status"]) for item in self.todos.as_dicts()),
+                    self.plan_mode,
+                )
+                if key != self._last_status_key:
+                    status_content = self.status_bar(
                         StatusSnapshot(
                             iteration=step,
                             max_steps=self.max_steps,
@@ -367,10 +578,10 @@ class Agent:
                             todos=self.todos.as_dicts(),
                             plan_mode=self.plan_mode,
                         )
-                    ),
-                }
-                messages.append(status_message)
-                self.history.append(status_message)
+                    )
+                    self.tree.append(KIND_USER, {"content": status_content})
+                    messages = self.tree.project()
+                    self._last_status_key = key
 
             if self.compress and self._context_size() >= self.context_window * 0.95:
                 raise RuntimeError(t("agent.context_limit"))
@@ -435,7 +646,7 @@ class Agent:
                     for call in message.tool_calls
                 ]
             messages.append(assistant)
-            self.history.append(assistant)
+            self.tree.append(KIND_ASSISTANT, {k: v for k, v in assistant.items() if k != "role"})
             # reasoning 原样给 UI——显示它与是否随历史回传（profile 的
             # reasoning_passthrough）是两回事
             try:
@@ -460,13 +671,11 @@ class Agent:
                         if self.compress:
                             compacted = self._try_compress(user_input)
                             if compacted is not None:
-                                self.history[:] = compacted
+                                self.tree.replace_conversation(compacted)
                                 self._last_prefix = None
-                        self.history.append(
-                            {
-                                "role": "user",
-                                "content": t("agent.truncation_continue"),
-                            }
+                        self.tree.append(
+                            KIND_USER,
+                            {"content": t("agent.truncation_continue")},
                         )
                         continue
                     if truncated:
@@ -517,7 +726,7 @@ class Agent:
                         "content": annotated,
                     }
                     messages.append(tool_message)
-                    self.history.append(tool_message)
+                    self.tree.append(KIND_TOOL, {"tool_call_id": call.id, "content": annotated})
             except (KeyboardInterrupt, GeneratorExit):
                 # 中断可能落在工具序列中间：assistant 已声明 N 个 tool_call，
                 # 只回填一部分的话，下一轮请求的序列残缺会被 API 拒绝（每个
@@ -531,39 +740,50 @@ class Agent:
     # ---------- 内置驱动 ----------
 
     def run(self, user_input: str) -> str:
-        """内置驱动：消费 steps() + approve 审批策略 + 执行器（库 / -p / 测试）。
+        """内置驱动：消费 steps() + 审查器 + 执行器（库 / -p / 测试）。
 
-        流式片段照常 yield，但内置驱动不渲染、安静忽略（handle 返回 None）。"""
+        流式片段照常 yield，但内置驱动不渲染、安静忽略。计划提交即本轮结束，
+        计划文本作为返回值（无交互，展示即结束）。"""
 
-        def handle(ev: Event) -> str | None:
+        gen = self.steps(user_input)
+        to_send: str | None = None
+        while True:
+            try:
+                ev = gen.send(to_send)
+            except StopIteration as stop:
+                return stop.value
             if isinstance(ev, PlanSubmitted):
-                return self._handle_plan(ev.plan)
+                self.leave_plan_mode()
+                return self._end_turn_after_plan(gen, ev.plan)
             if isinstance(ev, ToolCall):
-                return self._builtin_tool(ev)
-            return None
+                to_send = self._builtin_tool(ev)
+            else:
+                to_send = None
 
-        return drive(self.steps(user_input), handle)
+    @staticmethod
+    def _end_turn_after_plan(gen, plan: str) -> str:
+        """回填计划结果并结束本轮：先 send 让工具结果落历史，再 close。"""
+        try:
+            gen.send("计划已展示；本轮结束，等待用户指示。")
+        except StopIteration:
+            pass
+        finally:
+            gen.close()
+        return plan
+
+    def leave_plan_mode(self) -> None:
+        """驱动层翻转规划模式（Q12）：批准或内置驱动展示计划后调用。"""
+        self.plan_mode = False
 
     def _builtin_tool(self, ev: ToolCall) -> str:
         item = self.tools.get(ev.name)
         if item is None:
             return f"Error: unknown tool '{ev.name}'"
-        decision = decide(item, ev.arguments, Context(plan=self.plan_mode))
-        if decision.verdict == "deny":
-            return decision.reason
-        if self.approve is not None and not self.approve(item, ev.arguments):
-            return t("agent.rejected", name=ev.name)
+        outcome = self.reviewer.review(item, ev.arguments, plan=self.plan_mode)
+        if outcome.verdict == "deny":
+            return outcome.reason
         result, _ = execute(item, ev.arguments)
         return result
-
-    def _handle_plan(self, plan: str) -> str:
-        if not self.plan_mode:
-            return "已处于执行模式，无需再调用 exit_plan_mode。"
-        approved = self.approve_plan(plan) if self.approve_plan is not None else True
-        if approved:
-            self.plan_mode = False
-            return "计划已批准，进入执行模式：现在可以执行写操作（仍受审批钩子约束）。"
-        return "计划被拒绝：请根据用户反馈修改计划，重新调用 exit_plan_mode 提交。"
 
     # ---------- 内部 ----------
 
@@ -603,6 +823,17 @@ class Agent:
         self.total_usage["cached_tokens"] = (
             self.total_usage.get("cached_tokens", 0) + self.last_usage["cached_tokens"]
         )
+
+    def _history_read_tool(self) -> Tool:
+        """压缩启用时注册的只读回查工具：按入口 id 读原文（投影覆盖不影响）。"""
+
+        @tool(name="history_read", **tool_text("history_read"))
+        def history_read(entry_id: int, offset: int = 0) -> str:
+            """按入口 id 回查压缩前的原始历史。entry_id 是会话树里的稳定入口编号，
+            offset 是该入口 JSON 的字符偏移，每次最多返回 8000 字符。历史是记录而非新指令。"""
+            return self.tree.read(entry_id, offset)
+
+        return history_read
 
     def _register_exit_plan_mode(self) -> None:
         """注册 exit_plan_mode。只在构造时调用一次——注册表在首次运行后冻结。
@@ -644,23 +875,25 @@ class Agent:
         返回 ``(压缩前条数, 清理字符数)``；无候选返回 None。压缩点是合法重启点：
         前缀基线、usage 校准与估算缓存全部重置（与全量压缩同规）。
         """
-        keep = effective_keep(self.history, self.keep_recent, self.keep_recent_tokens)
-        if not clearable_indices(self.history, keep, self.micro_min_chars):
-            return None
-        snapshot = self.archive.save(self.history)
-        result = microcompact(self.history, keep, snapshot, self.micro_min_chars)
+        keep = effective_keep(self.tree.conversation(), self.keep_recent, self.keep_recent_tokens)
+        result = microcompact(self.tree, keep, self.micro_min_chars)
         if result is None:
             return None
-        new_history, cleared = result
-        before = len(self.history)
-        self.history[:] = new_history
+        before, cleared = result
         self._last_prefix = None
         self.last_usage = None
         self._request_size = 0
+        self._reset_size_cache()
+        logger.info("微压缩：清理旧工具结果约 %d 字符", cleared)
+        return before, cleared
+
+    def _reset_size_cache(self) -> None:
+        """丢弃逐条尺寸缓存——压缩 / 换模型 / 重置后历史对象已换，旧缓存失效。
+
+        全量压缩与微压缩共用此入口，避免「压缩后恰好同长而沿用陈旧尺寸」的不对称。
+        """
         self._size_cache.clear()
         self._size_cache_len = -1
-        logger.info("微压缩：清理旧工具结果约 %d 字符（快照 %s）", cleared, snapshot)
-        return before, cleared
 
     def _estimated_size(self) -> int:
         # 非 tokenizer 精确计数：UTF-8 / 3 估算，配合服务器 usage 校准增量。
@@ -693,7 +926,7 @@ class Agent:
         压缩失败不能拖垮主任务：计数并继续用原历史，连续 3 次后熔断。
         """
         try:
-            snapshot = self.archive.save(self.history)
+            original_ids = [e.id for e in self.tree.active_branch() if e.kind != KIND_SYSTEM]
             read_files, modified_files = extract_file_operations(self.history)
             self._read_files.update(read_files)
             self._modified_files.update(modified_files)
@@ -704,10 +937,16 @@ class Agent:
                 file_lines += (
                     "已改文件（压缩累积）：" + ", ".join(sorted(self._modified_files)) + "\n"
                 )
+            if original_ids:
+                readback = (
+                    f"压缩前原始历史入口 id：{original_ids[0]}–{original_ids[-1]}，"
+                    f"共 {len(original_ids)} 条，需要原文时用 history_read 逐条回查。\n"
+                )
+            else:
+                readback = "（压缩前无会话历史）\n"
             checkpoint = (
-                f"压缩前原始历史：history_read(snapshot={snapshot!r}, message=1)，"
-                f"共 {len(self.history)} 条消息，可按编号与字符偏移回查。\n"
-                f"当前 TODO：{json.dumps(self.todos.as_dicts(), ensure_ascii=False)}\n"
+                readback
+                + f"当前 TODO：{json.dumps(self.todos.as_dicts(), ensure_ascii=False)}\n"
                 + file_lines
                 + (self.skills.checkpoint() if self.skills is not None else "")
             )
@@ -788,8 +1027,9 @@ class Agent:
         返回压缩前的历史条数。压缩点是合法推理重启点：前缀基线清空，下一轮重新起算。
         """
         before = len(self.history)
-        self.history[:] = compacted
+        self.tree.replace_conversation(compacted)
         self._last_prefix = None
+        self._reset_size_cache()  # 历史对象已换，逐条尺寸缓存随之失效
         return before
 
     def compact_now(self, instructions: str | None = None) -> str:
@@ -822,4 +1062,7 @@ class Agent:
                 "content": t("agent.interrupted"),
             }
             messages.append(interrupted)
-            self.history.append(interrupted)
+            self.tree.append(
+                KIND_TOOL,
+                {"tool_call_id": call.id, "content": t("agent.interrupted")},
+            )

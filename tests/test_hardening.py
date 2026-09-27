@@ -15,7 +15,6 @@ from polya.compact import (
     extract_file_operations,
     microcompact,
 )
-from polya.history import HistoryArchive
 from polya.llm import LLM
 from polya.prompt import SystemPrompt, diff_sections, tool_guidelines, tool_snippets
 from polya.tools import ToolRegistry, json_schema
@@ -145,21 +144,18 @@ def test_extract_file_operations_reads_and_writes():
     assert modified_files == {"b.py", "c.py"}
 
 
-# ---------- 内存归档（非破坏） ----------
+# ---------- 树入口只读回查（非破坏） ----------
 
 
-def test_history_archive_is_independent_of_later_mutation():
-    from polya.tools import ToolRegistry
+def test_tree_read_preserves_original_after_override():
+    from polya.tree import SessionTree
 
-    archive = HistoryArchive()
-    history = [{"role": "user", "content": "原始内容"}]
-    snapshot = archive.save(history)
-    history[0]["content"] = "被改写"  # 压缩后原历史被替换
-    registry = ToolRegistry([archive.tool()])
-    result = registry.call("history_read", {"snapshot": snapshot, "message": 1})
-    assert "原始内容" in result and "被改写" not in result
-    archive.reset()
-    assert registry.call("history_read", {"snapshot": snapshot}).startswith("Error:")
+    tree = SessionTree()
+    tree.reset_with_system("sys")
+    entry = tree.append("tool", {"tool_call_id": "a", "content": "原始内容"})
+    tree.override(entry.id, {**entry.payload, "content": "被改写的投影"})
+    assert "原始内容" in tree.read(entry.id) and "被改写" not in tree.read(entry.id)
+    assert tree.project()[1]["content"] == "被改写的投影"
 
 
 # ---------- agent 健壮性 ----------
@@ -237,15 +233,19 @@ def test_length_truncation_continues_then_answers():
 def test_compact_now_compacts_regardless_of_threshold():
     llm = ScriptedLLM([response(SimpleNamespace(content="#1: 摘要", tool_calls=None))])
     agent = Agent(llm=llm, tools=[echo], compress=True, keep_recent=0)
-    agent.history[:] = [
-        {"role": "user", "content": "任务"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "a", "function": {"name": "echo", "arguments": '{"text": "x"}'}}],
-        },
-        {"role": "tool", "tool_call_id": "a", "content": "很长的结果" * 100},
-    ]
+    agent.tree.replace_conversation(
+        [
+            {"role": "user", "content": "任务"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "a", "function": {"name": "echo", "arguments": '{"text": "x"}'}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "很长的结果" * 100},
+        ]
+    )
     message = agent.compact_now("聚焦任务")
     assert "已压缩" in message
     assert any(
@@ -295,19 +295,22 @@ def _unsupported():
 
 
 def test_micro_compact_replaces_large_and_is_idempotent():
-    history = [
-        {"role": "tool", "tool_call_id": "a", "content": "z" * 2000},
-        {"role": "tool", "tool_call_id": "b", "content": "short"},
-    ]
-    result = microcompact(history, keep=0, snapshot="1", min_chars=2000)
+    from polya.tree import SessionTree
+
+    tree = SessionTree()
+    tree.reset_with_system("sys")
+    tool_entry = tree.append("tool", {"tool_call_id": "a", "content": "z" * 2000})
+    tree.append("tool", {"tool_call_id": "b", "content": "short"})
+    result = microcompact(tree, keep=0, min_chars=2000)
     assert result is not None
-    new, cleared = result
+    before, cleared = result
     assert cleared == 2000  # 返回清理的字符数
-    assert new[0]["content"].startswith(MICROCLEAR_MARKER)
-    assert "history_read" in new[0]["content"]
-    assert new[1]["content"] == "short"
-    assert history[0]["content"] == "z" * 2000  # 原列表不动
-    again = microcompact(new, keep=0, snapshot="2", min_chars=2000)
+    messages = tree.conversation()
+    assert messages[0]["content"].startswith(MICROCLEAR_MARKER)
+    assert "history_read" in messages[0]["content"]
+    assert messages[1]["content"] == "short"
+    assert "z" * 2000 in tree.read(tool_entry.id)  # 原文留在树里
+    again = microcompact(tree, keep=0, min_chars=2000)
     assert again is None  # 幂等：已清理的不再处理
 
 
@@ -323,29 +326,29 @@ def test_agent_micro_compresses_without_calling_llm():
         context_window=10000,
         keep_recent=1,
     )
-    agent.history[:] = [
-        {"role": "user", "content": "task"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "a", "function": {"name": "echo", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "a", "content": "z" * 5000},
-        {"role": "user", "content": "recent kept"},
-    ]
+    agent.tree.replace_conversation(
+        [
+            {"role": "user", "content": "task"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "a", "function": {"name": "echo", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "z" * 5000},
+            {"role": "user", "content": "recent kept"},
+        ]
+    )
     result = agent._try_microcompress()
     assert result is not None
     _, cleared = result
     assert cleared == 5000
     assert any((m.get("content") or "").startswith(MICROCLEAR_MARKER) for m in agent.history)
-    # 回查指针指向快照里的原始输出
+    # 回查指针指向树里保留的原始输出（入口 id）
     pointer = next(
         m for m in agent.history if (m.get("content") or "").startswith(MICROCLEAR_MARKER)
     )
-    snapshot = pointer["content"].split("snapshot=")[1].split(",")[0].strip("'\"")
-    raw = ToolRegistry([agent.archive.tool()]).call(
-        "history_read", {"snapshot": snapshot, "message": 3}
-    )
+    assert "entry_id=4" in pointer["content"]
+    raw = agent.tools.call("history_read", {"entry_id": 4})
     assert "z" * 100 in raw
 
 
@@ -359,7 +362,7 @@ def test_micro_disabled_for_thinking_bound_models():
         context_window=10000,
         profile=ModelProfile(supports_inplace_tool_edit=False),
     )
-    agent.history[:] = [{"role": "tool", "content": "z" * 5000}]
+    agent.tree.replace_conversation([{"role": "tool", "content": "z" * 5000}])
     assert agent._should_microcompress() is False
 
 

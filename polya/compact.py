@@ -129,61 +129,49 @@ def stale_status_indices(history: list[dict], keep: int) -> list[int]:
     return [i for i, message in enumerate(history) if _is_status_message(message) and i < boundary]
 
 
-def clearable_indices(
-    history: list[dict], keep: int, min_chars: int = MICRO_MIN_CHARS
-) -> list[int]:
-    """可微压缩的 tool 下标：保留区外、未带任何压缩标记、且内容足够长。
+def microcompact(
+    tree,
+    keep: int,
+    min_chars: int = MICRO_MIN_CHARS,
+) -> tuple[int, int] | None:
+    """微压缩：把保留区外的大块旧 tool 入口在**投影**里换成 ``history_read`` 指针。
 
-    微压缩不调 LLM：直接把旧工具结果换成回查指针（读原文用 history_read）。
-    已在保留区、已压缩或过短的都不动。
+    原文留在树里（``history_read(entry_id)`` 可回查），只挂投影覆盖——纯替换，
+    消息条数与 tool_call_id 配对不变。返回 ``(压缩前条数, 清理字符数)``；
+    无候选返回 None。
     """
-    boundary = len(history) - keep
-    targets: list[int] = []
-    for index, message in enumerate(history):
-        if message.get("role") != "tool" or index >= boundary:
+    conversation = [e for e in tree.active_branch() if e.kind != "system"]
+    if not conversation:
+        return None
+    boundary = len(conversation) - keep
+    cleared = 0
+    applied = False
+    for index, entry in enumerate(conversation):
+        if entry.kind != "tool" or index >= boundary:
             continue
-        content = message.get("content") or ""
+        effective = tree.effective_payload(entry.id)
+        if effective is None:
+            continue  # 已被 context_edit 删除，不再参与压缩
+        content = effective.get("content") or ""
         if content.startswith((MICROCLEAR_MARKER, COMPRESS_MARKER)):
             continue
-        if len(content) >= min_chars:
-            targets.append(index)
-    return targets
-
-
-def microcompact(
-    history: list[dict],
-    keep: int,
-    snapshot: str,
-    min_chars: int = MICRO_MIN_CHARS,
-) -> tuple[list[dict], int] | None:
-    """微压缩：把大块旧工具结果换成 ``history_read`` 回查指针（无 LLM 调用）。
-
-    返回 ``(新历史, 清理字符数)``；没有候选时返回 None。指针文本含回查参数
-    （快照编号 + 消息编号，从 1 起）；纯替换——消息条数与 tool_call_id 配对不变。
-    原列表不动。
-    """
-    targets = clearable_indices(history, keep, min_chars)
-    if not targets:
+        if len(content) < min_chars:
+            continue
+        tree.override(
+            entry.id,
+            {
+                **entry.payload,
+                "content": (
+                    f"{MICROCLEAR_MARKER} 原始输出 {len(content)} 字符已清理；"
+                    f"回查原文：history_read(entry_id={entry.id})"
+                ),
+            },
+        )
+        cleared += len(content)
+        applied = True
+    if not applied:
         return None
-    target_set = set(targets)
-    cleared_chars = 0
-    new_history: list[dict] = []
-    for index, message in enumerate(history):
-        if index in target_set:
-            original = message.get("content") or ""
-            cleared_chars += len(original)
-            new_history.append(
-                {
-                    **message,
-                    "content": (
-                        f"{MICROCLEAR_MARKER} 原始输出 {len(original)} 字符已清理；"
-                        f"回查原文：history_read(snapshot={snapshot!r}, message={index + 1})"
-                    ),
-                }
-            )
-        else:
-            new_history.append(message)
-    return new_history, cleared_chars
+    return len(conversation), cleared
 
 
 def _parse_numbered(text: str, targets: list[int]) -> dict[int, str] | None:

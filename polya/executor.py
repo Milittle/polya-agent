@@ -9,18 +9,16 @@ from __future__ import annotations
 
 import time
 
-from .tools import Tool
+from .tools import Tool, run_tool
 
 
 def execute(tool: Tool, arguments: dict) -> tuple[str, float]:
     """执行一次工具调用，返回 ``(result, duration_s)``。
 
-    异常不外抛，转成 ``Error:`` 文本交回模型（与 ToolRegistry.call 同一格式），
-    让模型有机会自行调整重试；审批阻塞的耗时由调用方计时，不在这里。
+    异常不外抛，转成 ``Error:`` 文本交回模型（经 :func:`tools.run_tool`，与
+    ToolRegistry.call 同一执行点），让模型有机会自行调整重试；审批阻塞的耗时
+    由调用方计时，不在这里。
     """
     start = time.monotonic()
-    try:
-        result = tool.run(arguments)
-    except Exception as exc:  # noqa: BLE001 - 错误信息是给模型看的，不是给调用方抛的
-        result = f"Error: {type(exc).__name__}: {exc}"
+    result = run_tool(tool, arguments)
     return result, time.monotonic() - start

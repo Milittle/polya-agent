@@ -325,23 +325,24 @@ def test_compaction_checkpoint_preserves_skill_todo_and_raw_history(tmp_path):
     skills.tool().run({"name": "develop"})
     llm = ScriptedLLM([make_message("#3: read file")])
     agent = Agent(llm=llm, compress=True, skills=skills, keep_recent=3)
-    agent.history[:] = sample_history()
-    agent.history[0]["content"] = "只改解析器，保持 API 不变"
+    history = sample_history()
+    history[0]["content"] = "只改解析器，保持 API 不变"
+    agent.tree.replace_conversation(history)
     agent.todos.rewrite([{"content": "验证解析器", "status": "in_progress"}])
     compacted = agent._try_compress("原始任务")
     checkpoint = compacted[-1]["content"]
     assert "develop" in checkpoint and "验证解析器" in checkpoint
     assert "只改解析器" in llm.calls[0]["messages"][1]["content"]
-    original = agent.tools.call("history_read", {"snapshot": "1", "message": 4})
+    original = agent.tools.call("history_read", {"entry_id": 5})
     assert "x" * 5000 in original
     agent.reset()
-    assert agent.tools.call("history_read", {"snapshot": "1"}).startswith("Error:")
+    assert agent.tools.call("history_read", {"entry_id": 5}).startswith("Error:")
     assert skills.checkpoint() == ""
 
 
 def test_missing_usage_large_new_result_triggers_preflight():
     agent = Agent(llm=ScriptedLLM([]), compress=True, context_window=10000)
-    agent.history[:] = [{"role": "user", "content": "x" * 30000}]
+    agent.tree.replace_conversation([{"role": "user", "content": "x" * 30000}])
     assert agent._should_compress()
 
 

@@ -121,7 +121,7 @@ def test_enter_opens_picker_for_choice_commands(tmp_path):
         assert buffer.text == "/plan "  # 补出主名并进入选项器，而非直接执行
         state = buffer.complete_state
         assert state is not None, "选项器菜单应已打开"
-        assert [c.text for c in state.completions] == ["on", "off"]
+        assert [c.text for c in state.completions] == ["on", "go", "off"]
         assert state.complete_index == 0  # 公开 CompletionState 构造预选首项
 
 
@@ -131,7 +131,7 @@ def test_tab_selects_first_completion_and_enter_runs_it(tmp_path):
         async def scenario():
             task = asyncio.ensure_future(box.ask_async({}))
             await until(lambda: box._session.app.is_running)
-            pipe.send_text("/e")
+            pipe.send_text("/exi")
             await until(lambda: box._session.default_buffer.complete_state is not None)
             pipe.send_text("\x1b")  # Esc 关掉自动弹出，再用 Tab 主动打开
             await until(lambda: box._session.default_buffer.complete_state is None)
@@ -142,10 +142,10 @@ def test_tab_selects_first_completion_and_enter_runs_it(tmp_path):
                 return state is not None and state.complete_index == 0
 
             await until(picked)
-            assert box._session.default_buffer.text == "/expand"  # Tab=插入首项（CC 同义）
+            assert box._session.default_buffer.text == "/exit"  # Tab=插入首项（CC 同义）
             pipe.send_text("\r")
             await until(lambda: task.done())
-            assert task.result() == "/expand"  # 预选中的命令 Enter 直接提交执行
+            assert task.result() == "/exit"  # 预选中的命令 Enter 直接提交执行
 
         asyncio.run(scenario())
 
@@ -163,7 +163,7 @@ def test_slash_completer_carries_descriptions():
 def test_slash_completer_matches_case_insensitive():
     assert [c.text for c in SlashCompleter().get_completions(Document("/HE"), None)] == ["/help"]
     texts = [c.text for c in SlashCompleter().get_completions(Document("/EX"), None)]
-    assert set(texts) == {"/exit", "/expand"}  # 前缀桶内保持声明序
+    assert set(texts) == {"/exit"}  # 前缀桶内保持声明序
 
 
 def test_slash_completer_alias_yields_canonical_name():
@@ -295,23 +295,9 @@ def test_footer_preserves_model_project_and_topic_with_unicode(tmp_path, width):
 
 def test_working_bar_uses_actual_phase(tmp_path):
     with make_box(tmp_path) as (box, _):
-        for phase in ("Thinking", "Responding", "Running Bash", "Awaiting approval"):
+        for phase in ("Thinking", "Responding", "Running Bash", "Reviewing"):
             box._state = {"busy": True, "status": phase}
             assert phase in "".join(t for _, t in box._working_bar())
-        box._state["stopping"] = True
+        box._state = {"busy": True, "status": "Reviewing", "stopping": True}
         text = "".join(t for _, t in box._working_bar())
-        assert "Stopping" in text and "Awaiting approval" in text
-
-
-def test_approval_footer_keeps_identity_and_replaces_typing_hint(tmp_path):
-    with make_box(tmp_path) as (box, _):
-        box._state = {
-            "model": "demo",
-            "project": str(tmp_path),
-            "topic": "检查审批",
-            "busy": True,
-            "mode": "normal",
-        }
-        text = "".join(t for _, t in box.session_footer())
-        assert "demo" in text and "检查审批" in text and "等待审批" in text
-        assert "Enter to queue" not in text
+        assert "Stopping" in text and "Reviewing" in text

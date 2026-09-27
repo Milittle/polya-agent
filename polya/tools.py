@@ -162,6 +162,17 @@ class Tool:
         }
 
 
+def run_tool(tool: Tool, arguments: dict) -> str:
+    """执行工具并把异常转成 ``Error:`` 文本——驱动层与注册表共用的单一执行点。
+
+    错误信息是给模型看的（让它自行调整重试），不是给调用方抛的。
+    """
+    try:
+        return tool.run(arguments)
+    except Exception as exc:  # noqa: BLE001 - 错误信息是给模型看的，不是给调用方抛的
+        return f"Error: {type(exc).__name__}: {exc}"
+
+
 class ToolRegistry:
     """按名字索引一组工具，负责生成 schema 和分发调用。
 
@@ -207,10 +218,7 @@ class ToolRegistry:
         item = self._tools.get(name)
         if item is None:
             return f"Error: unknown tool '{name}'"
-        try:
-            return item.run(arguments)
-        except Exception as exc:  # noqa: BLE001 - 错误信息是给模型看的，不是给调用方抛的
-            return f"Error: {type(exc).__name__}: {exc}"
+        return run_tool(item, arguments)
 
 
 def tool(

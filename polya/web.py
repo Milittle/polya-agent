@@ -88,6 +88,25 @@ def _truncate(text: str) -> str:
     return text[:MAX_OUTPUT] + f"\n... [已截断，完整内容共 {len(text)} 字符]"
 
 
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """跟随重定向前逐跳校验目标，堵住「公网 URL 重定向到内网」的 SSRF 绕过。
+
+    默认 ``urlopen`` 会静默跟随重定向且不重新校验跳转目标——一个公开页面 302 到
+    ``169.254.169.254`` 就能让模型读到内网数据。这里在每一跳被跟随前先跑同一套
+    :func:`_assert_public_url` 校验。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_url(request: urllib.request.Request, timeout: float):
+    """用带校验重定向的 opener 发起请求（独立函数便于测试替身）。"""
+    opener = urllib.request.build_opener(_ValidatingRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
 def web_fetch_impl(url: str, timeout: int = 15) -> str:
     """抓取 url 并返回包裹在 <external_content> 里的正文文本。"""
     _assert_public_url(url)
@@ -100,7 +119,10 @@ def web_fetch_impl(url: str, timeout: int = 15) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 URL 来自模型
+        with _open_url(request, timeout) as response:  # noqa: S310 URL 来自模型
+            # 兜底再校验一次最终地址：重定向逐跳已拦，这里补拦 DNS rebinding
+            # （连接后解析结果变化）与任何未经过 redirect handler 的跳转。
+            _assert_public_url(getattr(response, "url", url) or url)
             if response.status != HTTPStatus.OK:
                 raise RuntimeError(f"HTTP {response.status}: {url}")
             content_type = response.headers.get("content-type", "")

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from polya import Agent, tool
 from polya.cli import build_agent, main, parse_args
-from polya.loop import handle_command, terminal_approve
+from polya.loop import handle_command
 from polya.models import ModelsConfig, Profile
 from polya.render import TerminalRenderer
 from polya.todos import TodoStore
@@ -100,35 +100,6 @@ def test_unknown_command():
     assert "未知命令" in handle_command("/nope", make_agent())
 
 
-# ---------- 终端审批 ----------
-
-
-def test_terminal_approve_yes_no_always(monkeypatch):
-    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: 0)
-    approve = terminal_approve(interactive=True)
-    assert approve(add, {}) is True  # 只读工具直接放行，不询问
-
-    # 选择列表下标：0 允许 / 1 总是允许 / 2 拒绝
-    answers = iter([3, 1])
-    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: next(answers))
-    approve = terminal_approve(interactive=True)
-    assert approve(write_thing, {"content": "x"}) is False  # 拒绝
-    assert approve(write_thing, {"content": "y"}) is True  # 总是允许 → 放行
-
-    # 总是允许之后同工具不再询问：答案耗尽会抛 StopIteration，若被询问即测试失败
-    assert approve(write_thing, {"content": "z"}) is True
-
-
-def test_terminal_approve_noninteractive_rejects(monkeypatch):
-    def fail(prompt=""):
-        raise AssertionError("非交互环境不应交互询问")
-
-    monkeypatch.setattr("builtins.input", fail)
-    approve = terminal_approve(interactive=False)
-    assert approve(write_thing, {"content": "x"}) is False
-    assert approve(add, {}) is True  # 只读不受影响
-
-
 # ---------- build_agent / main ----------
 
 
@@ -140,11 +111,6 @@ def test_build_agent_registers_exit_plan_mode(tmp_path):
 
     planned = build_agent(parse_args(["--root", str(tmp_path), "--plan"]), llm=ScriptedLLM([]))
     assert planned.plan_mode is True
-
-
-def test_yes_mode_disables_approval(tmp_path):
-    agent = build_agent(parse_args(["--root", str(tmp_path), "--yes"]), llm=ScriptedLLM([]))
-    assert agent.approve is None and agent.approve_plan is None  # None = 不拦截
 
 
 def test_prompt_mode_prints_answer(monkeypatch, tmp_path, capsys):
@@ -172,7 +138,7 @@ def test_no_stream_flag_disables_streaming(tmp_path):
     assert agent.stream is False
 
 
-def test_expand_command_dispatches_to_renderer():
+def test_details_command_dispatches_to_renderer():
     from io import StringIO
 
     from rich.console import Console
@@ -183,11 +149,12 @@ def test_expand_command_dispatches_to_renderer():
         "tool_result",
         {"name": "bash", "call_id": "c1", "result": "完整输出", "duration_s": 0.1, "error": False},
     )
-    assert "完整输出" in handle_command("/expand", make_agent(), renderer)
-    assert "Ran Bash" in handle_command("/expand 1", make_agent(), renderer)
+    # 无参：最近 5 块；带 ID：指定块
+    assert "完整输出" in handle_command("/details", make_agent(), renderer)
+    assert "Ran Bash" in handle_command("/details 1", make_agent(), renderer)
     # 无渲染器（非终端会话）：给出解释而不是炸
-    assert "非终端" in handle_command("/expand", make_agent())
-    assert "用法" in handle_command("/expand x", make_agent(), renderer)
+    assert "No details" in handle_command("/details", make_agent())
+    assert "用法" in handle_command("/details x", make_agent(), renderer)
 
 
 def test_input_box_builds_multiline_session(tmp_path):
@@ -224,101 +191,6 @@ def test_rule_and_prompt_message_lay_out():
     message = prompt_message({"topic": "count-readme-words"})
     text = "".join(fragment for _, fragment in message)
     assert text == "❯ "
-
-
-def test_approve_cooperates_with_renderer_pause(monkeypatch):
-    """审批询问前暂停渲染器、结束后恢复——非终端下 pause/resume 均 no-op，不炸。"""
-    renderer = TerminalRenderer()
-    assert renderer._live is None  # 非 tty：未进入 with 前本就无 Live
-    renderer.pause()
-    renderer.resume()
-
-    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: 0)
-    approve = terminal_approve(interactive=True, renderer=renderer)
-    assert approve(write_thing, {"content": "x"}) is True
-
-
-# ---------- 审批变更预览：diff / 命令 / 截断 ----------
-
-
-def approve_and_capture(monkeypatch, capsys, root, name, arguments, choice=0):
-    kind = "exec" if name == "bash" else "write"
-    monkeypatch.setattr("polya.approval._select_option", lambda options, **kwargs: choice)
-    monkeypatch.setattr("polya.approval._ask_line", lambda label, default=None: "")
-    approve = terminal_approve(interactive=True, root=root)
-    approved = approve(
-        SimpleNamespace(name=name, kind=kind, dangerous=True, fn=None),
-        arguments,  # noqa: SLF001
-    )
-    return approved, capsys.readouterr().err
-
-
-def test_approval_shows_diff_for_write_file(monkeypatch, tmp_path, capsys):
-    (tmp_path / "app.py").write_text("old = 1\nprint(old)\n", encoding="utf-8")
-    approved, err = approve_and_capture(
-        monkeypatch,
-        capsys,
-        tmp_path,
-        "write_file",
-        {"path": "app.py", "content": "new = 2\nprint(new)\n"},
-    )
-    assert approved is True
-    assert "--- a/app.py" in err and "+++ b/app.py" in err
-    assert "-old = 1" in err and "+new = 2" in err  # 红删绿增的原料行
-
-
-def test_approval_new_file_diff_is_all_additions(monkeypatch, tmp_path, capsys):
-    approved, err = approve_and_capture(
-        monkeypatch, capsys, tmp_path, "write_file", {"path": "new.py", "content": "x = 1\n"}
-    )
-    assert approved is True
-    assert "-old" not in err and "+x = 1" in err
-
-
-def test_approval_bash_shows_full_command(monkeypatch, tmp_path, capsys):
-    approved, err = approve_and_capture(
-        monkeypatch, capsys, tmp_path, "bash", {"command": "pytest -q tests/"}
-    )
-    assert approved is True
-    assert "$ pytest -q tests/" in err
-
-
-def test_approval_reject_and_always(monkeypatch, tmp_path, capsys):
-    # 四选项下标：bash = 0 允许 / 1 前缀授权 / 2 修改后执行 / 3 拒绝
-    approved, _ = approve_and_capture(
-        monkeypatch, capsys, tmp_path, "bash", {"command": "ls -la"}, choice=4
-    )
-    assert approved is False
-
-    approved, err = approve_and_capture(
-        monkeypatch, capsys, tmp_path, "bash", {"command": "ls -la"}, choice=1
-    )
-    assert approved is True
-    assert "will not prompt again" in err
-
-
-def test_diff_lines_truncates_with_note():
-    from polya.approval import _diff_lines
-
-    old = "\n".join(f"old{i}" for i in range(60))
-    new = "\n".join(f"new{i}" for i in range(60))
-    diff = _diff_lines(old, new, "big.txt", max_lines=10)
-    assert len(diff) == 11 and diff[-1].startswith("… 还有 ")
-    assert _diff_lines("同", "同", "same.txt") == ["（内容无变化）"]
-
-
-def test_apply_edits_draft_flags_future_failures():
-    from polya.approval import _apply_edits_draft
-
-    text = "alpha beta\n"
-    draft, error = _apply_edits_draft(text, [{"old_string": "alpha", "new_string": "gamma"}])
-    assert draft == "gamma beta\n" and error is None
-
-    draft, error = _apply_edits_draft(text, [{"old_string": "zeta", "new_string": "x"}])
-    assert error and "未找到" in error
-
-    draft, error = _apply_edits_draft("a a a", [{"old_string": "a", "new_string": "b"}])
-    assert "不唯一" in error
 
 
 # ---------- 启动解析（票 14）：active profile 与旗标覆盖 ----------

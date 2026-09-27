@@ -1,4 +1,4 @@
-"""真实伪终端冒烟：启动、流式输出、审批让位、草稿恢复和退出。"""
+"""真实伪终端冒烟：启动、流式输出、默认放行工具执行和退出。"""
 
 import fcntl
 import os
@@ -14,7 +14,7 @@ import pytest
 
 
 @pytest.mark.parametrize("width", [40, 100])
-def test_terminal_session_restores_draft_after_approval(tmp_path, width):
+def test_terminal_session_runs_tool_and_exits(tmp_path, width):
     script = tmp_path / "terminal_demo.py"
     script.write_text(
         '''
@@ -52,7 +52,7 @@ class LLM:
         return NS(choices=[NS(message=message)], usage=None)
 
 loop.InputBox = lambda **kw: InputBox(Path(__file__).with_name("history"), **kw)
-agent = Agent(llm=LLM(), tools=[change], approve=lambda *_: False, status_bar=False)
+agent = Agent(llm=LLM(), tools=[change], status_bar=False)
 loop.run_repl(agent, str(Path(__file__).parent), TerminalRenderer())
 ''',
         encoding="utf-8",
@@ -93,17 +93,9 @@ loop.run_repl(agent, str(Path(__file__).parent), TerminalRenderer())
         os.write(master, b"hello\r")
         read_until("esc to interrupt)")
         read_until("Checking file.")
-        os.write(master, b"draft text")
         (tmp_path / "preview_seen").touch()
-        read_until("Approve Change")
-        read_until("Deny")
-        read_until("等待审批")  # Shared session footer remains visible during approval.
-        os.write(master, b"\r")  # Default selection remains rejection.
-        read_until("Reason")
-        os.write(master, b"\r")
-        mark = read_until("已拒绝并停止当前任务")
-        # prompt_toolkit redraws the draft when output is printed above it.
-        read_until("draft text", offset=mark)
+        read_until("changed")  # 默认放行：工具无需审批直接执行并落滚动区
+        read_until("Finished.")  # 第二轮正文
         os.write(master, b"\x03\x04")
         process.wait(timeout=6)
         assert process.returncode == 0
@@ -135,7 +127,7 @@ class LLM:
         return NS(choices=[NS(message=NS(content="ok", tool_calls=None))], usage=None)
 
 loop.InputBox = lambda **kw: InputBox(Path(__file__).with_name("history"), **kw)
-agent = Agent(llm=LLM(), tools=[], approve=lambda *_: False, status_bar=False)
+agent = Agent(llm=LLM(), tools=[], status_bar=False)
 loop.run_repl(agent, str(Path(__file__).parent), TerminalRenderer())
 """,
         encoding="utf-8",

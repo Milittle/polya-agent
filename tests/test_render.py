@@ -1,4 +1,4 @@
-"""TerminalRenderer 测试：注入捕获输出的 Console（非终端 → 无 Live，滚动区可捕获）。"""
+"""TerminalRenderer 测试：注入捕获输出的 Console，滚动区可捕获。"""
 
 from __future__ import annotations
 
@@ -115,7 +115,7 @@ def test_commit_clears_state_for_next_iteration():
     renderer.update("iteration", {"step": 1, "max_steps": 25})
     renderer.update("text_delta", {"delta": "答案"})
     renderer.update("assistant_message", {"content": "答案", "reasoning": None, "tool_calls": []})
-    assert renderer._live_text is None and renderer._text_buf == []
+    assert renderer._text_buf == []
 
     renderer.update("iteration", {"step": 2, "max_steps": 25})
     assert renderer.phase == "thinking"  # 新一轮回到思考阶段
@@ -140,62 +140,26 @@ def test_header_arg_specializes_by_tool():
     assert _header_arg("custom", {"a": 1}) == '{"a": 1}'
 
 
-# ---------- live 区 ----------
+# ---------- 状态标签与尾窗 ----------
 
 
 def test_status_label_migrates_with_phase():
     renderer, _buf = make_renderer()
-
-    def label() -> str:
-        return renderer.render().renderables[-1].text.plain
-
     renderer.update("iteration", {"step": 1, "max_steps": 25})
-    assert "Waiting for model" in label() and "step 1/25" in label()
+    assert renderer._status_label() == "Waiting for model"
 
     renderer.update("text_delta", {"delta": "答案"})
-    assert "Responding" in label()
+    assert renderer._status_label() == "Responding"
 
     feed_tool_call(renderer)
-    assert "Running Bash" in label()
+    assert renderer._status_label() == "Running Bash"
 
 
-def test_reasoning_tail_visible_only_in_thinking_phase():
-    renderer, _buf = make_renderer()
-    renderer.update("iteration", {"step": 1, "max_steps": 25})
-    renderer.update("reasoning_delta", {"delta": "第一行\n第二行\n第三行\n第四行"})
-    lines = renderer.render().renderables[0].plain.splitlines()
-    assert lines[0] == "…" and lines[1:] == ["第二行", "第三行", "第四行"]  # 尾 3 行 + 截断标记
-
-    renderer.update("text_delta", {"delta": "正文开始"})  # 进入 streaming：思考尾窗退场
-    renderables = renderer.render().renderables
-    assert all("第二行" not in getattr(r, "plain", "") for r in renderables)
-
-
-def test_live_text_rebuild_is_throttled():
-    renderer, _buf = make_renderer(min_render_interval=60)
-    renderer.update("iteration", {"step": 1, "max_steps": 25})
-    renderer.update("text_delta", {"delta": "第一段"})  # 首帧恒立即重建
-    assert renderer._live_text.markup == "第一段"
-
-    renderer.update("text_delta", {"delta": "第二段"})  # 间隔内：只置脏不重建
-    assert renderer._live_text.markup == "第一段"
-    assert renderer._dirty is True
-
-    renderer._last_rebuild = 0.0  # 模拟时间已流逝
-    renderer.update("text_delta", {"delta": "第三段"})
-    assert renderer._live_text.markup == "第一段第二段第三段"
-    assert renderer._dirty is False
-
-
-def test_usage_feeds_context_occupancy_in_status_line():
+def test_usage_feeds_context_occupancy():
     renderer, _buf = make_renderer(context_window=128000)
-    renderer.update("iteration", {"step": 1, "max_steps": 25})
-    label = renderer.render().renderables[-1].text.plain
-    assert "/" not in label.split("·")[-1]  # 未收到 usage 前不显示占用
-
-    renderer.update("usage", {"last": {"prompt_tokens": 12800, "completion_tokens": 300}})
-    label = renderer.render().renderables[-1].text.plain
-    assert "12.8k/128k（10%）" in label
+    renderer.update("usage", {"last": {"prompt_tokens": 12800, "cached_tokens": 3200}})
+    assert renderer._ctx_used == 12800
+    assert renderer._ctx_cached == 3200
 
 
 def test_tool_output_delta_shows_tail_then_clears():
@@ -205,23 +169,22 @@ def test_tool_output_delta_shows_tail_then_clears():
     for i in range(5):
         renderer.update("tool_output_delta", {"name": "bash", "line": f"out{i}"})
 
-    tail = renderer.render().renderables[0].plain.splitlines()
-    assert tail == ["…", "out2", "out3", "out4"]  # 尾 3 行 + 截断标记
+    preview = renderer.preview(80)
+    assert "out4" in preview and "out3" in preview
+    assert "out0" not in preview  # 只保留尾 3 行
 
     feed_tool_result(renderer, "out0\nout1\nout2\nout3\nout4")
-    renderables = renderer.render().renderables
-    assert all("out" not in getattr(r, "plain", "") for r in renderables)  # live 区已清
+    assert renderer.preview(80) == ""  # 尾窗已清
 
 
 # ---------- 生命周期 ----------
 
 
-def test_context_manager_without_terminal_is_noop():
+def test_context_manager_is_reentrant_noop():
     renderer, _buf = make_renderer()
     with renderer:
-        renderer.pause()
-        renderer.resume()
-    assert renderer._live is None
+        renderer.update("text_delta", {"delta": "x"})
+    assert renderer._text_buf == []
 
 
 # ---------- /expand：块留档与全文展开 ----------
@@ -302,13 +265,12 @@ def test_interrupted_live_text_is_retained_without_leaking_into_next_task():
     assert output.getvalue().count("unfinished paragraph") == 1
 
 
-def test_plan_approval_uses_shared_activity_and_receipt():
+def test_plan_submitted_prints_plan_to_scrollback():
     renderer, output = make_renderer()
-    renderer.update("plan_approval", {})
-    assert renderer._status_label() == "Awaiting approval"
-    renderer.update("plan_result", {"approved": True})
+    renderer.update("plan_submitted", {"plan": "## 步骤\n1. 读文件"})
     assert renderer._status_label() == "Waiting for model"
-    assert "计划已批准，继续执行" in output.getvalue()
+    assert "计划已提交" in output.getvalue()
+    assert "读文件" in output.getvalue()
 
 
 def test_pending_shell_result_does_not_claim_completion():

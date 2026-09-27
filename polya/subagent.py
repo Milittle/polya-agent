@@ -4,19 +4,18 @@
 history、独立 shell 会话，只有最终报告回父上下文（主上下文只进报告，探查链不占
 主窗口）。同步运行、深度 1（子 Agent 工具集不含 ``task``）。
 
-审批不在这里做：``dispatch`` 可注入，引擎级默认走子 Agent 的内置驱动；驱动层
-（票 04）换成经共享 :class:`ApprovalGate` 的版本。引擎不 import 驱动层，避免循环。
+审查不在这里做：``dispatch`` 可注入，引擎级默认走子 Agent 的内置驱动；驱动层
+（票 04）换成经共享 :class:`~polya.review.Reviewer` 的版本。引擎不 import 驱动层，
+避免循环。
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from collections.abc import Callable
 
 from .agent import Agent, Compaction, Iteration, PlanSubmitted, ToolCall
-from .approval import ApprovalGate
 from .builtin import default_tools
 from .i18n import t, tool_text
 from .todos import TodoStore
@@ -52,7 +51,6 @@ class SubagentRunner:
         # 工具调用分派：默认内置驱动；驱动层 bind 后换经闸门的版本
         self.dispatch: Dispatch = lambda child, ev: child._builtin_tool(ev)
         self.parent: Agent | None = None
-        self.gate: ApprovalGate | None = None
         self.stop: threading.Event | None = None
         self.interactive = False
         self.last_child: Agent | None = None  # 留档供测试回查子历史 / 压缩
@@ -66,12 +64,10 @@ class SubagentRunner:
 
     def bind(
         self,
-        gate: ApprovalGate,
         stop: threading.Event | None,
         interactive: bool,
     ) -> None:
-        """驱动层注入共享闸门、停止事件与交互标记（票 04）。"""
-        self.gate = gate
+        """驱动层注入停止事件与交互标记（票 04）。"""
         self.stop = stop
         self.interactive = interactive
 
@@ -102,6 +98,7 @@ class SubagentRunner:
             status_bar=None,
             plan_mode=parent.plan_mode,  # 子 Context 继承父规划模式
             plan_capable=False,  # 子无 exit_plan_mode
+            reviewer=parent.reviewer,  # 共享父会话审查器
             compress=True,  # 子代理总是启用压缩（ticket 03）
             context_window=parent.context_window,
             compress_threshold=parent.compress_threshold,
@@ -176,11 +173,3 @@ class SubagentRunner:
             parent.total_usage[field] = parent.total_usage.get(field, 0) + child.total_usage.get(
                 field, 0
             )
-
-
-def _brief(arguments: dict, limit: int = 80) -> str:
-    try:
-        text = json.dumps(arguments, ensure_ascii=False, separators=(", ", ": "))
-    except (TypeError, ValueError):
-        text = str(arguments)
-    return text if len(text) <= limit else text[: limit - 1] + "…"

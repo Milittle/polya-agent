@@ -1,7 +1,8 @@
 """Built-in command registry shared by help, completion, validation and dispatch.
 
-Handlers run on the session worker. Only the queue's resume control runs on the
-input thread; task-end commands must never run inside a live agent generator.
+命令是平面注册表：`name + handler + 参数`。唯一的安全属性是 `idle`——会改
+agent 会话树 / 历史的命令标 `idle=True`，任务运行中拒绝执行并提示先按 Esc 中断；
+其余命令随到随执行。调度语义（busy 三态 / 队列恢复）已删除。
 """
 
 from __future__ import annotations
@@ -10,8 +11,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import get_close_matches
 from getpass import getpass
-from typing import TYPE_CHECKING, Literal, TypeVar
+from pathlib import Path
+from typing import TYPE_CHECKING, TypeVar
 
+from . import session as session_store
 from .llm import LLM
 from .models import PRESETS, ModelsConfig, Profile, host_of, mask_key
 from .providers import profile_for
@@ -19,7 +22,6 @@ from .todos import _STATUS_LABELS
 
 if TYPE_CHECKING:
     from .agent import Agent
-    from .approval import ApprovalGate
     from .render import TerminalRenderer
 
 
@@ -30,10 +32,8 @@ _T = TypeVar("_T")
 class CommandContext:
     agent: Agent
     renderer: TerminalRenderer | None = None
-    gate: ApprovalGate | None = None
-    resume: Callable[[], str] | None = None
     restart: Callable[[], str] | None = None
-    # 终端让位（/models add 向导）：交互会话借道审批的挂起机制运行交互闭包
+    # 终端让位（/models add 向导）：交互会话借道挂起机制运行交互闭包
     # （输入框让位、key 走 getpass 不进屏幕与输入历史）；缺省直接跑（管道 stdin）。
     in_terminal: Callable[[Callable[[], _T]], _T] | None = None
     rename: Callable[[str], str] | None = None
@@ -55,7 +55,8 @@ class Command:
     validator: Callable[[str], str | None] | None = None
     integer: bool = False
     required: bool = False
-    busy: Literal["boundary", "task_end", "control"] = "boundary"
+    # 需要无存活任务（会改会话树 / 历史 / llm）；忙时拒绝并提示先 Esc 中断。
+    idle: bool = False
 
     @property
     def usage(self) -> str:
@@ -121,16 +122,16 @@ def _status(ctx: CommandContext, arg: str) -> str:
         f"工具调用: {dict(agent.tool_counts) or '（无）'}",
         f"token 用量: {agent.total_usage}",
     ]
-    if ctx.gate is not None:
-        mode = (
-            "全部允许（高危仍询问）" if ctx.gate.allow_all or agent.approve is None else "逐次审批"
-        )
-        lines.extend([f"审批模式: {mode}", f"会话授权规则: {len(ctx.gate.rules)} 条"])
-        lines.extend(str(rule) for rule in ctx.gate.rules)
+    thinking = getattr(agent.llm, "thinking_level", None)
+    if thinking:
+        lines.append(f"推理档位: {thinking}")
     return "\n".join(lines)
 
 
 def _plan(ctx: CommandContext, arg: str) -> str:
+    if arg == "go":
+        ctx.agent.leave_plan_mode()
+        return "已批准计划，进入执行模式。"
     ctx.agent.plan_mode = arg == "on"
     if arg == "off":
         return "已退出规划模式。"
@@ -140,33 +141,17 @@ def _plan(ctx: CommandContext, arg: str) -> str:
 
 
 def _details(ctx: CommandContext, arg: str) -> str:
+    """查看留档块：带 ID 看指定块；无参看最近 5 块（合并旧 /expand）。"""
     if ctx.renderer is None:
         return "No details recorded in this session."
-    return ctx.renderer.show_details(int(arg))
-
-
-def _expand(ctx: CommandContext, arg: str) -> str:
-    if ctx.renderer is None:
-        return "（非终端会话不记录块，无法展开）"
-    return ctx.renderer.expand_blocks(int(arg) if arg else 5)
-
-
-def _permissions(ctx: CommandContext, arg: str) -> str:
-    if ctx.gate is None:
-        return "此会话不支持切换审批模式，请在交互终端中使用 /permissions。"
-    ctx.gate.allow_all = arg == "all"
-    if arg == "ask":
-        ctx.agent.approve = ctx.gate.as_approve()
-        ctx.gate.rules.clear()
-    return "本会话全部允许（高危仍询问）" if arg == "all" else "已恢复逐次审批"
-
-
-def _resume(ctx: CommandContext, arg: str) -> str:
-    return ctx.resume() if ctx.resume is not None else "此会话没有可恢复的排队任务。"
+    if arg:
+        return ctx.renderer.show_details(int(arg))
+    return ctx.renderer.expand_blocks(5)
 
 
 def _rename(ctx: CommandContext, arg: str) -> str:
-    return ctx.rename(arg) if ctx.rename else "此会话不支持主题重命名。"
+    ctx.agent.set_session_title(arg)
+    return ctx.rename(arg) if ctx.rename else f"已更新会话主题：{arg}"
 
 
 def _rename_error(argument: str) -> str | None:
@@ -181,11 +166,11 @@ def _clear(ctx: CommandContext, arg: str) -> str:
 
 
 def _new(ctx: CommandContext, arg: str) -> str:
-    ctx.agent.reset()
+    name = ctx.agent.new_session()
     if ctx.restart is None:
-        return "已开始新会话。"
-    # 会话级重置（主题、授权规则、排队消息）由驱动层提供；返回附注（如丢弃条数）
-    return "已开始新会话：主题与授权规则已重置。" + ctx.restart()
+        return f"已开始新会话 {name}。"
+    # 会话级重置（主题、排队消息）由驱动层提供；返回附注（如丢弃条数）
+    return f"已开始新会话 {name}：主题与排队消息已重置。" + ctx.restart()
 
 
 def _model_choices() -> tuple[tuple[str, str], ...]:
@@ -340,7 +325,7 @@ def _models(ctx: CommandContext, arg: str) -> str:
     profile = config.find(arg)
     if profile is None:  # 双保险：_models_validate 已拦截未知名
         return _MODELS_USAGE
-    # boundary 语义（busy="boundary"）：下一轮请求前生效，生成器存活时不碰
+    # 动态 choices（/models）：无参走选项器/清单，生成器存活时不触碰会话
     new_profile = profile_for(profile.model)
     ctx.agent.switch_model(
         LLM(
@@ -364,6 +349,132 @@ def _compact(ctx: CommandContext, arg: str) -> str:
     return ctx.agent.compact_now(arg or None)
 
 
+def _reload(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.reload_skills()
+
+
+def _rewind(ctx: CommandContext, arg: str) -> str:
+    try:
+        steps = int(arg) if arg else 1
+    except ValueError:
+        return "用法 (Usage): /rewind [N]"
+    try:
+        return ctx.agent.rewind(steps)
+    except ValueError as exc:
+        return f"无法回退：{exc}"
+
+
+def _save(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.save_session(arg or None)
+
+
+def _sessions(ctx: CommandContext, arg: str) -> str:
+    metas = session_store.list_metas()
+    if not metas:
+        return "（暂无已保存会话）"
+    return "已保存会话（/resume 打开选择器）：\n" + "\n".join(f"  {m.label()}" for m in metas)
+
+
+def _session_choices() -> tuple[tuple[str, str], ...]:
+    "/resume 的动态选项：已存会话，name · title · updated。"
+    return tuple((m.name, m.label()) for m in session_store.list_metas())
+
+
+def _resume_validate(argument: str) -> str | None:
+    # 空参放行：交互层先开选项器，非交互落到处理器出清单。
+    return _session_name_error(argument) if argument else None
+
+
+def _resume(ctx: CommandContext, arg: str) -> str:
+    if not arg:
+        return _sessions(ctx, "")
+    return ctx.agent.load_session(arg)
+
+
+def _fork_validate(argument: str) -> str | None:
+    try:
+        entry_id = int(argument)
+    except ValueError:
+        return "用法 (Usage): /fork <入口 id>"
+    if entry_id < 1:
+        return "入口 id 必须为正整数。"
+    return None
+
+
+def _fork(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.fork_session(int(arg))
+
+
+def _clone(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.clone_session()
+
+
+def _load(ctx: CommandContext, arg: str) -> str:
+    if not arg:
+        return "用法 (Usage): /load <会话名>"
+    return ctx.agent.load_session(arg)
+
+
+def _tree(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.branch_overview()
+
+
+def _edit_validate(argument: str) -> str | None:
+    parts = argument.split(maxsplit=1)
+    if not parts:
+        return "用法 (Usage): /edit <id> <新内容|remove>"
+    try:
+        entry_id = int(parts[0])
+    except ValueError:
+        return "入口 id 必须是整数。"
+    if entry_id < 1:
+        return "入口 id 必须为正整数。"
+    if len(parts) == 1:
+        return "需要新内容，或用 remove 删除。"
+    return None
+
+
+def _edit(ctx: CommandContext, arg: str) -> str:
+    entry_id_str, rest = arg.split(maxsplit=1)
+    entry_id = int(entry_id_str)
+    if rest.strip() in ("remove", "删除"):
+        try:
+            return ctx.agent.remove_entry(entry_id)
+        except ValueError as exc:
+            return f"无法移除：{exc}"
+    try:
+        return ctx.agent.edit_entry(entry_id, rest)
+    except ValueError as exc:
+        return f"无法编辑：{exc}"
+
+
+def _jump(ctx: CommandContext, arg: str) -> str:
+    try:
+        entry_id = int(arg)
+    except ValueError:
+        return "用法 (Usage): /jump <入口 id>"
+    try:
+        return ctx.agent.jump(entry_id)
+    except ValueError as exc:
+        return f"无法跳转：{exc}"
+
+
+def _session_name_error(argument: str) -> str | None:
+    if any(c.isspace() for c in argument) or "/" in argument or "\\" in argument:
+        return "会话名不能含空白或路径分隔符。"
+    return None
+
+
+def _save_validate(argument: str) -> str | None:
+    return _session_name_error(argument) if argument else None
+
+
+def _load_validate(argument: str) -> str | None:
+    if not argument:
+        return "用法 (Usage): /load <会话名>"
+    return _session_name_error(argument)
+
+
 COMMANDS = (
     Command("/help", "显示命令帮助", _help),
     Command("/todos", "显示当前 TODO 清单", _todos),
@@ -372,32 +483,89 @@ COMMANDS = (
         "立即压缩上下文（当前任务结束后执行）",
         _compact,
         argument_hint="[说明]",
-        busy="task_end",
+        idle=True,
     ),
     Command("/status", "显示模式、用量与工具计数", _status),
+    Command("/reload", "热加载技能目录（重扫 .polya/skills 等）", _reload, idle=True),
+    Command(
+        "/rewind",
+        "回退到更早的入口（后续输入分叉）",
+        _rewind,
+        argument_hint="[N]",
+        integer=True,
+        idle=True,
+    ),
+    Command(
+        "/save",
+        "保存会话树到 ~/.polya/sessions",
+        _save,
+        argument_hint="[名称]",
+        validator=_save_validate,
+        idle=True,
+    ),
+    Command("/sessions", "列出已保存会话", _sessions),
+    Command(
+        "/resume",
+        "恢复已保存会话（无参数打开选择器）",
+        _resume,
+        argument_hint="[名称]",
+        choices_provider=_session_choices,
+        validator=_resume_validate,
+        idle=True,
+    ),
+    Command(
+        "/fork",
+        "从指定入口分叉出新会话",
+        _fork,
+        argument_hint="<id>",
+        validator=_fork_validate,
+        idle=True,
+    ),
+    Command("/clone", "复制当前会话为新会话", _clone, idle=True),
+    Command("/tree", "显示整棵树：分叉点与所有分支", _tree),
+    Command(
+        "/edit",
+        "编辑某入口在投影里的内容（原文保留，remove 删除）",
+        _edit,
+        argument_hint="<id> <新内容|remove>",
+        validator=_edit_validate,
+        idle=True,
+    ),
+    Command(
+        "/jump",
+        "跳到指定入口（后续输入分叉）",
+        _jump,
+        argument_hint="<id>",
+        integer=True,
+        required=True,
+        idle=True,
+    ),
+    Command(
+        "/load",
+        "恢复已保存会话到当前 Agent",
+        _load,
+        argument_hint="<名称>",
+        validator=_load_validate,
+        idle=True,
+    ),
     Command(
         "/plan",
         "切换规划模式（无参数打开选项）",
         _plan,
-        argument_hint="[on|off]",
-        choices=(("on", "规划：只读探查与计划审批"), ("off", "执行：退出规划模式")),
+        argument_hint="[on|off|go]",
+        choices=(
+            ("on", "规划：只读探查，完成后提交计划"),
+            ("go", "批准当前计划，进入执行"),
+            ("off", "执行：退出规划模式"),
+        ),
     ),
     Command(
         "/details",
-        "查看审批或工具调用的完整详情",
+        "查看留档块详情（无参数=最近 5 块）",
         _details,
-        argument_hint="ID",
-        integer=True,
-        required=True,
-    ),
-    Command(
-        "/expand",
-        "展开最近 N 块工具结果 / 思考（默认 5）",
-        _expand,
-        argument_hint="[N]",
+        argument_hint="[ID]",
         integer=True,
     ),
-    Command("/resume", "恢复中断或拒绝后暂停的排队任务", _resume, busy="control"),
     Command(
         "/rename",
         "重命名当前会话主题",
@@ -406,36 +574,25 @@ COMMANDS = (
         validator=_rename_error,
     ),
     Command(
-        "/permissions",
-        "切换审批模式（无参数打开选项）",
-        _permissions,
-        argument_hint="[ask|all]",
-        choices=(("ask", "逐次审批，并清除会话授权规则"), ("all", "本会话全部允许，高危仍询问")),
-    ),
-    Command(
         "/models",
         "查看/切换/录入模型 profile（add 进交互向导）",
         _models,
         argument_hint="[profile|add|remove]",
         choices_provider=_model_choices,
         validator=_models_validate,
+        idle=True,
     ),
     Command(
         "/clear",
         "清空对话历史、TODO 与统计",
         _clear,
         aliases=("/reset",),
-        busy="task_end",
+        idle=True,
     ),
-    Command("/new", "开新会话：另清主题、授权规则与排队消息", _new, busy="task_end"),
-    Command("/exit", "退出", _exit, aliases=("/quit",), busy="task_end"),
+    Command("/new", "开新会话：分配新名、重置主题与排队消息", _new, idle=True),
+    Command("/exit", "退出", _exit, aliases=("/quit",), idle=True),
 )
 BY_NAME = {name: command for command in COMMANDS for name in (command.name, *command.aliases)}
-BUSY_HINTS = {
-    "boundary": "下一轮请求前执行",
-    "task_end": "当前任务结束后执行",
-    "control": "立即恢复队列",
-}
 
 
 def parse_command(text: str) -> tuple[Command | None, str]:
@@ -470,6 +627,6 @@ def handle_command(cmd: str, agent: Agent, renderer: TerminalRenderer | None = N
 HELP_TEXT = "命令：\n" + "\n".join(
     f"  {command.usage}"
     + (f"（别名 {'、'.join(command.aliases)}）" if command.aliases else "")
-    + f"  {command.description} · {BUSY_HINTS[command.busy]}"
+    + f"  {command.description}"
     for command in COMMANDS
 )

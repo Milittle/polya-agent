@@ -66,11 +66,12 @@ and the choice is written back as `active`.
 
 ```bash
 uv run polya                    # interactive REPL
-uv run polya -p "fix the failing tests" --plan -y   # one-shot mode
+uv run polya -p "fix the failing tests" --plan   # one-shot mode
 ```
 
 Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
-(start in plan mode), `--yes` (auto-approve everything), `--max-steps N` (default 25),
+(start in plan mode), `--trust` / `--no-trust` (save and apply a project-trust decision;
+`--trust` is needed for non-interactive runs in a fresh directory), `--max-steps N` (default 25),
 `--model/--base-url/--api-key`, `--no-stream`, `--no-compress`, `--no-microcompact`,
 `--context-window N` (default 128000), `--keep-recent N`, `--keep-recent-tokens N`,
 `--prefix-check`.
@@ -84,14 +85,15 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 | `@` | file-path completion |
 | `!command` | run a shell command locally; output goes into the conversation |
 | `#note` | append a line to the project memory file (`AGENTS.md`) |
-| `Esc` | close completion, or request task interruption; keep the draft |
+| `Esc` | close completion, or request task interruption; queued messages return to the editor |
+| `Alt+Up` | pull queued messages back into the editor |
 | `Ctrl+C` | clears the input; press twice within 2s on an empty box to quit |
 | big paste | folds to `[Pasted #1 +200 lines]`, expanded again on submit |
 
-`/plan`, `/permissions` and `/models` without arguments open options in the input
+`/plan` and `/models` without arguments open options in the input
 box; the current value is marked (the `/models` picker also offers `add` for the
 setup wizard and `remove`). Choose with arrows and Tab/Enter, then Enter to
-execute; Esc closes the menu. You can also type `/plan on|off`, `/permissions ask|all`
+execute; Esc closes the menu. You can also type `/plan on|go|off`
 or `/models <profile>`
 directly, with argument completion. Invalid commands and arguments stay in the
 editor with a hint; `/details ID` and `/expand [N]` require positive integers.
@@ -101,14 +103,14 @@ Queued commands run before the next model request; `/clear`, `/new`, `/exit` and
 resumes a queue paused after interruption, rejection or failure; it waits for an active stop to finish. In a piped REPL, supply options explicitly.
 
 `/clear` (alias `/reset`) clears the conversation — history, todos, stats — while
-keeping the session topic, authorization rules and queued messages. `/new` starts a
-fresh session: it additionally resets the topic (re-derived from the next task),
-clears session authorization rules, drops queued messages and reprints the banner.
+keeping the session identity, topic and queued messages. `/new` starts a
+fresh session: it additionally assigns a new session name, resets the topic (re-derived
+from the next task), drops queued messages and reprints the banner.
 
-**Project memory**: if the working directory has an `AGENTS.md`, it is read once at
-startup and appended to the system prompt (quasi-static: it never changes mid-session,
-so the KV-cache prefix stays stable). `#` prefix appends to it — takes effect next
-session.
+**Project memory**: if the working directory is trusted and has an `AGENTS.md`, it is
+read once at startup and appended to the system prompt (quasi-static: it never changes
+mid-session, so the KV-cache prefix stays stable). Untrusted directories do not load
+it. `#` prefix appends to it — takes effect next session.
 
 ### Skills for development
 
@@ -124,7 +126,8 @@ invalid entries are skipped with a warning. Only the catalog enters the startup
 prompt. The model loads applicable instructions using `skill_read(name)`; you can
 also ask explicitly with `$name`. Resources use paths relative to the skill folder,
 for example `skill_read(name="develop", path="references/testing.md")`.
-Reads are paginated; skill scripts still require ordinary bash approval.
+Reads are paginated; skill scripts run with the process's permissions like any bash
+command. Project skills load only in a trusted directory.
 
 This repository includes `$develop-polya`: read the ticket and project conventions,
 make the change, run checks, repair failures, inspect the diff and report evidence.
@@ -132,50 +135,40 @@ For example, in the REPL: `Use $develop-polya to implement .scratch/feature/issu
 Skill catalogs are refreshed on startup; loading a skill does not change the system
 prompt or tool schemas. User skills do not widen the file tools' workspace boundary.
 
-### Permissions & approval
+### Trust, permissions & the reviewer seam
 
-Tools declare a `kind`: `read` (no side effects), `write` (files), `exec` (commands).
-Every call goes through a six-step `decide()`:
+Tools declare a `kind`: `read` (no side effects), `write` (files), or `exec` (commands).
+There is **no per-call approval**: tools run with the permissions of the Polya process,
+restricted to `--root` (`../` and absolute paths are rejected). Every call passes
+through a pluggable `Reviewer` (`polya/review.py`) that returns `allow` or `deny`:
 
-1. `read` → allow
-2. plan mode and not `read` → deny ("read-only mode, submit a plan first")
-3. high-risk (heuristic match on the bash command string: `rm -rf`, `sudo`,
-   `curl | sh`, `git push`, `git reset --hard`) → forced ask, **no authorization escape hatch**
-4. a session rule matches, or `--yes` → allow
-5. auto-edit mode and `write` → allow
-6. otherwise → ask
+- the default `AllowAllReviewer` allows everything, except that in plan mode it denies
+every non-`read` tool (delegation is the exception, since its side effects happen in
+child calls), keeping plan mode read-only;
+- a future **model reviewer** (Jev-style) can implement the same protocol to intercept
+commands. A `deny` only becomes a tool result for the model — it never opens a prompt
+or takes over the terminal.
 
-The approval prompt shows a **change preview** first — a unified diff against what's
-on disk for write tools (red/green, new files all green, folded past 40 lines), the
-full command for `bash` — then a choice list. **Low/medium risk defaults to
-Allow once; high/unknown risk defaults to Deny. Esc always cancels**:
+**Project trust** is the one gate. It controls whether project resources are loaded:
+`AGENTS.md` and project/ancestor skills. Decisions are saved in `~/.polya/trust.json`
+as `{ "<abs path>": true | false | null }` and **inherited from parent directories**
+(the closest `true`/`false` wins; `null` means “no decision”). Polya only asks when a
+directory actually has protected resources; declining leaves tools running but loads no
+project instructions. `/trust` shows the saved decision (and where it was inherited
+from) and saves Trust / Trust parent folder / Do not trust / Clear — the change takes
+effect on the next start. Non-interactive runs never prompt; use `--trust` / `--no-trust`
+for an explicit decision (`--trust` also loads project resources when none is saved).
+`/permissions` and session authorization rules are gone.
 
-1. Allow once
-2. Allow by prefix for this session (e.g. `bash(pytest tests/test_a.py:*)`; compound
-   commands with `&&` `;` `|` never get this option, and existing prefix rules don't
-   match them either)
-3. Edit command (bash only: changes are evaluated and approved again)
-4. Allow all for this session (commands and file edits; high-risk actions still ask)
-5. Reject and stop the current task, optionally recording a reason
-
-Risk classification only selects the prompt default; it never automatically authorizes
-shell commands. Shell sessions are persistent and not OS-sandboxed. Dynamic shell
-syntax cannot reuse a prefix grant; generic interpreter prefixes are not offered.
-File-write authorization checks resolved paths against the workspace.
-
-Options are omitted when unavailable. `/permissions all` enables session-wide approval;
-`/permissions ask` restores per-call approval and clears session rules. Rejection stops
-the current task and pauses queued work. A new instruction can start a new task;
-`/resume` explicitly resumes the paused queue (not a saved conversation).
-
-Plan mode works the same way: `exit_plan_mode` becomes a plan-approval prompt; after
-approval, write tools run (still subject to the normal approval flow). Non-interactive
-environments reject everything dangerous by default.
+**Plan mode** is a two-phase read-only stance. `exit_plan_mode` prints the plan to
+scrollback and ends the turn; `plan_mode` stays on. Reply with `/plan go` (or an exact
+`批准`/`go`-style approval) to execute, or send any other message to keep revising the
+plan read-only.
 
 **Interrupts**: `Esc` requests a stop at the next event boundary. A running tool or
-model request may need to finish first. Completed steps stay in history and pending
-tool results are back-filled. `Ctrl+C` edits/quits the input; `-p` retains Ctrl+C
-interruption.
+model request may need to finish first. Completed steps stay in history, pending tool
+results are back-filled, and queued messages return to the editor. `Ctrl+C` edits/quits
+the input; `-p` retains Ctrl+C interruption.
 
 ### Display
 
@@ -189,33 +182,27 @@ from the left to retain the project name, and shorten the topic before hiding co
 `/clear` preserves the topic; `/new` resets it. The topic starts from the first task,
 without an extra model request.
 
-You can keep typing while the agent runs. Submitted messages and commands are
-queued in order. Before the next model request, after **all** tool results in the
-current batch have been recorded, queued input is processed. `/clear`, `/new`,
-`/exit` and `/quit` wait until the current task ends; later queued input stays behind them.
-A receipt identifies when a queued supplement enters the next model request.
-If there is no further tool round, queued messages start a new task.
-Esc, rejected approval and task errors pause queued work. After the current operation
-stops, use `/resume` to continue the queue or type a new task while it stays paused.
-
-Approval temporarily takes over input, keeps the same session footer, and restores
-the draft, cursor and folded pastes afterwards. Enter selects a completion when its menu is open; otherwise it
+You can keep typing while the agent runs. `Enter` sends a **steering** message: it is
+injected before the next model request, after **all** results of the current tool batch
+are recorded. `Alt+Enter` queues a **follow-up** that runs after the current task ends.
+`Alt+Up` pulls queued messages back into the editor; Esc-aborting does the same.
+`/clear`, `/new`, `/exit` and `/quit` need an idle agent — press Esc first.
+Enter selects a completion when its menu is open; otherwise it
 submits at the end of the buffer or inserts a newline inside the text.
 
 Completed messages append once to native terminal scrollback;
-reasoning is collapsed and available through `/expand`. Tool names use display labels
+reasoning is collapsed and available through `/details`. Tool names use display labels
 (`Bash`, `Read File`); identifiers sent to the model stay unchanged. Tools show
 `Running`, then `Ran`, `Failed`, or `Denied`. Result previews are limited to three
 lines and 400 characters. While running, Bash shows a moving tail above the input;
 only its completion summary enters scrollback. `+ Show details: /details ID` opens that exact archived
-approval or tool block, including full arguments and the returned result
+tool block, including full arguments and the returned result
 (the tool itself may cap its output).
 While a task runs, its activity and elapsed time stay above the input: `Waiting for
-model`, `Thinking`, `Responding`, `Running …`, `Reviewing`, or `Awaiting approval`.
+model`, `Thinking`, `Responding`, `Running …`, or `Reviewing`.
 Tool changes do not reset the task timer. `Stopping` identifies the activity being
-waited on. Each model task leaves a turn-ended, interrupted, rejected or failed receipt
-with duration; turn-ended does not claim that the requested goal was achieved. Explicit approval prints `✔ You approved polya to run …` with a dim
-command preview and a stable details ID; automatic authorization prints no such receipt.
+waited on. Each model task leaves a turn-ended, interrupted or failed receipt
+with duration; turn-ended does not claim that the requested goal was achieved.
 The most recent 20 blocks are retained; expired IDs report unavailable.
 With completions open, Esc closes them first. Streaming text appears before a newline
 in a live Markdown tail above the input (up to eight content lines, fewer on short
@@ -253,17 +240,18 @@ ev = next(gen)  # Text / ReasoningDelta / Usage / Iteration /
 result = gen.send("...")  # ToolCall / PlanSubmitted expect the result string back
 ```
 
-so any frontend (REPL, TUI, web) can drive rendering, permission decisions and
-approval itself — that's exactly what `polya/loop.py` does. Event names double as the
-renderer vocabulary (see `polya/agent.py`).
+so any frontend (REPL, TUI, web) can drive rendering and tool review itself — that's
+exactly what `polya/loop.py` does. Event names double as the renderer vocabulary (see
+`polya/agent.py`).
 
 Notable knobs:
 
-- `approve(tool, args) -> bool`: approval hook for the built-in driver; tool
-  exceptions become `Error:` text handed back to the model instead of crashing.
-- `Agent(plan_mode=True, approve_plan=...)`: two-phase plan mode. Plan state is owned
-  by the driver layer; the tool array never changes mid-session (KV-cache prefix
-  stays stable).
+- `reviewer=Reviewer()`: pluggable allow/deny decision before each tool call (default
+  `AllowAllReviewer`); tool exceptions become `Error:` text handed back to the model
+  instead of crashing.
+- `Agent(plan_mode=True)`: two-phase plan mode. Plan state is owned by the driver
+  layer (`leave_plan_mode()` on approval); the tool array never changes mid-session
+  (KV-cache prefix stays stable).
 - `status_bar=True`: appends an `<agent_status>` snapshot (iteration, per-tool call
   counts, token usage, todos) to the **end** of the context each round — the model
   never has to count from its own trajectory. Append-only, cache-friendly.
@@ -313,7 +301,7 @@ absolute paths are rejected):
 The CLI/driver additionally registers `task` (kind `delegate`): it delegates a bounded
 subtask to a child agent with its own context and shell session, keeping exploration
 chains out of the main context. Only the final report returns to the parent; the child's
-tool calls still pass through the shared approval gate one by one (depth is 1 — the child
+tool calls still pass through the shared reviewer one by one (depth is 1 — the child
 has no `task` tool).
 
 Context is managed in two tiers: **micro-compaction** (no LLM call) replaces large old
@@ -339,11 +327,11 @@ Pure Python throughout (Windows-native friendly); only `bash` needs a real bash.
 ```
 polya/
   agent.py       # generator protocol: event union + steps() + built-in run() driver
-  loop.py        # interactive driver: render / decide / approve / execute / dispatch
-  input.py       # InputBox: multiline editing, completion, paste folding, Ctrl+C
-  render.py      # scrollback + live-region renderer, shared consoles
-  permissions.py # decide() six-step ordering, high-risk table, prefix rules
-  approval.py    # session authorization and terminal approval
+  loop.py        # interactive driver: render / review / execute / dispatch / queues
+  input.py       # InputBox: multiline editing, completion, paste folding, steering keys
+  render.py      # scrollback renderer + preview tail for the editor
+  review.py      # pluggable tool reviewer (allow/deny); default allows all
+  trust.py       # project trust gate for AGENTS.md / project skills
   executor.py    # shared tool executor (loop and run())
   cli.py         # argparse + assembly + one-shot mode
   llm.py         # OpenAI-compatible client; chat_iter streaming

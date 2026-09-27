@@ -13,7 +13,7 @@ from rich.console import Console
 
 from polya import Agent, tool
 from polya.input import InputBox, InputSuspended
-from polya.loop import ApprovalOutcome, InteractiveSession, run_task
+from polya.loop import InteractiveSession, run_task
 from polya.render import TerminalRenderer
 
 
@@ -49,13 +49,13 @@ async def until(condition):
 
 
 @contextmanager
-def session_for(tmp_path, llm, tools=(), approve=None):
+def session_for(tmp_path, llm, tools=(), **agent_kwargs):
     with create_pipe_input() as pipe:
         box = InputBox(tmp_path / "history", input=pipe, output=DummyOutput())
         output = StringIO()
         renderer = TerminalRenderer(Console(file=output))
         renderer.use_scrollback(Console(file=output))
-        agent = Agent(llm=llm, tools=tools, approve=approve, status_bar=False, prefix_check=True)
+        agent = Agent(llm=llm, tools=tools, status_bar=False, prefix_check=True, **agent_kwargs)
         session = InteractiveSession(agent, str(tmp_path), renderer, box)
         yield session, pipe, output
 
@@ -85,38 +85,43 @@ def test_slash_picker_uses_live_input_without_calling_model(tmp_path):
 
 
 @pytest.mark.parametrize("command", ["/reset", "/clear", "/new", "/exit", "/quit"])
-def test_task_end_command_holds_following_queue_entries(tmp_path, command):
+def test_idle_command_refused_while_busy(tmp_path, command):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
-        session.enqueue(command)
-        session.enqueue("after command")
-        assert session._pop(boundary=True) is None
-        assert list(session.pending) == [command, "after command"]
-        assert "当前任务结束后执行" in output.getvalue()
-        assert session._pop() == command
+        session.state["busy"] = True
+        session._submit_input(command)
+        assert "先按 Esc 中断" in output.getvalue()
+        assert not session.closing  # /exit 未被误执行
 
 
-def test_queued_permissions_apply_at_boundary_and_resume_reports_state(tmp_path):
+def test_queued_message_applies_at_boundary(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
-        session.enqueue("/permissions all")
-        assert not session.gate.allow_all
+        session.state["busy"] = True
+        session._submit_input("补充一句")
+        assert "下一轮请求前交给模型" in output.getvalue()
         session._boundary()
-        assert session.gate.allow_all
-        assert "下一轮请求前执行" in output.getvalue()
-        session.queue_paused = True
-        session.state["queue_paused"] = True
-        session._local("/resume extra")
-        assert session.queue_paused
-        session._local("/resume")
-        assert not session.queue_paused and not session.state["queue_paused"]
-        assert "已恢复排队任务" in output.getvalue()
+        assert session.agent.history[-1]["content"] == "补充一句"
+        assert "补充已交给模型" in output.getvalue()
 
 
-def test_resume_during_input_handoff_does_not_get_stuck_in_paused_queue(tmp_path):
+def test_follow_up_queues_separately_from_steering(tmp_path):
+    with session_for(tmp_path, FakeLLM([])) as (session, _, output):
+        session.state["busy"] = True
+        session.box.last_kind = "follow-up"
+        session._submit_input("随后再处理")
+        assert list(session.follow_up) == ["随后再处理"] and not session.steering
+        assert "本轮结束后交给模型" in output.getvalue()
+
+
+def test_dequeue_moves_queue_back_to_editor(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, _):
-        session.queue_paused = True
-        session.state["queue_paused"] = True
-        session.enqueue("/resume")
-        assert not session.queue_paused and not session.pending
+        session.state["busy"] = True
+        session._submit_input("第一条")
+        session.box.last_kind = "follow-up"
+        session._submit_input("第二条")
+        text = session._dequeue_to_editor()
+        assert text == "第一条\n第二条"
+        assert not session.steering and not session.follow_up
+        assert session.state["queued"] == 0
 
 
 def test_invalid_reset_preserves_context_indicator(tmp_path):
@@ -131,25 +136,27 @@ def test_invalid_reset_preserves_context_indicator(tmp_path):
 def test_clear_keeps_session_identity_and_queue(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, _):
         session.topic = "old-topic"
-        session.gate.rules.append("rule")
-        session.enqueue("later message")
+        session.state["busy"] = True
+        session._submit_input("later message")
+        session.state["busy"] = False
         session._local("/clear")
-        assert session.topic == "old-topic" and list(session.gate.rules) == ["rule"]
-        assert list(session.pending) == ["later message"]
+        assert session.topic == "old-topic"
+        assert list(session.steering) == ["later message"]
         assert not session.agent.history
 
 
-def test_new_resets_topic_rules_queue_and_reprints_banner(tmp_path):
+def test_new_resets_topic_queue_and_reprints_banner(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
         titles = []
         session.renderer._console.set_window_title = titles.append
         session.agent.history.append({"role": "user", "content": "stale"})
         session.topic = "old-topic"
-        session.gate.rules.append("rule")
-        session.enqueue("later message")
+        session.state["busy"] = True
+        session._submit_input("later message")
+        session.state["busy"] = False
         session._local("/new")
         assert not session.agent.history and session.topic is None
-        assert not session.gate.rules and not session.pending
+        assert not session.steering and not session.follow_up
         assert session.state["queued"] == 0
         assert titles and titles[-1] == "polya"
         assert "已丢弃 1 条排队消息" in output.getvalue()
@@ -190,46 +197,6 @@ def test_busy_input_enters_next_request_after_entire_tool_batch(tmp_path):
         assert [m["role"] for m in messages[-3:]] == ["tool", "tool", "user"]
         assert messages[-1]["content"] == "also check callers"
         assert "已排队" in output.getvalue()
-
-
-def test_approval_releases_input_and_restores_folded_paste_and_cursor(tmp_path):
-    @tool(kind="write")
-    def change() -> str:
-        """An operation requiring approval."""
-        return "changed"
-
-    llm = FakeLLM([reply(calls=[call("change", "a")]), reply("done")])
-    with session_for(tmp_path, llm, [change], approve=lambda *_: False) as (session, pipe, _):
-        original = "\n".join(f"line-{i}" for i in range(20))
-        seen = []
-
-        def approval(*args, **kwargs):
-            seen.append(session.box._session.app.is_running)
-            assert session.box._draft.text.endswith("[Pasted #1 +20 lines]")
-            assert session.box._draft.cursor_position == 2
-            return ApprovalOutcome(False)
-
-        session._screen = approval
-
-        async def scenario():
-            task = asyncio.create_task(session.run())
-            await until(lambda: session.box._session.app.is_running)
-            pipe.send_text("draft \x1b[200~" + original + "\x1b[201~")
-            await until(lambda: bool(session.box._tokens))
-            session.box._session.default_buffer.cursor_position = 2
-            # Start work while retaining the draft in the active prompt.
-            session.state["busy"] = True
-            work = asyncio.create_task(asyncio.to_thread(session._work, "start"))
-            await asyncio.wait_for(work, 3)
-            await until(lambda: session.box._session.app.is_running)
-            buffer = session.box._session.default_buffer
-            assert buffer.cursor_position == 2
-            assert session.box._expand_pastes(buffer.text) == "draft " + original
-            pipe.send_text("\x03\x03\x03")
-            await asyncio.wait_for(task, 3)
-
-        asyncio.run(scenario())
-        assert seen == [False]
 
 
 def test_escape_preserves_draft_and_completed_tool_result(tmp_path):
@@ -286,7 +253,6 @@ def test_live_previews_commit_to_scrollback_once():
     renderer = TerminalRenderer()
     renderer.use_scrollback(Console(file=output))
     with renderer:
-        assert renderer._live is None
         renderer.update("text_delta", {"delta": "unique first\nlast fragment"})
         assert output.getvalue() == ""
         assert "last fragment" in renderer.preview(80)
@@ -327,7 +293,7 @@ def test_interrupt_backfills_unexecuted_tools():
         status_bar=False,
     )
     with pytest.raises(InterruptedError):
-        run_task(agent, TerminalRenderer(Console(file=StringIO())), "go", True, stop=stop)
+        run_task(agent, TerminalRenderer(Console(file=StringIO())), "go", stop=stop)
     results = [m for m in agent.history if m["role"] == "tool"]
     assert [m["tool_call_id"] for m in results] == ["a", "b"]
     assert results[0]["content"] == "actual result"
@@ -351,7 +317,7 @@ def test_stop_after_tool_declaration_backfills_before_first_execution():
 
     renderer.update = stop_on_declaration
     with pytest.raises(InterruptedError):
-        run_task(agent, renderer, "go", True, stop=stop)
+        run_task(agent, renderer, "go", stop=stop)
     assert agent.history[-1]["role"] == "tool"
     assert agent.history[-1]["tool_call_id"] == "a"
 
@@ -374,17 +340,15 @@ def test_narrow_status_preserves_mode_and_interrupt(tmp_path):
         assert "very-long-model-name" not in text
 
 
-def test_reset_waits_for_task_end_and_preserves_queue_order(tmp_path):
+def test_boundary_injects_steering_in_order(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, _):
         session.agent.history.append({"role": "user", "content": "original"})
-        for text in ("first", "/reset", "after reset"):
-            session.enqueue(text)
+        session.state["busy"] = True
+        for text in ("first", "second"):
+            session._submit_input(text)
         session._boundary()
-        assert session.agent.history[-1]["content"] == "first"
-        assert list(session.pending) == ["/reset", "after reset"]
-        assert session._local(session._pop())
-        assert session.agent.history == []
-        assert session._pop() == "after reset"
+        assert [m["content"] for m in session.agent.history[-2:]] == ["first", "second"]
+        assert not session.steering
 
 
 def test_streamed_shell_failure_shows_exit_code():
@@ -429,7 +393,7 @@ def test_session_identity_rename_clear_and_new(tmp_path):
         assert "已更新会话主题" in output.getvalue()
 
 
-def test_interruption_pauses_queue_until_explicit_resume(tmp_path):
+def test_interrupt_returns_queued_messages_to_editor(tmp_path):
     entered, release = threading.Event(), threading.Event()
 
     @tool
@@ -439,49 +403,48 @@ def test_interruption_pauses_queue_until_explicit_resume(tmp_path):
         assert release.wait(3)
         return "done"
 
-    llm = FakeLLM([reply(calls=[call("slow", "a")]), reply("resumed")])
+    llm = FakeLLM([reply(calls=[call("slow", "a")])])
     with session_for(tmp_path, llm, [slow]) as (session, pipe, output):
 
         async def scenario():
             task = asyncio.create_task(session.run())
             pipe.send_text("start\r")
             await until(entered.is_set)
-            session.enqueue("later")
+            pipe.send_text("later\r")  # 忙时 → steering 队列
+            await until(lambda: session.state.get("queued") == 1)
             session.interrupt()
-            assert session.queue_paused and session.state["stopping"]
-            assert "正在停止" in session._resume_queue()
-            assert session.queue_paused
+            assert session.state["stopping"]
             release.set()
             await until(lambda: not session.state["busy"])
-            assert list(session.pending) == ["later"]
+            # Esc 中断后，排队消息回到编辑器，不静默丢弃
+            await until(lambda: "later" in session.box._session.default_buffer.text)
+            assert not session.steering
             assert len(llm.requests) == 1
-            pipe.send_text("/resume\r")
-            await until(lambda: len(llm.requests) == 2 and not session.state["busy"])
-            pipe.send_text("\x04")
+            pipe.send_text("\x03\x03\x03")
             await asyncio.wait_for(task, 3)
 
         asyncio.run(scenario())
         assert "本轮已中断" in output.getvalue()
-        assert "本轮结束" in output.getvalue()
-        assert "任务成功" not in output.getvalue()
 
 
-def test_task_failure_pauses_pending_messages(tmp_path):
+def test_task_failure_keeps_queue(tmp_path):
     class BrokenLLM(FakeLLM):
         def chat(self, messages, **kwargs):
-            session.enqueue("later")
+            session.state["busy"] = True
+            session._submit_input("later")
             raise ConnectionError("connection lost")
 
     with session_for(tmp_path, BrokenLLM([])) as (session, _, output):
         session._start_task()
         session._work("fail")
-        assert session.queue_paused and list(session.pending) == ["later"]
+        assert list(session.steering) == ["later"]
         assert "本轮失败" in output.getvalue()
 
 
 def test_queued_supplement_receives_delivery_receipt(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
-        session.enqueue("keep the interface")
+        session.state["busy"] = True
+        session._submit_input("keep the interface")
         assert "下一轮请求前交给模型" in output.getvalue()
         session._boundary()
         assert session.agent.history[-1]["content"] == "keep the interface"

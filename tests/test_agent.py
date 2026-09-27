@@ -105,7 +105,8 @@ def collect(agent, prompt):
         if isinstance(ev, ToolCall):
             return agent._builtin_tool(ev)
         if isinstance(ev, PlanSubmitted):
-            return agent._handle_plan(ev.plan)
+            agent.leave_plan_mode()
+            return "计划已展示"
         return None
 
     return drive(agent.steps(prompt), handle), events
@@ -269,36 +270,44 @@ def test_raises_when_max_steps_exceeded():
         agent.run("死循环")
 
 
-def test_approve_hook_can_deny_tool_call():
+class _DenyReviewer:
+    """替身审查器：记录调用并拒绝（验证 reviewer 缝接入 _builtin_tool）。"""
+
+    def __init__(self):
+        self.seen = []
+
+    def review(self, tool, arguments, *, plan=False, origin=None):
+        from polya.review import Review
+
+        self.seen.append((tool.name, arguments))
+        return Review("deny", "Error: 用户拒绝")
+
+
+def test_reviewer_can_deny_tool_call():
     llm = ScriptedLLM(
         [
             make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 2}')]),
             make_message(content="好的，那我不加了"),
         ]
     )
-    seen = []
-
-    def approve(tool, arguments):
-        seen.append((tool.name, arguments))
-        return False
-
-    agent = Agent(llm=llm, tools=[add], approve=approve)
+    reviewer = _DenyReviewer()
+    agent = Agent(llm=llm, tools=[add], reviewer=reviewer)
     agent.run("帮我加一下")
 
-    assert seen == [("add", {"a": 1, "b": 2})]
+    assert reviewer.seen == [("add", {"a": 1, "b": 2})]
     tool_message = llm.calls[1]["messages"][-1]
     assert tool_message["role"] == "tool"
     assert "拒绝" in tool_message["content"]
 
 
-def test_approve_hook_can_allow_tool_call():
+def test_default_reviewer_allows_tool_call():
     llm = ScriptedLLM(
         [
             make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 2, "b": 3}')]),
             make_message(content="5"),
         ]
     )
-    agent = Agent(llm=llm, tools=[add], approve=lambda tool, arguments: True)
+    agent = Agent(llm=llm, tools=[add])
 
     assert agent.run("加一下") == "5"
     assert llm.calls[1]["messages"][-1]["content"] == "5"
@@ -541,8 +550,8 @@ def test_reasoning_content_passthrough():
 
     assistant = agent.history[1]
     assert assistant["reasoning_content"] == "用户要算术，我调用 add 工具……"
-    # 下一次请求原样回传
-    assert llm.calls[1]["messages"][2] is assistant  # [0]=system [1]=user [2]=assistant
+    # 下一次请求原样回传（投影确定性：history 与请求里的消息按值相等）
+    assert llm.calls[1]["messages"][2] == assistant  # [0]=system [1]=user [2]=assistant
 
 
 def test_reasoning_passthrough_disabled_by_profile():
@@ -583,9 +592,8 @@ def test_prefix_check_passes_on_append_only():
     agent.run("再会")  # 多轮 run 同样通过
 
 
-def test_prefix_check_catches_history_mutation():
-    import pytest
-
+def test_history_view_is_read_only_and_tree_is_source_of_truth():
+    """history 是树的派生视图：改视图不影响树，前缀稳定由结构而非 prefix_check 保证。"""
     llm = ScriptedLLM(
         [
             make_message(content="第一轮"),
@@ -595,6 +603,6 @@ def test_prefix_check_catches_history_mutation():
     )
     agent = Agent(llm=llm, prefix_check=True)
     agent.run("hi")
-    agent.history[0]["content"] = "被篡改的前缀"  # 模拟未来代码违规改写历史
-    with pytest.raises(RuntimeError, match="前缀不变量"):
-        agent.run("再来")
+    agent.history[0]["content"] = "被篡改的前缀"  # 改的是投影副本，不是树
+    assert agent.history[0]["content"] == "hi"  # 原始内容仍在
+    agent.run("再来")  # 前缀仍是 append-only，不触发不变量

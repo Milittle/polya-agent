@@ -71,6 +71,21 @@ class SkillCatalog:
     def __init__(self, skills: dict[str, Skill]):
         self.skills = skills
         self.active: dict[str, Skill] = {}
+        # 发现配置（reload 重扫用）；discover 填充。
+        self._root: Path | None = None
+        self._user_dir: Path | None = None
+        self._user_agents_dir: Path | None = None
+        self._trusted: bool = True
+
+    def reload(self) -> None:
+        """重扫技能目录，原地更新 ``skills``（冻结的 skill_read 工具闭包引用 self）。
+
+        已加载但已不存在的技能从 active 移除；仍存在的保留。
+        """
+        assert self._root is not None, "reload 需要先经 discover 初始化"
+        fresh = self.discover(self._root, self._user_dir, self._user_agents_dir, self._trusted)
+        self.skills = fresh.skills
+        self.active = {name: s for name, s in self.active.items() if name in self.skills}
 
     @classmethod
     def discover(
@@ -78,17 +93,21 @@ class SkillCatalog:
         root: str | Path,
         user_dir: Path | None = None,
         user_agents_dir: Path | None = None,
+        trusted: bool = True,
     ) -> SkillCatalog:
         skills: dict[str, Skill] = {}
         # 加载顺序即优先级（后者同名覆盖前者）：用户 .agents → 用户 .polya →
         # 祖先 .agents（远→近）→ 项目 .polya。同层级 .polya 专属目录优先于
-        # Agent Skills 标准位置，项目优先于用户。
+        # Agent Skills 标准位置，项目优先于用户。未信任项目时只加载用户级。
         directories = [
             user_agents_dir or Path.home() / ".agents/skills",
             user_dir or Path.home() / ".polya/skills",
-            *reversed(_ancestor_agents_dirs(Path(root).resolve())),
-            Path(root) / ".polya/skills",
         ]
+        if trusted:
+            directories += [
+                *reversed(_ancestor_agents_dirs(Path(root).resolve())),
+                Path(root) / ".polya/skills",
+            ]
         scanned: set[Path] = set()
         for directory in directories:
             for path in _iter_skill_files(directory, scanned):
@@ -112,7 +131,12 @@ class SkillCatalog:
                     skills[name] = Skill(name, " ".join(description.split()), path.resolve())
                 except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
                     logger.warning("跳过技能 %s: %s", path, exc)
-        return cls(skills)
+        catalog = cls(skills)
+        catalog._root = Path(root).resolve()
+        catalog._user_dir = user_dir
+        catalog._user_agents_dir = user_agents_dir
+        catalog._trusted = trusted
+        return catalog
 
     def prompt(self) -> str:
         if not self.skills:

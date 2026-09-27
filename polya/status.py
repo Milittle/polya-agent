@@ -13,7 +13,6 @@ system 或历史消息。更新采用持久追加（Claude Code ``<system-remind
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 
 _STATUS_LABELS = {
     "pending": "待办",
@@ -33,7 +32,6 @@ class StatusSnapshot:
     usage: dict = field(default_factory=dict)  # 累计 token 用量
     todos: list[dict] = field(default_factory=list)  # TODO 清单（任务规划组件）
     plan_mode: bool = False  # 规划模式（只读；环境状态组件）
-    now: datetime = field(default_factory=datetime.now)
 
 
 def render_status(snapshot: StatusSnapshot) -> str:
@@ -61,7 +59,6 @@ def render_status(snapshot: StatusSnapshot) -> str:
         "<agent_status>\n"
         f"当前状态（第 {snapshot.iteration}/{snapshot.max_steps} 轮迭代；"
         "历史中若有多条状态，以最后一条为准）：\n"
-        f"- 时间: {snapshot.now:%Y-%m-%d %H:%M:%S}\n"
         f"{mode_line}"
         f"- 工具调用累计:\n{calls}\n"
         f"{todo_lines}"

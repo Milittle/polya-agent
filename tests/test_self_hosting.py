@@ -119,5 +119,5 @@ def test_development_survives_compaction_and_repairs_failed_check(tmp_path):
     assert "return a + b" in target.read_text()
     assert todos.as_dicts()[0]["status"] == "completed"
     assert model.compactions == 1
-    assert "develop-polya" in agent.tools.call("history_read", {"snapshot": "1", "message": 3})
+    assert "develop-polya" in agent.tools.call("history_read", {"entry_id": 4})
     agent.tools.call("kill_bash", {})

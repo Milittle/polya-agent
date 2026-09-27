@@ -6,9 +6,7 @@ import threading
 from types import SimpleNamespace
 
 from polya import Agent
-from polya.approval import ApprovalGate
 from polya.loop import run_tool_call
-from polya.permissions import Rule
 from polya.subagent import SubagentRunner
 from polya.tools import ToolRegistry
 
@@ -216,11 +214,9 @@ def test_integration_parent_delegates_and_child_works(tmp_path):
     runner.attach(parent)
     # 父级注册 task 工具（真实 registry）
     parent.tools.add(runner.task_tool())
-    gate = ApprovalGate(interactive=False)
-    gate.allow_all = True
-    runner.bind(gate, None, False)
+    runner.bind(None, False)
     runner.dispatch = lambda child, ev: run_tool_call(
-        child, None, ev, False, gate, unrestricted=True, origin="子任务", progress=None
+        child, None, ev, child.reviewer, origin="子任务", progress=None
     )
 
     # 迷你父驱动：ToolCall 经 run_tool_call 执行（task 工具从此进）
@@ -234,9 +230,7 @@ def test_integration_parent_delegates_and_child_works(tmp_path):
             answer = stop.value
             break
         if ev.event == "tool_call":
-            to_send = run_tool_call(
-                parent, None, ev, False, gate, unrestricted=True, origin=None, progress=None
-            )
+            to_send = run_tool_call(parent, None, ev, parent.reviewer, origin=None, progress=None)
         else:
             to_send = None
 
@@ -246,27 +240,18 @@ def test_integration_parent_delegates_and_child_works(tmp_path):
     assert any("报告：已写 out.txt" in m["content"] for m in tool_messages)
 
 
-def test_session_rule_applies_to_child_without_prompt(tmp_path):
+def test_child_shares_parent_reviewer(tmp_path):
     llm = ScriptedLLM(
         [
-            resp(tool_calls=[tc("c1", "bash", '{"command": "cat x"}')]),
+            resp(tool_calls=[tc("c1", "bash", '{"command": "echo hi"}')]),
             resp(content="完成"),
         ]
     )
     parent, runner = _runner(tmp_path, llm)
-    gate = ApprovalGate(interactive=False)
-    gate.rules.append(Rule("bash", "cat"))  # 会话规则对子生效
-    runner.bind(gate, None, False)
-
-    prompted = []
-    gate.screen = lambda *a, **k: prompted.append(True)  # type: ignore[method-assign]
-    runner.dispatch = lambda child, ev: run_tool_call(
-        child, None, ev, False, gate, unrestricted=False, origin="子任务", progress=None
-    )
-    (tmp_path / "x").write_text("content", encoding="utf-8")
-    runner.run("读文件", "cat x")
-    assert prompted == []  # 命中规则，未弹审批
-    assert gate.rejected_reason is None
+    runner.bind(None, False)
+    runner.run("跑命令", "echo hi")
+    # 子代理复用父审查器实例（reviewer 缝共享）
+    assert runner.last_child.reviewer is parent.reviewer
 
 
 def test_task_tool_without_attach_reports_error():
