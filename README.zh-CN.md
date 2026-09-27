@@ -39,12 +39,12 @@ NVIDIA、Qwen Token Plan 国际/国内，外加「自定义端点」）。base_u
 /login zai
   base_url（回车用 https://api.z.ai/api/coding/paas/v4）:
   api_key（输入不回显）:
-已登录 zai：glm-5.3 @ api.z.ai · 窗口 1M，已设为默认启动模型。/model 切换，Ctrl+S 设默认。
+已登录 zai：glm-5.3 @ api.z.ai · 窗口 1M，已设为默认启动模型；模型目录后台刷新中。/model 切换，Ctrl+S 设默认。
 ```
 
-登录后 polya 会问 provider 的 `/models` 端点拿模型列表，并在端点报了窗口时读取
-（`context_length` / `max_model_len`），否则回落内置能力表。解析优先级：发现值 >
-内置表 > 128k。`/model` 随时切换（无参数跨已登录 provider 展开选项器，`Ctrl+S`
+登录后 polya 立即落盘凭据，模型列表在后台线程问 provider 的 `/models` 端点
+（15s 超时），向导不等待；端点报了窗口就读（`context_length` / `max_model_len`），
+否则回落内置能力表。解析优先级：发现值 > 内置表 > 128k。`/model` 随时切换（无参数跨已登录 provider 展开选项器，`Ctrl+S`
 把高亮项存为默认启动模型）；`/logout <provider>` 移除凭据。启动解析优先级：
 CLI 旗标 > 默认模型（active）> `OPENAI_*` 环境变量。
 
@@ -85,7 +85,7 @@ REPL 斜杠命令：
 | `/help` | 命令列表 |
 | `/todos` `/status` | 查看 TODO 清单 / 会话状态（模式、用量、工具计数） |
 | `/plan on\|go\|off` | 切换规划模式；`go` 批准当前计划进入执行（`exit_plan_mode` 构造时已注册，切换不动工具数组，缓存安全） |
-| `/login [provider\|custom]` | 登录 provider：provider 列表 → base_url（预填可改）→ 隐藏输 key → 发现模型并选默认；`custom` 自填端点 |
+| `/login [provider\|custom]` | 登录 provider：provider 列表 → base_url（预填可改）→ 隐藏输 key → 立即落盘，模型目录后台刷新；`custom` 自填端点与模型名 |
 | `/logout <provider>` | 登出并移除 provider 凭据（若是默认模型则清空 active） |
 | `/model [provider/模型]` | 切换模型：对话保留、旧模型 thinking 剥离、能力档案与窗口跟随；无参数跨已登录 provider 展开选项器，`Ctrl+S` 把高亮项存为默认启动模型 |
 | `/thinking [off\|low\|medium\|high]` | 设置推理档位（一家一策）：o 系/gpt-5 发 `reasoning_effort`，GLM/DeepSeek 发 `thinking` 开关；档案无档位的模型明确提示不可切 |

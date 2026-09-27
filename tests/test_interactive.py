@@ -84,6 +84,26 @@ def test_slash_picker_uses_live_input_without_calling_model(tmp_path):
         assert "已进入规划模式" in output.getvalue()
 
 
+def test_tick_repaints_only_while_busy(tmp_path):
+    """空窗期（思考/长工具无事件）计时靠周期重绘，空闲时不重绘。"""
+    with session_for(tmp_path, FakeLLM([])) as (session, _, _):
+        session.tick_interval = 0.01
+        calls: list[int] = []
+        session.box._session.app.invalidate = lambda: calls.append(1)
+
+        async def scenario():
+            session.state["busy"] = False
+            ticker = asyncio.create_task(session._tick())
+            await asyncio.sleep(0.04)
+            assert calls == []  # 空闲不重绘
+            session.state["busy"] = True
+            await until(lambda: len(calls) >= 3)
+            session.closing = True
+            await asyncio.wait_for(ticker, 1)
+
+        asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("command", ["/reset", "/clear", "/new", "/exit", "/quit"])
 def test_idle_command_refused_while_busy(tmp_path, command):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
@@ -101,6 +121,48 @@ def test_queued_message_applies_at_boundary(tmp_path):
         session._boundary()
         assert session.agent.history[-1]["content"] == "补充一句"
         assert "补充已交给模型" in output.getvalue()
+
+
+def test_idle_command_borrows_terminal_without_freezing_the_loop(tmp_path, monkeypatch):
+    """空闲命令必须在 worker 线程执行。
+
+    若命令在主循环线程执行，`_borrow_terminal` 的 `call_soon_threadsafe` +
+    `ready.wait()` 会与主循环互相死等，整个 TUI 冻结（/login 卡死回归）。
+    """
+    from polya import commands as commands_mod
+    from polya.commands import Command
+
+    handler_thread: list[int | None] = [None]
+    borrowed = threading.Event()
+
+    def handler(ctx, arg):
+        handler_thread[0] = threading.get_ident()
+
+        def work():
+            borrowed.set()
+            return "borrowed ok"
+
+        return ctx.in_terminal(work)
+
+    monkeypatch.setitem(commands_mod.BY_NAME, "/testterm", Command("/testterm", "借道", handler))
+
+    with session_for(tmp_path, FakeLLM([])) as (session, pipe, output):
+        loop_thread = None
+
+        async def scenario():
+            nonlocal loop_thread
+            loop_thread = threading.get_ident()
+            task = asyncio.create_task(session.run())
+            await until(lambda: session.box._session.app.is_running)
+            pipe.send_text("/testterm\r")
+            await until(lambda: borrowed.is_set())
+            await until(lambda: "borrowed ok" in output.getvalue())
+            assert handler_thread[0] is not None
+            assert handler_thread[0] != loop_thread
+            pipe.send_text("\x04")
+            await asyncio.wait_for(task, 3)
+
+        asyncio.run(scenario())
 
 
 def test_follow_up_queues_separately_from_steering(tmp_path):
@@ -410,6 +472,21 @@ def test_session_identity_rename_and_new_session(tmp_path):
         assert session.topic is None and session.state["topic"] is None
         assert session.state["project"] == str(tmp_path)
         assert "已更新会话主题" in output.getvalue()
+
+
+@pytest.mark.parametrize("command", ["/new", "/clear", "/reset"])
+def test_session_commands_wipe_screen_before_welcome(tmp_path, command):
+    """/new /clear /reset 清屏后重印启动区：终端像刚启动的新会话。"""
+    with session_for(tmp_path, FakeLLM([])) as (session, _, output):
+        # 清屏走 rich Control.clear()，只在终端上输出 ANSI：测试用强制终端捕获。
+        session.renderer._console = Console(file=output, force_terminal=True)
+        output.write("旧输出\n")
+        session._local(command)
+        wiped = output.getvalue()
+        assert "\x1b[2J" in wiped  # rich Control.clear()：擦全屏 + 光标归位
+        assert wiped.index("\x1b[2J") < wiped.index("polya · v")  # 先清屏，再印 banner
+        assert "和你一起理解" in wiped
+        assert "旧输出" not in wiped[wiped.index("\x1b[2J") :]  # 旧内容只留在清屏之前
 
 
 def test_interrupt_returns_queued_messages_to_editor(tmp_path):

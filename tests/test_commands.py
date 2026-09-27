@@ -10,6 +10,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from polya import Agent
+from polya import commands as commands_mod
 from polya.commands import (
     BY_NAME,
     COMMANDS,
@@ -255,6 +256,17 @@ def _ctx(agent, in_terminal=True):
     )
 
 
+def _run_refresh_inline(monkeypatch):
+    """让登录后的后台目录刷新在测试里同步执行，便于断言（真实现走线程）。"""
+
+    def start(provider_id, base_url, api_key):
+        note = commands_mod._refresh_catalog(provider_id, base_url, api_key)
+        if note:
+            print(f"{provider_id}: {note}")
+
+    monkeypatch.setattr(commands_mod, "_start_catalog_refresh", start)
+
+
 def test_model_without_login_prompts_login(tmp_path, monkeypatch):
     monkeypatch.setattr("polya.models.default_path", lambda: tmp_path / "none.json")
     agent = Agent(llm=object(), tools=[])
@@ -322,6 +334,7 @@ def test_login_preset_flow_discovers_and_selects_default(tmp_path, monkeypatch, 
         "polya.commands.discover_models",
         lambda base_url, api_key, timeout=10.0: [ModelEntry("glm-5.3", 1_000_000)],
     )
+    _run_refresh_inline(monkeypatch)
     _fake_io(monkeypatch, [""], "sk-wizard-12345678")  # base_url 回车用预设默认
     result = dispatch_command("/login zai-coding-cn", _ctx(Agent(llm=object(), tools=[])))
     assert "已登录 zai-coding-cn" in result and "glm-5.3" in result and "1M" in result
@@ -330,8 +343,42 @@ def test_login_preset_flow_discovers_and_selects_default(tmp_path, monkeypatch, 
     entry = config.get("zai-coding-cn")
     assert entry.base_url == "https://open.bigmodel.cn/api/coding/paas/v4"
     assert entry.api_key == "sk-wizard-12345678"
-    assert entry.models[0].context_window == 1_000_000
+    assert entry.models[0].context_window == 1_000_000  # 后台刷新补上的窗口
     assert "sk-wizard-12345678" not in capsys.readouterr().out  # 明文 key 不落屏幕
+
+
+def test_login_saves_key_without_blocking_on_discovery(tmp_path, monkeypatch):
+    """登录向导不做同步 models.list()；只登记后台刷新（对齐 pi，不冻结登录）。"""
+    monkeypatch.setattr("polya.models.default_path", lambda: tmp_path / "models.json")
+    calls: list[object] = []
+    monkeypatch.setattr(commands_mod, "discover_models", lambda *a, **k: calls.append("sync") or [])
+    monkeypatch.setattr(commands_mod, "_start_catalog_refresh", lambda *a, **k: calls.append("bg"))
+    _fake_io(monkeypatch, [""], "sk-wizard-12345678")
+    result = dispatch_command("/login deepseek", _ctx(Agent(llm=object(), tools=[])))
+    assert "已登录 deepseek" in result and "deepseek-flash" in result
+    assert "后台刷新中" in result
+    assert calls == ["bg"]  # 没有同步发现，只有后台任务
+    entry = ModelsConfig.load().get("deepseek")
+    assert (entry.model, entry.base_url) == ("deepseek-flash", "https://api.deepseek.com")
+
+
+def test_refresh_catalog_keeps_current_model_and_drops_logged_out(tmp_path, monkeypatch):
+    entry = ProviderEntry(
+        "https://api.deepseek.com",
+        "sk-x-12345678",
+        "deepseek-flash",
+        [ModelEntry("deepseek-flash")],
+    )
+    _write_models(tmp_path, monkeypatch, {"deepseek": entry})
+    monkeypatch.setattr(
+        "polya.commands.discover_models",
+        lambda base_url, api_key, timeout=15.0: [ModelEntry("deepseek-v4-pro", 1_000_000)],
+    )
+    assert "已刷新" in commands_mod._refresh_catalog("deepseek", "https://api.deepseek.com", "k")
+    ids = [m.id for m in ModelsConfig.load().get("deepseek").models]
+    assert "deepseek-v4-pro" in ids and "deepseek-flash" in ids  # 当前模型不丢，active 不悬空
+    # 期间已 /logout：过期结果丢弃，不复活 provider
+    assert commands_mod._refresh_catalog("ghost", "https://x", "k") == ""
 
 
 def test_login_custom_flow_falls_back_when_discovery_fails(tmp_path, monkeypatch, capsys):
@@ -341,6 +388,7 @@ def test_login_custom_flow_falls_back_when_discovery_fails(tmp_path, monkeypatch
         raise RuntimeError("connection refused")
 
     monkeypatch.setattr("polya.commands.discover_models", _boom)
+    _run_refresh_inline(monkeypatch)
     _fake_io(
         monkeypatch,
         ["box", "http://localhost:8000/v1", "qwen3"],

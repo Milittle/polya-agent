@@ -1,8 +1,8 @@
 """Agent 事件的终端渲染器。
 
-单一渲染路径：完成的正文与工具结果一次写入滚动区（原生 scrollback）；
-编辑器上方的短尾窗由 prompt_toolkit 通过 ``preview()`` 自取。思考与工具结果
-保留有界归档，供 /details 使用；流式 bash 结果不重复打印。
+正文按段落边界实时提交进滚动区（原生 scrollback），未完成的尾部留在编辑器
+上方的短尾窗（prompt_toolkit 通过 ``preview()`` 自取）；工具结果一次写入。
+思考与工具结果保留有界归档，供 /details 使用；流式 bash 结果不重复打印。
 """
 
 from __future__ import annotations
@@ -47,6 +47,35 @@ def _collapse(text: str, max_lines: int = 8, max_chars: int = 600) -> tuple[str,
     return partial, hidden
 
 
+def _stream_cut(text: str, in_fence: bool, budget: int) -> tuple[int, bool]:
+    """正文流式提交点：返回 (可提交字符数, 切点之后的围栏态)，0 表示暂不提交。
+
+    优先切在「围栏外的空行」——段落边界，保住表格/列表/代码块的完整；没有空行
+    且完整行数超过 ``budget`` 时，退到围栏外的最后一个换行。切点始终落在围栏外，
+    代码块不会被劈成多段。
+    """
+    lines = text.split("\n")
+    fence = in_fence
+    para_cut = line_cut = 0
+    para_fence = line_fence = in_fence
+    pos = 0
+    for index, line in enumerate(lines):
+        last = index == len(lines) - 1
+        end = pos + len(line) + (0 if last else 1)
+        if line.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        if not last and not fence:
+            line_cut, line_fence = end, fence
+            if not line.strip():
+                para_cut, para_fence = end, fence
+        pos = end
+    if para_cut:
+        return para_cut, para_fence
+    if line_cut and len(lines) - 1 > budget:
+        return line_cut, line_fence
+    return 0, in_fence
+
+
 def _args_preview(arguments: dict, limit: int = 60) -> str:
     """工具头行的参数预览：紧凑 JSON，超长截断。"""
     preview = json.dumps(arguments, ensure_ascii=False, separators=(", ", ": "))
@@ -88,26 +117,33 @@ def _header_arg(name: str, arguments: dict) -> str:
 
 
 def _thinking_summary(reasoning: str) -> Text:
-    """思考折叠行（Claude Code 的 ✻ 语汇）：字数 + 首行摘要，dim italic 单行。
+    """思考标题行（Claude Code 的 ✻ 语汇）：字数，dim italic 单行。
 
-    不展示秒数——交错 thinking（DeepSeek interleave）下计时含糊。
+    不展示秒数——交错 thinking（DeepSeek interleave）下计时含糊。尾窗正文由
+    ``_reasoning_tail`` 逐行落在标题下方，标题只报字数。
     """
-    stripped = reasoning.strip()
-    summary = Text(f"✻ 思考 {len(reasoning)} 字", style="dim italic")
-    if stripped:
-        first = stripped.splitlines()[0]
-        summary.append(f"：{first[:40]}", style="dim italic")
-        if len(first) > 40:
-            summary.append("…", style="dim italic")
-    return summary
+    return Text(f"✻ 思考 {len(reasoning)} 字", style="dim italic")
+
+
+def _reasoning_tail(reasoning: str, limit: int) -> list[str]:
+    """思考尾部：末 ``limit`` 行，被截断时前置一行省略号。
+
+    流式尾窗与定稿共用同一切法：思考结束时落进滚动区的那几行，和过程中滚动的
+    尾窗一样大。
+    """
+    lines = reasoning.splitlines()
+    tail = lines[-limit:]
+    if len(tail) < len(lines):
+        tail = ["…", *tail]
+    return tail
 
 
 class TerminalRenderer:
     """Agent 事件 → 终端渲染。驱动将事件翻译后调用 ``update``。
 
-    单一渲染路径：完成的正文与工具结果一次写入滚动区；编辑器上方的尾窗由
-    prompt_toolkit 通过 ``preview()`` 自取。实例即上下文管理器：``with renderer:``
-    退出时把未提交正文标记为 Partial response 留在滚动区。
+    正文按段落边界实时提交进滚动区，未完成的尾部留在编辑器上方的尾窗
+    （prompt_toolkit 通过 ``preview()`` 自取）。实例即上下文管理器：
+    ``with renderer:`` 退出时把未提交正文标记为 Partial response 留在滚动区。
     """
 
     def __init__(
@@ -119,6 +155,8 @@ class TerminalRenderer:
         max_result_chars: int = 400,
         context_window: int = 0,
         tool_output_tail_lines: int = 8,
+        reasoning_tail_lines: int = 3,
+        text_flush_lines: int = 8,
     ) -> None:
         self.step = 0
         self.max_steps = 0
@@ -136,10 +174,14 @@ class TerminalRenderer:
         self._ctx_cached = 0
         self.total_usage: dict = {}  # 会话累计用量（usage 事件的 total）
         self._tool_output_tail_lines = max(1, tool_output_tail_lines)
+        self._reasoning_tail_lines = max(1, reasoning_tail_lines)  # 思考尾窗行数
+        self._text_flush_lines = max(1, text_flush_lines)  # 无空行时的正文提交行预算
         self._tool_out: list[str] = []  # 运行中工具的实时输出尾窗（bash tap 喂入）
         self._tool_dropped = 0  # 尾窗装不下而丢弃的行数（渲染 … 标记用）
         self._reasoning_buf: list[str] = []
         self._text_buf: list[str] = []
+        self._answer_started = False  # 本段正文的 ⏺ 标题是否已打（流式多块只打一次）
+        self._in_fence = False  # 正文是否停在代码围栏内（提交切点须避开围栏）
         self._blocks: list[dict] = []  # 滚动区已提交块的留档（/details 用）
         self._max_blocks = 20
         self._next_block_id = 1
@@ -157,7 +199,7 @@ class TerminalRenderer:
 
     @property
     def has_preview(self) -> bool:
-        return bool(self._text_buf or self.current_tool)
+        return bool(self._text_buf or self.current_tool or self._reasoning_buf)
 
     def preview(self, width: int, max_lines: int = 8) -> str:
         """Render a bounded live tail for prompt_toolkit, without writing to the terminal.
@@ -167,13 +209,16 @@ class TerminalRenderer:
         """
         text = "".join(self._text_buf)
         tool = self.current_tool
-        if not text and not tool:
+        reasoning = "".join(self._reasoning_buf)
+        if not text and not tool and not reasoning:
             return ""
         width, max_lines = max(1, width), max(1, max_lines)
         output = tuple(self._tool_out)
         arguments = self._current_arguments.copy()
         phase = self.phase
-        key = (text, tool, output, str(arguments), phase, width, max_lines)
+        # reasoning 放在「增长字段」区（与 text/output 同侧）：节流只比较结构字段
+        # （key[1] tool 与 key[4:] arguments/phase/宽高），思考逐片增长不触发重渲。
+        key = (text, tool, output, reasoning, str(arguments), phase, width, max_lines)
         now = time.monotonic()
         cached_key = self._preview_key
         if key == cached_key:
@@ -181,7 +226,7 @@ class TerminalRenderer:
         if (
             cached_key is not None
             and key[1] == cached_key[1]
-            and key[3:] == cached_key[3:]
+            and key[4:] == cached_key[4:]
             and now - self._preview_at < self._min_render_interval
         ):
             return self._preview_ansi
@@ -191,11 +236,19 @@ class TerminalRenderer:
             console.print(Markdown(text))
         elif output:
             console.print(Text("\n".join(output), style="dim"))
+        elif reasoning and not tool:
+            # 思考尾窗（dim italic）：流式思考的存活信号。全文只在 commit 后按尾窗
+            # 大小落滚动区、经 /details 展开——不实时落思考，避免 append-only 刷屏。
+            tail = _reasoning_tail(reasoning, self._reasoning_tail_lines)
+            console.print(Text("\n".join(tail), style="dim italic"))
         lines = buffer.getvalue().splitlines()
         folded = len(lines) > max_lines or (not text and self._tool_dropped > 0)
-        header = (
-            "⏺" if text else f"{self._status_label()} {_header_arg(tool or '', arguments or {})}"
-        )
+        if text:
+            header = "⏺"
+        elif reasoning and not tool:
+            header = f"✻ 思考中 · {len(reasoning)} 字"
+        else:
+            header = f"{self._status_label()} {_header_arg(tool or '', arguments or {})}"
         if folded:
             header += " · …"
         buffer = StringIO()
@@ -218,11 +271,14 @@ class TerminalRenderer:
             self._text_buf.clear()
             self._tool_out.clear()
             self._tool_dropped = 0
+            self._answer_started = False
+            self._in_fence = False
         elif event == "reasoning_delta":
             self._reasoning_buf.append(payload.get("delta", ""))
         elif event == "text_delta":
             self._text_buf.append(payload.get("delta", ""))
             self.phase = PHASE_STREAMING
+            self._stream_text()
         elif event == "assistant_message":
             self._commit(payload)
         elif event == "tool_review":
@@ -267,6 +323,8 @@ class TerminalRenderer:
             self._print_tool_result(payload)
             self.current_tool = None
             self.phase = PHASE_THINKING
+            # 该工具轮的思考已随 assistant_message 折叠进滚动区，清掉以免尾窗回映。
+            self._reasoning_buf.clear()
             self._tool_out.clear()
             self._tool_dropped = 0
         elif event == "usage":
@@ -293,24 +351,55 @@ class TerminalRenderer:
         return block["id"]
 
     def _commit(self, payload: dict) -> None:
-        """一段 assistant 消息完成：思考折叠行 + 完整 Markdown 进滚动区，清缓冲。"""
+        """一段 assistant 消息完成：补交正文尾部 + 思考尾窗落滚动区，清缓冲。"""
         # Clear the transient preview before publishing the completed block.
-        self._text_buf.clear()
         self._preview_key = None
         reasoning = payload.get("reasoning")
         if reasoning:
-            self._console.print(_thinking_summary(reasoning))
+            self._print_thinking(reasoning)
             self._record_block({"kind": "thinking", "content": reasoning})
         content = payload.get("content") or ""
-        if content.strip():
-            # 工具块之后接正文：空行分组，避免与 ⎿ 块连成一片
-            if self._blocks and self._blocks[-1]["kind"] == "tool":
-                self._console.print()
-            if self.scrollback:
-                self._console.print(Text("⏺", style="cyan"))
-            self._console.print(Markdown(content))
+        # 流式期间完整段落已落滚动区，这里只补未提交的尾部；无 delta 的非流式
+        # 回复（text_buf 空且 ⏺ 未打）直接落 content。
+        text = "".join(self._text_buf)
+        if text or not self._answer_started:
+            self._print_answer(text or content)
         self._reasoning_buf.clear()
         self._text_buf.clear()
+        self._answer_started = False
+        self._in_fence = False
+
+    def _stream_text(self) -> None:
+        """正文流式提交（路线 B）：以段落边界为切点，完整块即时渲染进滚动区。
+
+        未打完的尾部留在小尾窗；无空行且行数超预算时退到围栏外的最后一个换行，
+        保证长块也能持续走、尾窗不无限增长。
+        """
+        text = "".join(self._text_buf)
+        cut, in_fence = _stream_cut(text, self._in_fence, self._text_flush_lines)
+        if not cut:
+            return
+        self._print_answer(text[:cut])
+        self._in_fence = in_fence
+        self._text_buf = [text[cut:]] if text[cut:] else []
+
+    def _print_answer(self, chunk: str) -> None:
+        """把正文的一块渲染进滚动区；「⏺」标题与工具块后的空行只打一次。"""
+        if not chunk.strip():
+            return
+        if not self._answer_started:
+            if self._blocks and self._blocks[-1]["kind"] == "tool":
+                self._console.print()  # 与 ⎿ 块空行分组
+            if self.scrollback:
+                self._console.print(Text("⏺", style="cyan"))
+            self._answer_started = True
+        self._console.print(Markdown(chunk))
+
+    def _print_thinking(self, reasoning: str) -> None:
+        """思考定稿：字数标题 + 尾窗大小的灰斜体行（与流式尾窗对得上）。"""
+        self._console.print(_thinking_summary(reasoning))
+        for line in _reasoning_tail(reasoning, self._reasoning_tail_lines):
+            self._console.print(Text(line, style="dim italic"))
 
     def _print_plan(self, plan: str) -> None:
         """计划提交：全文进滚动区（不再弹阻断式选择器）。"""
@@ -436,9 +525,13 @@ class TerminalRenderer:
         # 中断时把尚未提交的正文标记为 Partial response 留在滚动区，清理 tail。
         partial = "".join(self._text_buf)
         self._text_buf.clear()
+        # 中断于思考阶段时半截思考不能留在尾窗（has_preview 含 reasoning，须显式清）。
+        self._reasoning_buf.clear()
         self.current_tool = None
         self._tool_out.clear()
         self._preview_key = None
+        self._answer_started = False
+        self._in_fence = False
         if partial.strip():
             self._console.print(Text("⏺ Partial response", style="dim"))
             self._console.print(Markdown(partial))

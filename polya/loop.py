@@ -223,6 +223,8 @@ class InteractiveSession:
     普通消息在下一模型调用前注入；会重置或结束会话的命令需先让任务空闲。
     """
 
+    tick_interval: float = 1.0  # 忙碌条重绘周期（测试可缩小）
+
     def __init__(self, agent: Agent, root: str, renderer: TerminalRenderer, box: InputBox):
         self.agent, self.root, self.renderer, self.box = agent, root, renderer, box
         # 忙时输入分两类：steering=下一模型请求前注入；follow_up=本轮结束后作为
@@ -242,6 +244,7 @@ class InteractiveSession:
         }
         self.requests: asyncio.Queue = asyncio.Queue()
         self.loop: asyncio.AbstractEventLoop | None = None
+        self._loop_thread: int | None = None  # 事件循环线程 id（_borrow_terminal 防死锁）
         self.box.on_interrupt = self.interrupt
         self.box.on_dequeue = self._dequeue_to_editor
         self.box.on_set_default = self._set_default_model
@@ -387,7 +390,7 @@ class InteractiveSession:
         return f"已更新会话主题：{topic}"
 
     def _restart(self) -> str:
-        """/new 的会话级重置：主题、窗口标题、计划与排队消息；返回丢弃附注。"""
+        """/new 的会话级重置：清屏重印启动区、主题、标题、计划与排队消息。"""
         self.topic = None
         self.state["topic"] = None
         self.plan_pending = False
@@ -397,6 +400,10 @@ class InteractiveSession:
             self.steering.clear()
             self.follow_up.clear()
         self._sync_queue_state()
+        # 清屏再重印启动区：/new /clear /reset 后终端像刚启动的新会话，旧输出
+        # 不留在滚动区。经 patched stdout 写出会先擦除输入区、写完再重绘，
+        # 输入框与状态栏回到屏幕底部（见 issues/10-fixed-bottom-tui.md 的全屏方案）。
+        self.renderer._console.clear()
         print_welcome(
             self.renderer._console,
             project_memory=self.agent.project_memory,
@@ -435,8 +442,10 @@ class InteractiveSession:
     def _borrow_terminal(self, callback):
         if self.stop.is_set() or self.closing:
             raise InterruptedError("终端借用已取消")
-        if self.loop is None:
-            # 事件循环尚未就绪（理论上不会走到）：直接跑回调，避免死等。
+        if self.loop is None or threading.get_ident() == self._loop_thread:
+            # 事件循环未就绪，或调用方就在主循环线程上：握手会自我死等
+            # （call_soon_threadsafe 排的回调永远排不到）。直接跑回调，宁可短暂
+            # 阻塞也不冻结会话。命令现由 run() 起独立 worker 任务，正常不会走到这里。
             return callback()
         ready, done = threading.Event(), threading.Event()
         self.loop.call_soon_threadsafe(self.requests.put_nowait, (ready, done))
@@ -530,36 +539,58 @@ class InteractiveSession:
         self._status(self.renderer)
 
     def _submit_input(self, text: str) -> None:
-        """分流一次提交：命令立即执行；忙时排队（Enter=steering，Alt+Enter=follow-up）；
-        空闲时作为下一任务交给主循环启动。"""
+        """分流一次提交。
+
+        忙时：命令就地执行（`idle` 命令自会拒绝），消息排队（Enter=steering，
+        Alt=follow-up）。空闲时一律进队列，由 `run()` 起独立 worker/命令任务——
+        命令必须在主循环之外执行，否则终端让位握手（`_borrow_terminal`）会死锁。
+        """
         if not text:
             return
         command, _ = parse_command(text)
-        if command is not None:
-            self._run_command(text, command)
-            return
         if self.state.get("busy"):
-            self._queue_input(text, self.box.last_kind)
+            if command is not None:
+                self._run_command(text, command)
+            else:
+                self._queue_input(text, self.box.last_kind)
             return
         with self.lock:
             self.steering.append(text)
         self._sync_queue_state()
 
+    async def _tick(self) -> None:
+        """每秒重绘忙碌条：思考/长工具的空窗期没有事件，计时否则会冻在某一秒。"""
+        while not self.closing:
+            await asyncio.sleep(self.tick_interval)
+            if self.state.get("busy"):
+                self.box._session.app.invalidate()
+
     async def run(self) -> None:
         self.loop = asyncio.get_running_loop()
+        self._loop_thread = threading.get_ident()
         prompt = None
         worker = None
+        command = None
+        ticker = asyncio.create_task(self._tick())
         request = asyncio.create_task(self.requests.get())
         try:
             while not self.closing:
-                if worker is None:
+                if worker is None and command is None:
                     text = self._pop_next_task()
                     if text is not None:
-                        self._start_task()
-                        worker = asyncio.create_task(asyncio.to_thread(self._work, text))
-                if prompt is None:
+                        entry, _ = parse_command(text)
+                        if entry is not None:
+                            # 命令也走独立任务：终端让位握手要求主循环保持可调度，
+                            # 网络/交互输入也不冻 UI（_borrow_terminal）。
+                            command = asyncio.create_task(
+                                asyncio.to_thread(self._run_command, text, entry)
+                            )
+                        else:
+                            self._start_task()
+                            worker = asyncio.create_task(asyncio.to_thread(self._work, text))
+                if prompt is None and command is None:
                     prompt = asyncio.create_task(self.box.ask_async(self.state))
-                tasks = [prompt, request] + ([worker] if worker is not None else [])
+                tasks = [t for t in (prompt, request, worker, command) if t is not None]
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 if worker is not None and worker in done:
                     await worker
@@ -574,7 +605,12 @@ class InteractiveSession:
                             self.box.insert_pending(pending)
                     self.box.refresh_file_index()  # agent 可能刚写过文件
                     self.box._session.app.invalidate()
-                if prompt in done:
+                if command is not None and command in done:
+                    await command
+                    command = None
+                    self.box.refresh_file_index()  # 命令可能刚写过文件
+                    self.box._session.app.invalidate()
+                if prompt is not None and prompt in done:
                     try:
                         text = prompt.result().strip()
                     except (EOFError, KeyboardInterrupt):
@@ -601,15 +637,23 @@ class InteractiveSession:
         finally:
             self.closing = True
             self.stop.set()
-            # 退出也完成借用握手，避免 worker 等待一个已经消失的输入框。
+            ticker.cancel()
+            try:
+                await ticker
+            except asyncio.CancelledError:
+                pass
+            # 退出也完成借用握手，避免 worker/命令等待一个已经消失的输入框。
             if prompt is not None and not prompt.done():
                 self.box.suspend()
                 try:
                     await prompt
                 except (InputSuspended, EOFError, KeyboardInterrupt):
                     pass
-            while worker is not None and not worker.done():
-                done, _ = await asyncio.wait([worker, request], return_when=asyncio.FIRST_COMPLETED)
+            while any(t is not None and not t.done() for t in (worker, command)):
+                running = [t for t in (worker, command) if t is not None and not t.done()]
+                done, _ = await asyncio.wait(
+                    [*running, request], return_when=asyncio.FIRST_COMPLETED
+                )
                 if request in done:
                     ready, finished = request.result()
                     ready.set()
@@ -622,6 +666,8 @@ class InteractiveSession:
                 pass
             if worker is not None:
                 await worker
+            if command is not None:
+                await command
             self.renderer.on_status = lambda renderer: None
             self.box.preview = lambda width, max_lines: ""
 

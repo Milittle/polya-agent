@@ -7,6 +7,7 @@ agent 会话树 / 历史的命令标 `idle=True`，任务运行中拒绝执行�
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import get_close_matches
@@ -257,12 +258,42 @@ def _model_validate(argument: str) -> str | None:
     return None
 
 
-def _discover(base_url: str, api_key: str) -> tuple[list[ModelEntry], str]:
-    """尽力发现模型列表；失败返回空列表 + 提示语（不阻断登录，票 04 失败语义）。"""
+def _refresh_catalog(provider_id: str, base_url: str, api_key: str) -> str:
+    """后台刷新模型目录，返回一句提示（空串 = 无需提示）。
+
+    对齐 pi：登录本身不等 `models.list()`；这里在独立线程里跑，15s 超时、不重试。
+    只替换 `models[]`，不动已选的当前模型与 `active`（重登不擅自换模型，active 不悬空）；
+    期间若 provider 已被 `/logout`，过期结果丢弃。
+    """
     try:
-        return discover_models(base_url, api_key), ""
-    except Exception as exc:  # noqa: BLE001 - 网络/鉴权失败只提示，不阻断
-        return [], f"未能获取模型列表（{type(exc).__name__}: {exc}），可手动输入模型名。"
+        entries = discover_models(base_url, api_key, timeout=15.0)
+    except Exception as exc:  # noqa: BLE001 - 后台任务，任何失败都只提示不阻断
+        return f"未能获取模型列表（{type(exc).__name__}: {exc}），沿用静态窗口。"
+    try:
+        config = ModelsConfig.load()
+        entry = config.get(provider_id)
+        if entry is None:
+            return ""  # 登录后已被 /logout：丢弃过期结果
+        if entry.model and all(item.id != entry.model for item in entries):
+            entries.append(ModelEntry(entry.model))  # 保住当前模型，active 不悬空
+        config.upsert(
+            provider_id, ProviderEntry(entry.base_url, entry.api_key, entry.model, entries)
+        )
+        config.save()
+    except (ValueError, OSError) as exc:
+        return f"模型目录落盘失败（{type(exc).__name__}: {exc}）。"
+    return f"模型目录已刷新（{len(entries)} 个模型）。"
+
+
+def _start_catalog_refresh(provider_id: str, base_url: str, api_key: str) -> None:
+    """后台线程跑目录刷新；daemon 化，不影响会话退出（对齐 pi 的 `void refresh()`）。"""
+
+    def run() -> None:
+        note = _refresh_catalog(provider_id, base_url, api_key)
+        if note:
+            print(f"{provider_id}: {note}")
+
+    threading.Thread(target=run, name=f"polya-refresh-{provider_id}", daemon=True).start()
 
 
 def _login(ctx: CommandContext, arg: str) -> str:
@@ -274,7 +305,11 @@ def _login(ctx: CommandContext, arg: str) -> str:
 
 
 def _login_flow(provider_id: str) -> str:
-    """借道终端窗口的登录：base_url（预设为默认，可改）→ 隐藏 key → 发现模型。"""
+    """借道终端窗口的登录：base_url → 隐藏 key → 立即落盘 → 目录后台刷新。
+
+    对齐 pi：`models.list()` 不再阻塞登录；先用预置默认模型（自定义端点则手输）
+    建条目落盘，发现目录交给 `_start_catalog_refresh` 在后台补齐。
+    """
     preset = PROVIDERS.get(provider_id)
     if preset is None and provider_id != "custom":
         return _LOGIN_USAGE
@@ -295,29 +330,32 @@ def _login_flow(provider_id: str) -> str:
     if not api_key:
         print("[取消] api_key 不能为空。")
         return "已取消登录。"
+    config = ModelsConfig.load()
+    existing = config.get(provider_id)
     default_model = preset.model if preset else ""
-    models, note = _discover(base_url, api_key)
-    if note:
-        print(note)
-    if models:
-        model = default_model if any(item.id == default_model for item in models) else models[0].id
-    else:
-        model = default_model or input("模型名: ").strip()
-        if not model:
+    if not default_model:
+        # 无预置默认模型（自定义端点 / Nvidia 等）：定下当前模型才能落盘并设 active
+        default_model = input("模型名: ").strip()
+        if not default_model:
             print("[取消] 模型名不能为空。")
             return "已取消登录。"
-        models = [ModelEntry(model)]
-    config = ModelsConfig.load()
+    # 重登保留用户已选模型（不擅自切回预置默认），并把它放进目录以免 active 悬空
+    current = existing.model if existing and existing.model else default_model
+    models = [ModelEntry(current)]
+    if default_model != current:
+        models.append(ModelEntry(default_model))
     try:
-        config.upsert(provider_id, ProviderEntry(base_url, api_key, model, models))
+        config.upsert(provider_id, ProviderEntry(base_url, api_key, current, models))
         config.save()
     except ValueError as exc:
         return f"[错误] {exc}"
-    window = resolve_context_window(model, config.get(provider_id))
-    default_note = "，已设为默认启动模型" if config.active == f"{provider_id}/{model}" else ""
+    _start_catalog_refresh(provider_id, base_url, api_key)
+    window = resolve_context_window(current, config.get(provider_id))
+    default_note = "，已设为默认启动模型" if config.active == f"{provider_id}/{current}" else ""
     return (
-        f"已登录 {provider_id}：{model} @ {host_of(base_url)} · "
-        f"窗口 {format_context_window(window)}{default_note}。/model 切换，Ctrl+S 设默认。"
+        f"已登录 {provider_id}：{current} @ {host_of(base_url)} · "
+        f"窗口 {format_context_window(window)}{default_note}；模型目录后台刷新中。"
+        "/model 切换，Ctrl+S 设默认。"
     )
 
 

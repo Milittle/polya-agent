@@ -93,10 +93,10 @@ def test_error_result_is_printed_in_red():
 # ---------- 滚动区：assistant 提交 ----------
 
 
-def test_assistant_message_collapses_thinking_and_prints_content_once():
-    renderer, buf = make_renderer()
+def test_assistant_message_prints_thinking_tail_and_content_once():
+    renderer, buf = make_renderer(min_render_interval=0, reasoning_tail_lines=2)
     renderer.update("iteration", {"step": 1, "max_steps": 25})
-    reasoning = "长" * 80
+    reasoning = "第一行思考\n第二行思考\n第三行思考"
     renderer.update("reasoning_delta", {"delta": reasoning})
     renderer.update("text_delta", {"delta": "我来数一下"})
     renderer.update(
@@ -105,8 +105,10 @@ def test_assistant_message_collapses_thinking_and_prints_content_once():
     )
 
     out = buf.getvalue()
-    assert "✻ 思考 80 字" in out  # 思考折叠为一行 dim italic 摘要（Claude Code ✻ 语汇）
-    assert out.count("长") == 40  # 只见摘要里的前 40 字，全文不出现
+    assert f"✻ 思考 {len(reasoning)} 字" in out  # 标题只报字数（Claude Code ✻ 语汇）
+    assert "第三行思考" in out and "第二行思考" in out  # 尾窗大小的思考尾部
+    assert "第一行思考" not in out  # 超出尾窗的行不落滚动区
+    assert "…" in out  # 截断标记
     assert out.count("我来数一下") == 1  # 正文恰好提交一次（live 区不向滚动区泄漏）
 
 
@@ -119,6 +121,65 @@ def test_commit_clears_state_for_next_iteration():
 
     renderer.update("iteration", {"step": 2, "max_steps": 25})
     assert renderer.phase == "thinking"  # 新一轮回到思考阶段
+
+
+# ---------- 滚动区：正文流式提交（路线 B，段落边界切点） ----------
+
+
+def test_answer_streams_to_scrollback_at_paragraph_boundary():
+    renderer, output = make_renderer(min_render_interval=0)
+    renderer.use_scrollback(renderer._console)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+
+    renderer.update("text_delta", {"delta": "第一段"})
+    assert output.getvalue() == ""  # 未到段落边界，先留在尾窗
+    assert "第一段" in renderer.preview(80)
+
+    renderer.update("text_delta", {"delta": "\n\n第二段"})
+    assert "第一段" in output.getvalue()  # 空行即提交，尾窗只留未完成的段
+    assert "第二段" not in output.getvalue()
+    assert "第二段" in renderer.preview(80)
+
+    renderer.update("assistant_message", {"content": "第一段\n\n第二段"})
+    assert output.getvalue().count("第一段") == 1
+    assert output.getvalue().count("第二段") == 1
+    assert renderer.preview(80) == ""
+
+
+def test_code_fence_is_not_split_by_line_budget():
+    renderer, output = make_renderer(min_render_interval=0, text_flush_lines=2)
+    renderer.use_scrollback(renderer._console)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+    code = "```python\n" + "\n".join(f"line{i}" for i in range(6)) + "\n```"
+
+    renderer.update("text_delta", {"delta": code})
+    assert output.getvalue() == ""  # 围栏内即便超过行预算也不切
+    renderer.update("assistant_message", {"content": code})
+    assert "line0" in output.getvalue() and "line5" in output.getvalue()
+    assert "```" not in output.getvalue()  # 整块渲染成代码，不是碎段落
+
+
+def test_long_unbroken_block_streams_by_line_budget():
+    renderer, output = make_renderer(min_render_interval=0, text_flush_lines=3)
+    renderer.use_scrollback(renderer._console)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+    block = "\n".join(f"row{i}" for i in range(6))
+
+    renderer.update("text_delta", {"delta": block})
+    assert "row0" in output.getvalue()  # 无空行但超预算 → 在围栏外换行处切一刀
+    assert "row5" not in output.getvalue()
+    renderer.update("assistant_message", {"content": block})
+    assert output.getvalue().count("row0") == 1
+
+
+def test_answer_header_printed_once_across_streamed_blocks():
+    renderer, output = make_renderer(min_render_interval=0)
+    renderer.use_scrollback(renderer._console)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+
+    renderer.update("text_delta", {"delta": "一\n\n二\n\n三"})
+    renderer.update("assistant_message", {"content": "一\n\n二\n\n三"})
+    assert output.getvalue().count("⏺") == 1  # 多块正文共用一个 ⏺ 标题
 
 
 # ---------- 工具头行：按工具特化的人话参数 ----------
@@ -153,6 +214,63 @@ def test_status_label_migrates_with_phase():
 
     feed_tool_call(renderer)
     assert renderer._status_label() == "Running Bash"
+
+
+def test_thinking_tail_renders_dim_italic_header_and_lines():
+    renderer, _buf = make_renderer(min_render_interval=0, reasoning_tail_lines=3)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+    for line in ("先读文件", "再看依赖", "然后验证", "最后给结论"):
+        renderer.update("reasoning_delta", {"delta": line + "\n"})
+
+    assert renderer.has_preview  # 思考阶段尾窗不再隐藏
+    preview = renderer.preview(80)
+    assert "✻ 思考中 ·" in preview
+    assert "\x1b[2;3m" in preview  # dim italic
+    assert "最后给结论" in preview and "然后验证" in preview
+    assert "先读文件" not in preview  # 只保留尾 3 行
+    assert "…" in preview  # 截断标记
+
+
+def test_thinking_tail_yields_to_tool_then_text():
+    renderer, _buf = make_renderer(min_render_interval=0)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+    renderer.update("reasoning_delta", {"delta": "正在推理\n"})
+
+    feed_tool_call(renderer, name="read_file", arguments={"path": "a.py"})
+    preview = renderer.preview(80)
+    assert "正在推理" not in preview  # 工具执行时不显示上一段思考
+    assert "Running Read File" in preview
+
+    renderer.update("text_delta", {"delta": "答案"})
+    preview = renderer.preview(80)
+    assert "答案" in preview
+    assert "思考中" not in preview
+
+
+def test_thinking_tail_throttles_but_updates_after_interval():
+    renderer, _buf = make_renderer(min_render_interval=10)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+    renderer.update("reasoning_delta", {"delta": "甲\n"})
+    first = renderer.preview(80)
+    renderer.update("reasoning_delta", {"delta": "乙\n"})
+    assert renderer.preview(80) == first  # 间隔内复用帧（思考逐片增长不重渲）
+    renderer._preview_at -= 11  # 手工跨过节流窗口
+    assert renderer.preview(80) != first
+
+
+def test_thinking_tail_clears_on_commit_and_collapses_to_scrollback():
+    renderer, output = make_renderer()
+    renderer.use_scrollback(renderer._console)
+    renderer.update("iteration", {"step": 1, "max_steps": 25})
+    reasoning = "思考内容第一行\n思考内容第二行"
+    renderer.update("reasoning_delta", {"delta": reasoning})
+    assert "思考内容" in renderer.preview(80)
+
+    renderer.update(
+        "assistant_message", {"content": "答案", "reasoning": reasoning, "tool_calls": []}
+    )
+    assert renderer.preview(80) == ""
+    assert "✻ 思考 15 字" in output.getvalue()  # 折叠摘要进滚动区，全文不落
 
 
 def test_usage_feeds_context_occupancy():
@@ -263,6 +381,27 @@ def test_interrupted_live_text_is_retained_without_leaking_into_next_task():
         renderer.update("iteration", {"step": 1})
         renderer.update("assistant_message", {"content": "new answer"})
     assert output.getvalue().count("unfinished paragraph") == 1
+
+
+def test_interrupted_live_thinking_does_not_leak_into_next_task():
+    renderer, _output = make_renderer(min_render_interval=0)
+    import pytest
+
+    with pytest.raises(InterruptedError), renderer:
+        renderer.update("iteration", {"step": 1, "max_steps": 25})
+        renderer.update("reasoning_delta", {"delta": "半截思考"})
+        assert renderer.has_preview
+        assert "半截思考" in renderer.preview(80)
+        raise InterruptedError()
+
+    # has_preview 现在包含 reasoning：中断后必须显式清，否则半截思考挂在尾窗。
+    assert not renderer.has_preview
+    assert renderer.preview(80) == ""
+    assert renderer._status_label() == "Waiting for model"
+    with renderer:
+        renderer.update("iteration", {"step": 1})
+        renderer.update("reasoning_delta", {"delta": "新一轮思考"})
+        assert "半截思考" not in renderer.preview(80)
 
 
 def test_plan_submitted_prints_plan_to_scrollback():

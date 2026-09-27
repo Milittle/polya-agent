@@ -48,12 +48,13 @@ live in `~/.polya/models.json` (mode 0600):
 /login zai
   base_url（回车用 https://api.z.ai/api/coding/paas/v4）:
   api_key（输入不回显）:
-已登录 zai：glm-5.3 @ api.z.ai · 窗口 1M，已设为默认启动模型。/model 切换，Ctrl+S 设默认。
+已登录 zai：glm-5.3 @ api.z.ai · 窗口 1M，已设为默认启动模型；模型目录后台刷新中。/model 切换，Ctrl+S 设默认。
 ```
 
-After login, Polya asks the provider's `/models` endpoint for the model list and
-reads context windows when the endpoint reports them (`context_length` /
-`max_model_len`); otherwise the built-in capability table applies. Resolution:
+After login, Polya saves the credential right away and refreshes the provider's
+`/models` list in a background thread (15s timeout), so the wizard never blocks on
+it; context windows are read when the endpoint reports them (`context_length` /
+`max_model_len`), otherwise the built-in capability table applies. Resolution:
 discovered value > built-in table > 128k. `/model` switches mid-session (no
 arguments open a picker across every logged-in model; `Ctrl+S` saves the default
 startup model). `/logout <provider>` removes credentials. Startup resolution:

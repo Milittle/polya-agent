@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `/new`, `/clear` and `/reset` now wipe the screen (erase display + cursor home)
+  before reprinting the startup banner, so the terminal reads like a freshly
+  launched session instead of stacking on the old scrollback.
 - Compaction trigger now guarantees an absolute reserve (`--reserve-tokens`, default
   16384, matching pi's `reserveTokens`): the trigger is
   `min(window × threshold, window − reserve)` floored at half the window, so small
@@ -121,8 +124,12 @@ other message keeps revising it read-only.
 - Context-size estimation caches the static prompt/tool-schema part and per-message sizes.
 - `/login` and `/logout`: a provider table (first batch of 8 groups from pi's
   OpenRouter/DeepSeek/z.ai/Moonshot/Groq/Together/NVIDIA/Qwen catalog) logs in by
-  name, prefills the base URL (overridable), asks for the key via getpass, then asks
-  the endpoint's `/models` for the model list and auto-selects the provider default.
+  name, prefills the base URL (overridable), asks for the key via getpass, then saves
+  the credential immediately (pi-aligned): the model catalog is refreshed in a
+  background thread (15s timeout, no retries) instead of blocking the wizard on
+  `/models`, so login returns at once; failures fall back to the static window table
+  and are reported in the scrollback. Re-running `/login` keeps the user's currently
+  selected model rather than resetting it to the preset default.
 - `/model`: a picker across every logged-in provider and discovered model; `Ctrl+S`
   saves the highlighted model as the default startup model.
 - Context windows resolve through discovered endpoint metadata (`context_length` /
@@ -189,6 +196,14 @@ status line above the editor is unchanged. Narrow terminals drop provider → th
   previously prompt_toolkit's unique-no-increment reset collapsed the menu exactly when
   the confirmation mattered most. Esc still closes it (without reopening), Enter still
   executes, and the zombie-state guard from the menu-reopen fix is preserved.
+- Live thinking is rendered again: the v3 refactor left `_reasoning_buf` collected but
+  unrendered, so the preview window stayed hidden while the model reasoned and the UI
+  showed only `Thinking · Ns`. The bounded thinking tail (`✻ 思考中 · N 字` + last few
+  lines, dim italic) is restored in the preview tail; the full thinking text still only
+  lands in scrollback folded, and via `/details`. The buffer is also cleared on tool
+  result and on interrupt, so a finished or aborted thinking tail cannot linger.
+- The busy line repaints once a second while a task is running, so `Thinking · Ns`
+  keeps counting even when the provider sends no events during a long think or tool.
 - Completion menu now reopens after deleting back to a matching prefix (prompt_toolkit
   only restarts completion on insertion, not deletion) and auto-popup preselects the
   first candidate without inserting its text; Tab keeps its insert-first behavior and
@@ -197,6 +212,13 @@ status line above the editor is unchanged. Narrow terminals drop provider → th
   typed in full and the completion menu closes; previously it fell back to the bare
   command name, dropping the description. A duplicate `on_text_changed` handler that ran
   auto-completion twice per keystroke was also removed.
+- `/login` no longer freezes the whole TUI. Idle commands were executed on the asyncio
+  event-loop thread, so the terminal-handoff handshake in `_borrow_terminal`
+  (`call_soon_threadsafe` + `ready.wait()`) waited on the very loop it was blocking on —
+  a permanent deadlock that hit every provider (reported with DeepSeek). Commands are now
+  dispatched as their own worker task (like model tasks), keeping the loop schedulable;
+  `_borrow_terminal` also falls back to running the callback directly if it is ever
+  invoked from the loop thread, so the failure mode can no longer be an infinite hang.
 
 ## [0.1.0] - 2026-09-26
 

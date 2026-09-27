@@ -180,3 +180,93 @@ loop.run_repl(agent, str(Path(__file__).parent), TerminalRenderer())
             process.wait(timeout=3)
         os.close(master)
         (tmp_path / "menu.ansi").write_bytes(transcript)
+
+
+def test_terminal_login_saves_config_without_freezing(tmp_path):
+    """/login 在真实终端里走完向导并落盘，不冻结主循环（回归：借道握手死锁）。"""
+    home = tmp_path / "home"
+    home.mkdir()
+    script = tmp_path / "login_demo.py"
+    script.write_text(
+        f'''
+import os
+from pathlib import Path
+from types import SimpleNamespace as NS
+from polya import Agent
+from polya.input import InputBox
+from polya.render import TerminalRenderer
+import polya.loop as loop
+import polya.commands as commands
+from polya.models import ModelEntry
+
+commands.discover_models = lambda base_url, api_key, timeout=10.0: [
+    ModelEntry("deepseek-flash", 1_000_000)
+]
+commands.getpass = lambda prompt="": "sk-terminal-12345678"
+
+class LLM:
+    model = "demo-model"
+    base_url = "http://x"
+    api_key = "k"
+    def chat_iter(self, messages, schemas):
+        return NS(choices=[NS(message=NS(content="ok", tool_calls=None))], usage=None)
+
+loop.InputBox = lambda **kw: InputBox(Path(os.environ["HOME"]) / "history", **kw)
+agent = Agent(llm=LLM(), tools=[], status_bar=False)
+loop.run_repl(agent, {str(tmp_path)!r}, TerminalRenderer())
+''',
+        encoding="utf-8",
+    )
+    master, slave = os.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "TERM": "xterm-256color",
+        "HOME": str(home),
+    }
+    process = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=env,
+        start_new_session=True,
+    )
+    os.close(slave)
+    transcript = bytearray()
+
+    def read_until(text, offset=0):
+        deadline = time.monotonic() + 6
+        while text.encode() not in transcript[offset:]:
+            assert time.monotonic() < deadline, transcript.decode(errors="replace")
+            readable, _, _ = select.select([master], [], [], 0.05)
+            if readable:
+                chunk = os.read(master, 65536)
+                transcript.extend(chunk)
+                if b"\x1b[6n" in chunk:
+                    os.write(master, b"\x1b[1;1R")
+        return len(transcript)
+
+    try:
+        read_until("❯")
+        for char in b"/login deepseek":
+            os.write(master, bytes([char]))
+            time.sleep(0.02)
+        os.write(master, b"\r")
+        read_until("回车用")  # base_url 预填提示：向导已进入隐藏输入区
+        os.write(master, b"\r")  # 回车用预置 base_url
+        offset = read_until("已登录")  # key（getpass 替身）→ 发现 → 落盘
+        config = (home / ".polya" / "models.json").read_text(encoding="utf-8")
+        assert "deepseek-flash" in config and "api.deepseek.com" in config
+        read_until("❯", offset)  # 命令结束、输入框重现后再退出
+        os.write(master, b"\x03\x04")  # 清空草稿并退出
+        process.wait(timeout=6)
+        assert process.returncode == 0
+        assert b"Traceback" not in transcript
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=3)
+        os.close(master)
+        (tmp_path / "login.ansi").write_bytes(transcript)
