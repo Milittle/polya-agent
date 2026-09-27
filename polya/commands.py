@@ -409,6 +409,10 @@ def _clone(ctx: CommandContext, arg: str) -> str:
     return ctx.agent.clone_session()
 
 
+def _thinking(ctx: CommandContext, arg: str) -> str:
+    return ctx.agent.set_thinking(arg)
+
+
 def _load(ctx: CommandContext, arg: str) -> str:
     if not arg:
         return "用法 (Usage): /load <会话名>"
@@ -522,6 +526,18 @@ COMMANDS = (
         idle=True,
     ),
     Command("/clone", "复制当前会话为新会话", _clone, idle=True),
+    Command(
+        "/thinking",
+        "设置推理档位（一家一策）",
+        _thinking,
+        argument_hint="[off|low|medium|high]",
+        choices=(
+            ("off", "关闭推理（部分模型只能降到最低）"),
+            ("low", "低"),
+            ("medium", "中"),
+            ("high", "高"),
+        ),
+    ),
     Command("/tree", "显示整棵树：分叉点与所有分支", _tree),
     Command(
         "/edit",

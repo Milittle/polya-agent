@@ -31,6 +31,11 @@ class ModelProfile:
     reasoning_passthrough: bool = True  # 扩展字段，OpenAI 官方 API 不返回也无副作用
     supports_inplace_tool_edit: bool = True
     temperature: float | None = 0.0
+    # 推理档位的请求形态（一家一策，用户 2026-09-27 拍板；见 reasoning_params）：
+    #   "none"             不发任何档位参数（默认；未知/不支持的端点安全侧）
+    #   "reasoning_effort" OpenAI o 系 / gpt-5：reasoning_effort=low|medium|high
+    #   "thinking_toggle"  GLM / DeepSeek：thinking={type: enabled|disabled}
+    reasoning_style: str = "none"
     note: str = ""
 
 
@@ -43,19 +48,25 @@ PROFILES: dict[str, ModelProfile] = {
     # 原样回传（工具调用轮之间），回传即绑定前缀 → 压缩须摘要重启
     "deepseek-reasoner": ModelProfile(
         supports_inplace_tool_edit=False,
+        reasoning_style="thinking_toggle",
         note="interleaved thinking：reasoning_content 回传绑定前缀",
     ),
     # GLM-5 系（z.ai / bigmodel coding plan 的 glm-5.x）：1M 窗口（官方，2026-09 核实）。
     # 前缀须排在 "glm" 前：profile_for 按声明序首个 startswith 命中
     "glm-5": ModelProfile(context_window=1_000_000, note="1M 窗口（z.ai 官方）"),
     # GLM-4 系：200K 窗口（官方，2026-09 核实）
-    "glm": ModelProfile(context_window=200_000, note="200K 窗口（z.ai 官方）"),
+    "glm": ModelProfile(
+        context_window=200_000,
+        reasoning_style="thinking_toggle",
+        note="200K 窗口（z.ai 官方）；thinking 开关",
+    ),
     # DeepSeek V4.1 Flash（deepseek-flash）：1M 窗口 + 384K 输出（官方 pricing 页，
     # 2026-09 核实；deepseek-chat/reasoner 已是遗留名）。thinking 默认开，按
     # reasoner 同款保守档：摘要重启压缩（宁保守不赌原地替换）
     "deepseek-flash": ModelProfile(
         context_window=1_000_000,
         supports_inplace_tool_edit=False,
+        reasoning_style="thinking_toggle",
         note="1M 窗口；thinking 默认开，保守同 reasoner",
     ),
     # Claude 系：thinking block 密码学签名绑定前缀；200K 窗口；温度 1 起步。
@@ -67,10 +78,16 @@ PROFILES: dict[str, ModelProfile] = {
         note="thinking 签名绑定前缀；原生 API 需中立轨迹渲染层",
     ),
     # OpenAI o 系 / gpt-5：Chat Completions 不回传 reasoning（原地压缩安全），
-    # 但不接受自定义温度（None = 不传，用服务端默认）
-    "o1": ModelProfile(temperature=None, note="仅默认温度"),
-    "o3": ModelProfile(temperature=None, note="仅默认温度"),
-    "gpt-5": ModelProfile(temperature=None, note="仅默认温度"),
+    # 但不接受自定义温度（None = 不传，用服务端默认）；支持 reasoning_effort。
+    "o1": ModelProfile(
+        temperature=None, reasoning_style="reasoning_effort", note="仅默认温度；reasoning_effort"
+    ),
+    "o3": ModelProfile(
+        temperature=None, reasoning_style="reasoning_effort", note="仅默认温度；reasoning_effort"
+    ),
+    "gpt-5": ModelProfile(
+        temperature=None, reasoning_style="reasoning_effort", note="仅默认温度；reasoning_effort"
+    ),
     # Gemini：thought signature 绑定前缀（函数调用多轮需回传）
     "gemini": ModelProfile(supports_inplace_tool_edit=False, note="thought signature 绑定前缀"),
 }
@@ -84,3 +101,23 @@ def profile_for(model: str | None) -> ModelProfile:
         if model.startswith(prefix):
             return profile
     return _DEFAULT
+
+
+# 可选的推理档位（/thinking）；"none" 表示模型不支持，命令会明确提示。
+REASONING_LEVELS = ("off", "low", "medium", "high")
+
+
+def reasoning_params(style: str, level: str) -> dict:
+    """把统一档位翻译成厂商请求字段（一家一策）；纯函数，离线可测。
+
+    level ∈ REASONING_LEVELS。style 为 ``ModelProfile.reasoning_style``；未知/"none"
+    返回空（不污染请求）。
+    """
+    if style == "reasoning_effort":
+        # OpenAI o 系 / gpt-5：off 映射到极低推理（无法真正关闭思考），gpt-5 支持 minimal。
+        effort = {"off": "minimal", "low": "low", "medium": "medium", "high": "high"}
+        return {"reasoning_effort": effort[level]}
+    if style == "thinking_toggle":
+        # GLM / DeepSeek：只有开/关，档位粒度忽略（非 off 视为开）。
+        return {"thinking": {"type": "disabled" if level == "off" else "enabled"}}
+    return {}

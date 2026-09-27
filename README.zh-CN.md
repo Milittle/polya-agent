@@ -90,7 +90,8 @@ REPL 斜杠命令：
 | `/todos` `/status` | 查看 TODO 清单 / 会话状态（模式、用量、工具计数） |
 | `/plan on\|go\|off` | 切换规划模式；`go` 批准当前计划进入执行（`exit_plan_mode` 构造时已注册，切换不动工具数组，缓存安全） |
 | `/models [profile]` | 查看 / 切换 / 录入模型 profile：对话保留、旧模型 thinking 剥离、能力档案跟随；无参数展开选项器，`/models add` 进交互向导（预设选名字、key 隐藏输入） |
-| `/expand [N]` | 展开最近 N 块（默认 5）的工具结果 / 思考全文——滚动区的折叠块在这里看全量 |
+| `/thinking [off\|low\|medium\|high]` | 设置推理档位（一家一策）：o 系/gpt-5 发 `reasoning_effort`，GLM/DeepSeek 发 `thinking` 开关；档案无档位的模型明确提示不可切 |
+| `/details [ID]` | 查看留档块全文：无参数看最近 5 块，带 ID 看指定块——滚动区的折叠块在这里看全量 |
 | `/compact [说明]` | 立即压缩上下文（不等阈值）；可选说明聚焦摘要重点 |
 | `/clear` | 清空对话历史、TODO 与统计（别名 `/reset`；保留会话主题、授权规则与排队消息） |
 | `/rename <主题>` | 重命名当前会话主题与终端标题（单行，最多 120 字）；忙时下一轮请求前生效 |

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 from openai import APITimeoutError, BadRequestError, OpenAI, RateLimitError
 
+from .providers import profile_for, reasoning_params
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -172,6 +173,9 @@ class LLM:
         self._stream_supported = True
         # 流式瞬时错误的有界重试：只在尚未吐出任何片段时重开请求
         self._stream_retries = 1
+        # 推理档位（/thinking，一家一策）：风格由模型能力档案决定，None=用厂商默认。
+        self.reasoning_style = profile_for(self.model).reasoning_style
+        self.thinking_level: str | None = None
 
     def _base_kwargs(self, messages: list[dict], tools: list[dict] | None) -> dict:
         kwargs: dict = {"model": self.model, "messages": messages}
@@ -179,6 +183,8 @@ class LLM:
             kwargs["temperature"] = self.temperature
         if tools:
             kwargs["tools"] = tools
+        if self.thinking_level and self.reasoning_style != "none":
+            kwargs.update(reasoning_params(self.reasoning_style, self.thinking_level))
         return kwargs
 
     def _open_stream(self, kwargs: dict):

@@ -515,6 +515,14 @@ class Agent:
         self._compress_failures = 0
         self._reset_size_cache()
 
+    def set_thinking(self, level: str) -> str:
+        """设置推理档位（/thinking，一家一策；见 providers.reasoning_params）。"""
+        style = getattr(self.llm, "reasoning_style", "none")
+        if style == "none":
+            return f"当前模型（{self.llm.model}）没有可切换的推理档位。"
+        self.llm.thinking_level = level
+        self._reset_restart_point()  # 请求参数变更：前缀基线重算（保守）
+        return f"推理档位已设为 {level}（{style}）。"
 
     # ---------- 生成器协议 ----------
 
