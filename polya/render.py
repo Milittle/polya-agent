@@ -87,14 +87,6 @@ def _header_arg(name: str, arguments: dict) -> str:
     return _args_preview(arguments)
 
 
-def _fmt_tokens(count: int) -> str:
-    """token 数的人话格式：1234 → 1.2k、128000 → 128k。"""
-    if count < 1000:
-        return str(count)
-    value = count / 1000
-    return f"{value:.0f}k" if value >= 100 else f"{value:.1f}k"
-
-
 def _thinking_summary(reasoning: str) -> Text:
     """思考折叠行（Claude Code 的 ✻ 语汇）：字数 + 首行摘要，dim italic 单行。
 
@@ -142,6 +134,7 @@ class TerminalRenderer:
         self.context_window = context_window
         self._ctx_used: int | None = None
         self._ctx_cached = 0
+        self.total_usage: dict = {}  # 会话累计用量（usage 事件的 total）
         self._tool_output_tail_lines = max(1, tool_output_tail_lines)
         self._tool_out: list[str] = []  # 运行中工具的实时输出尾窗（bash tap 喂入）
         self._tool_dropped = 0  # 尾窗装不下而丢弃的行数（渲染 … 标记用）
@@ -279,9 +272,11 @@ class TerminalRenderer:
         elif event == "usage":
             # 上下文占用 = 最近一次请求的 prompt_tokens（当前真正在窗内的量）；
             # cached_tokens 是其中命中提示缓存的部分，用于展示缓存收益。
+            # total 为会话累计（跨压缩保留），状态栏的 ↑/↓/R 取它。
             last = payload.get("last") or {}
             self._ctx_used = last.get("prompt_tokens")
             self._ctx_cached = last.get("cached_tokens") or 0
+            self.total_usage = payload.get("total") or {}
         elif event == "compaction":
             self._print_compaction(payload)
 

@@ -38,8 +38,10 @@ from .commands import (
 )
 from .executor import execute
 from .filefind import ProjectFiles
+from .gitinfo import current_branch
 from .input import InputBox, InputSuspended
 from .models import ModelsConfig, format_context_window
+from .providers import SUBSCRIPTION_PROVIDERS, estimate_cost
 from .render import TerminalRenderer, console
 from .review import Reviewer, is_plan_approval
 
@@ -269,19 +271,40 @@ class InteractiveSession:
 
     def _status(self, renderer: TerminalRenderer) -> None:
         # /model 切换后状态行跟随（llm 实例整个换掉，model/profile_name 都变）
-        self.state["model"] = self.agent.llm.model
+        llm = self.agent.llm
+        self.state["model"] = llm.model
         self.state["topic"] = self.topic
-        self.state["profile"] = getattr(self.agent.llm, "profile_name", None)
-        self.state["thinking"] = getattr(self.agent.llm, "thinking_level", None) or ""
+        self.state["profile"] = getattr(llm, "profile_name", None)
+        self.state["thinking"] = getattr(llm, "thinking_level", None) or ""
         self.state["mode"] = "plan" if self.agent.plan_mode else "normal"
         self.state["status"] = renderer._status_label()
         self.state["preview_active"] = renderer.has_preview
+        self.state["branch"] = current_branch(self.root)
+        # 用量与费用：累计 token 取渲染器存的 total（跨压缩保留）；命中率取最近一次
+        # 请求的 cached/prompt。费用按 PRICES 估算，无价表或订阅制 provider 不显示金额。
+        totals = renderer.total_usage or {}
+        prompt_tokens = int(totals.get("prompt_tokens", 0) or 0)
+        completion_tokens = int(totals.get("completion_tokens", 0) or 0)
+        cached_tokens = int(totals.get("cached_tokens", 0) or 0)
+        # pi 语义：↑input 只算未命中缓存的输入，缓存读取单列为 CR（否则与 CR 重叠）。
+        input_tokens = max(0, prompt_tokens - cached_tokens)
+        self.state["input_tokens"] = input_tokens
+        self.state["output_tokens"] = completion_tokens
+        self.state["cached_tokens"] = cached_tokens
+        self.state["cache_hit"] = (
+            renderer._ctx_cached / renderer._ctx_used * 100 if renderer._ctx_used else None
+        )
+        self.state["subscribed"] = getattr(llm, "profile_name", None) in SUBSCRIPTION_PROVIDERS
+        self.state["cost"] = estimate_cost(
+            llm.model, input_tokens, completion_tokens, cached_tokens
+        )
+        self.state["auto"] = bool(getattr(self.agent, "compress", False))
         # 窗口大小（票 01）：第二零刻即可显示容量，首次请求后才追加占用百分比。
         # 只赋值、不 pop：占用在 /clear /new 时由 _run_command 显式清零（见下）。
         if renderer.context_window:
             self.state["window"] = format_context_window(renderer.context_window)
         if renderer.context_window and renderer._ctx_used is not None:
-            self.state["context"] = f"ctx {renderer._ctx_used * 100 // renderer.context_window}%"
+            self.state["context_pct"] = renderer._ctx_used * 100 // renderer.context_window
         self.box._session.app.invalidate()
 
     def _start_task(self) -> None:
@@ -485,7 +508,6 @@ class InteractiveSession:
             self.closing = True
             return
         if command.name in (
-            "/clear",
             "/new",
             "/resume",
             "/fork",
@@ -493,7 +515,9 @@ class InteractiveSession:
             "/load",
         ) and not command_error(text):
             self.renderer._ctx_used = None
-            self.state.pop("context", None)
+            self.renderer.total_usage = {}
+            self.state.pop("context_pct", None)
+            self.state.pop("cache_hit", None)
         # 切/换会话后把驱动层主题与窗口标题同步到会话元数据（/new 走 restart 自清）。
         if command.name in ("/resume", "/fork", "/clone", "/load"):
             self.topic = self.agent.session_title

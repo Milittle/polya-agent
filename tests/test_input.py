@@ -356,25 +356,61 @@ def _bar_text(box) -> str:
     return "".join(fragment for _, fragment in box._bottom_bar())
 
 
-def test_bottom_bar_shows_state_and_hints(tmp_path):
+def test_identity_usage_and_bottom_bars_split_state(tmp_path):
     with make_box(tmp_path) as (box, _):
         box._state = {
-            "mode": "规划",
-            "model": "deepseek-chat",
+            "mode": "plan",
+            "model": "deepseek-flash",
+            "profile": "deepseek",
+            "thinking": "high",
+            "project": "/home/u/polya",
+            "branch": "main",
+            "topic": "修复输入框",
             "window": "128k",
-            "context": "ctx 12%",
-            "rules": 2,
+            "context_pct": 12,
+            "auto": True,
+            "input_tokens": 12345,
+            "output_tokens": 678,
+            "cached_tokens": 12000,
+            "cache_hit": 80.0,
         }
-        text = _bar_text(box)
-        for part in ("规划", KEY_HINTS):
-            assert part in text, part
-        environment = "".join(t for _, t in box._environment_bar())
-        for part in ("deepseek-chat", "128k", "ctx 12%"):
-            assert part in environment, part
+        identity = "".join(t for _, t in box._environment_bar())
+        usage = "".join(t for _, t in box._usage_bar())
+        bottom = _bar_text(box)
+        # 身份行：模型带 provider/思考档，项目带分支与主题
+        assert "(deepseek) deepseek-flash • high" in identity
+        assert "main" in identity and "修复输入框" in identity
+        # 用量行：累计 token、缓存命中、上下文占用与 auto
+        for part in ("↑12.3k", "↓678", "CR12.0k", "CH80.0%", "ctx 12%/128k (auto)"):
+            assert part in usage, part
+        # 操作行：模式与快捷键
+        assert "plan" in bottom and KEY_HINTS in bottom
 
         box._flash_hint("再按一次 Ctrl+C 退出")
         assert "再按一次 Ctrl+C 退出" in _bar_text(box)
         assert KEY_HINTS not in _bar_text(box)  # 临时提示顶替快捷键区
+
+
+def test_usage_bar_shows_subscription_and_unknown_window(tmp_path):
+    with make_box(tmp_path) as (box, _):
+        box._state = {
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "subscribed": True,
+            "auto": True,
+        }
+        usage = "".join(t for _, t in box._usage_bar())
+        assert "(sub)" in usage and "(auto)" in usage
+        assert "ctx" not in usage  # 窗口未知时不显示占用
+        # 已知价表则显示金额而非 (sub)
+        box._state.update(subscribed=True, cost=0.1234)
+        assert "$0.123" in "".join(t for _, t in box._usage_bar())
+
+
+def test_usage_bar_omits_empty_state(tmp_path):
+    with make_box(tmp_path) as (box, _):
+        box._state = {}
+        assert "".join(t for _, t in box._usage_bar()).strip() == ""
 
 
 def test_bottom_bar_without_state_shows_hints_only(tmp_path):
@@ -423,20 +459,33 @@ def test_footer_preserves_model_project_and_topic_with_unicode(tmp_path, width):
         box = InputBox(tmp_path / "history", input=pipe, output=Output())
         box._state = {
             "model": "test-model",
+            "profile": "acme",
+            "thinking": "high",
             "window": "200k",
             "project": "/very/long/parent/项目",
+            "branch": "feature/x",
             "topic": "修复输入框和工具反馈",
-            "context": "ctx 23%",
+            "context_pct": 23,
+            "auto": True,
             "mode": "normal",
+            "input_tokens": 12345,
+            "output_tokens": 678,
+            "cached_tokens": 12000,
+            "cache_hit": 80.0,
         }
-        environment = "".join(t for _, t in box._environment_bar())
-        footer = _bar_text(box)
-        assert get_cwidth(environment) <= width and get_cwidth(footer) <= width
-        assert "test-model" in environment and "项目" in environment
-        assert "修" in footer and "normal" in footer
+        identity = "".join(t for _, t in box._environment_bar())
+        usage = "".join(t for _, t in box._usage_bar())
+        bottom = _bar_text(box)
+        for line in (identity, usage, bottom):
+            assert get_cwidth(line) <= width
+        assert "test-model" in identity and "项目" in identity
+        assert "normal" in bottom
         if width >= 80:
-            assert "200k" in environment and "ctx 23%" in environment
-            assert "修复输入框和工具反馈" in footer
+            assert "200k" in usage
+            assert "ctx 23%/200k" in usage and "auto" in usage
+            assert "修复输入框和工具反馈" in identity
+        if width >= 120:
+            assert "acme" in identity
 
 
 def test_working_bar_uses_actual_phase(tmp_path):

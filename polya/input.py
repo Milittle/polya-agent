@@ -28,6 +28,7 @@ from prompt_toolkit.utils import get_cwidth
 
 from .commands import COMMANDS, command_error, parse_command
 from .filefind import ProjectFiles
+from .models import format_tokens
 
 PASTE_FOLD_THRESHOLD = 10  # 粘贴超过此行数即折叠为占位符
 QUIT_WINDOW_S = 2.0  # 空框双击 Ctrl+C 的判定窗口（秒）
@@ -64,6 +65,30 @@ def _fit(text: str, width: int) -> str:
             break
         result += char
     return result + ("…" if width else "")
+
+
+def _tail(text: str, width: int) -> str:
+    """保留尾部（项目基名/后缀），前面用 … 占位。"""
+    if width <= 0:
+        return ""
+    if get_cwidth(text) <= width:
+        return text
+    tail = ""
+    for char in reversed(text):
+        if get_cwidth(char + tail) > width - 1:
+            break
+        tail = char + tail
+    return "…" + tail
+
+
+def _align(left: str, right: str, width: int) -> str:
+    """一行的左右两段：右段优先保真，左段先截，至少留 2 空格间隔。"""
+    if not right:
+        return _fit(left, width)
+    right = _fit(right, width)
+    left = _fit(left, max(0, width - get_cwidth(right) - 2))
+    gap = max(2, width - get_cwidth(left) - get_cwidth(right))
+    return _fit(left + " " * gap + right, width)
 
 
 def prompt_message(state: dict) -> list:
@@ -378,8 +403,6 @@ class InputBox:
         buffer.on_text_changed.add_handler(_auto_complete)
         buffer.on_completions_changed.add_handler(_preselect_first)
 
-        buffer.on_text_changed.add_handler(_auto_complete)
-
         def menu_visible() -> bool:
             state = buffer.complete_state
             return state is not None and bool(state.completions)
@@ -417,6 +440,7 @@ class InputBox:
                     container,
                     Window(FormattedTextControl(rule), height=1),
                     Window(FormattedTextControl(self._environment_bar), height=1),
+                    Window(FormattedTextControl(self._usage_bar), height=1),
                     Window(FormattedTextControl(self._bottom_bar), height=1),
                 ]
             ),
@@ -460,53 +484,100 @@ class InputBox:
         return [("class:rule", _fit(text, width))]
 
     def _environment_bar(self) -> list:
-        """Model · window · project stay visible before the optional context usage.
+        """项目身份行：项目（~ 缩写）(分支) • 主题，右对齐 provider · 模型 · 思考档。
 
-        窗口大小（票 01）在第二零刻即有值（cli 启动时灌入 renderer.context_window），
-        首次请求后由 `_status` 追加 `ctx N%`。
+        窗口与用量在下一行 `_usage_bar`；模式与提示在 `_bottom_bar`。宽度不足时
+        依次舍弃 provider → 思考档 → 分支 → 主题，最后保项目基名与模型。
         """
         width = max(0, self._session.output.get_size().columns - 3)
-        model = self._state.get("model") or "—"
-        window = self._state.get("window")
-        project = self._state.get("project") or "—"
+        state = self._state
+        project = state.get("project") or "—"
         home = str(Path.home())
         if project == home or project.startswith(home + "/"):
             project = "~" + project[len(home) :]
-        context = self._state.get("context")
+        branch = state.get("branch")
+        topic = state.get("topic")
+        model = state.get("model") or "—"
+        thinking = state.get("thinking")
+        profile = state.get("profile")
 
-        def compose(with_window: bool, with_context: bool) -> str:
-            segments = [model]
-            if with_window and window:
-                segments.append(window)
-            segments.append(project)
-            if with_context and context:
-                segments.append(context)
-            return " · ".join(segments)
+        def compose(
+            with_provider: bool, with_thinking: bool, with_branch: bool, with_topic: bool
+        ) -> tuple[str, str]:
+            left = f"{project} ({branch})" if with_branch and branch else project
+            if with_topic and topic:
+                left = f"{left} • {topic}"
+            right = f"{model} • {thinking}" if with_thinking and thinking else model
+            if with_provider and profile:
+                right = f"({profile}) {right}"
+            return left, right
 
-        full = compose(True, True)
-        if get_cwidth(full) > width:
-            full = compose(True, False)  # 窄屏先舍 ctx%（启动时本来也没有）
-        if get_cwidth(full) > width:
-            full = compose(False, False)  # 再舍窗口，保住模型与目录两个身份
-        if get_cwidth(full) > width:
-            available = max(0, width - 3)
-            basename_width = get_cwidth(Path(project).name or project)
-            reserved_project = min(basename_width, max(1, available // 2))
-            head_width = min(get_cwidth(model), max(1, available - reserved_project))
-            project_width = max(0, available - head_width)
-            # Keep the project basename/suffix when its parents don't fit.
-            if get_cwidth(project) > project_width:
-                tail = ""
-                for char in reversed(project):
-                    if get_cwidth(char + tail) > max(0, project_width - 1):
-                        break
-                    tail = char + tail
-                project = ("…" + tail) if project_width else ""
-            full = f"{_fit(model, head_width)} · {project}"
-        return [("class:rule", "  " + _fit(full, width))]
+        # 窄屏舍弃顺序：provider → 思考档 → 分支 → 主题；最后保项目基名与模型。
+        left, right = compose(True, True, True, True)
+        for flags in (
+            (False, True, True, True),
+            (False, False, True, True),
+            (False, False, False, True),
+            (False, False, False, False),
+        ):
+            if get_cwidth(left) + get_cwidth(right) + 2 <= width:
+                break
+            left, right = compose(*flags)
+        basename = Path(project).name or project
+        reserve = min(get_cwidth(basename), max(1, width // 3))
+        if get_cwidth(right) > max(0, width - reserve - 2):
+            right = _fit(right, max(0, width - reserve - 2))
+        budget = max(0, width - get_cwidth(right) - 2)
+        if get_cwidth(left) > budget:
+            left = _tail(left, budget)  # 保项目基名/后缀
+        return [("class:rule", "  " + _align(left, right, width))]
+
+    def _usage_bar(self) -> list:
+        """累计用量 + 上下文：↑输入 ↓输出 R缓存 CH命中% $费用 ctx 占比/窗口 (auto)。"""
+        width = max(0, self._session.output.get_size().columns - 3)
+        state = self._state
+        parts: list[str] = []
+        input_tokens = state.get("input_tokens") or 0
+        output_tokens = state.get("output_tokens") or 0
+        cached_tokens = state.get("cached_tokens") or 0
+        if input_tokens:
+            parts.append(f"↑{format_tokens(input_tokens)}")
+        if output_tokens:
+            parts.append(f"↓{format_tokens(output_tokens)}")
+        if cached_tokens:
+            parts.append(f"CR{format_tokens(cached_tokens)}")
+        hit = state.get("cache_hit")
+        if cached_tokens and hit is not None:
+            parts.append(f"CH{hit:.1f}%")
+        cost = state.get("cost")
+        subscribed = state.get("subscribed")
+        if cost is not None:
+            # 订阅制也照列价估算，但标 (sub)：套餐内不实际计费（pi 同款）。
+            parts.append(f"${cost:.3f}" + (" (sub)" if subscribed else ""))
+        elif subscribed and (input_tokens or output_tokens or cached_tokens):
+            parts.append("(sub)")
+        context = self._context_segment()
+        if context:
+            parts.append(context)
+        return [("class:rule", "  " + _fit(" ".join(parts), width))]
+
+    def _context_segment(self) -> str:
+        """上下文片段：`ctx 23%/128k (auto)`；窗口未知时不显示，auto 单独保留。"""
+        state = self._state
+        window = state.get("window")
+        percent = state.get("context_pct")
+        if window and percent is not None:
+            segment = f"ctx {percent}%/{window}"
+        elif window:
+            segment = f"ctx —/{window}"
+        else:
+            segment = ""
+        if state.get("auto"):
+            segment = f"{segment} (auto)" if segment else "(auto)"
+        return segment
 
     def _bottom_bar(self) -> list:
-        """Session identity on the left, mode and context-sensitive actions on the right."""
+        """模式与队列在左，随上下文变化的操作提示在右。"""
         state = self._state
         width = max(0, self._session.output.get_size().columns - 3)
         busy = state.get("busy", False)
@@ -520,23 +591,18 @@ class InputBox:
         elif buffer.text.lstrip().startswith("/"):
             command, _ = parse_command(buffer.text)
             if command is not None:
-                hint = command.usage
+                # 命令打全后补全菜单收起（_preselect_first 的唯一无增量重置），
+                # 描述不能随之消失：底栏接过参数提示与说明。
+                hint = " · ".join(p for p in (command.argument_hint, command.description) if p)
         elif buffer.text and not busy:
             hint = "Ctrl+J 换行 · Alt+Enter 追加"
         flashed = time.monotonic() < self._hint_until
         if flashed:
             hint = self._hint
-        topic = state.get("topic") or "新会话"
-        right = mode + " · " + hint
-        # Keep both session identity and an action visible on narrow terminals.
-        if not flashed and get_cwidth(right) + min(get_cwidth(topic), 12) + 2 > width:
+        # 窄屏：提示退到最短，但模式（plan/normal）一定保留。
+        if not flashed and get_cwidth(mode) + get_cwidth(hint) + 4 > width:
             hint = "Esc 关闭" if buffer.complete_state else "Enter 引导" if busy else "/help"
-            right = mode + " · " + hint
-        reserve = 0 if flashed else min(8, width // 3) + 2
-        right = _fit(right, max(0, width - reserve))
-        left = _fit(topic, max(0, width - get_cwidth(right) - 2))
-        gap = max(0, width - get_cwidth(left + right))
-        return [("class:rule", "  " + left + " " * gap + right)]
+        return [("class:rule", "  " + _align(mode, hint, width))]
 
     def _flash_hint(self, message: str) -> None:
         """临时提示占据状态栏右侧一小段时间。"""

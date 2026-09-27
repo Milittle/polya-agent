@@ -127,10 +127,28 @@ def test_dequeue_moves_queue_back_to_editor(tmp_path):
 def test_invalid_reset_preserves_context_indicator(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, _):
         session.renderer._ctx_used = 100
-        session.state["context"] = "ctx 10%"
+        session.state["context_pct"] = 10
         session._local("/clear extra")
         assert session.renderer._ctx_used == 100
-        assert "context" in session.state
+        assert "context_pct" in session.state
+
+
+def test_status_computes_uncached_input_and_cost(tmp_path):
+    llm = FakeLLM([])
+    llm.model = "deepseek-flash"
+    with session_for(tmp_path, llm) as (session, _, _):
+        session.renderer.total_usage = {
+            "prompt_tokens": 1_000_000,
+            "completion_tokens": 500_000,
+            "cached_tokens": 800_000,
+        }
+        session._status(session.renderer)
+        # pi 语义：↑input 扣掉缓存读取
+        assert session.state["input_tokens"] == 200_000
+        assert session.state["cached_tokens"] == 800_000
+        # 0.2*0.3 + 0.5*1.2 + 0.8*0.006 = 0.06 + 0.6 + 0.0048
+        assert session.state["cost"] == pytest.approx(0.6648)
+        assert session.state["subscribed"] is False
 
 
 def test_clear_keeps_session_identity_and_queue(tmp_path):
