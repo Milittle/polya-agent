@@ -106,8 +106,7 @@ def test_build_agent_registers_exit_plan_mode(tmp_path):
     agent = build_agent(parse_args(["--root", str(tmp_path)]), llm=ScriptedLLM([]))
     assert "exit_plan_mode" in [t.name for t in agent.tools]
     assert agent.plan_mode is False
-    assert agent.max_steps == 100
-    assert agent.max_continuations == 4
+    assert agent.max_steps == 0  # CLI pi 式无界：只有无进展熔断兜底
 
     planned = build_agent(parse_args(["--root", str(tmp_path), "--plan"]), llm=ScriptedLLM([]))
     assert planned.plan_mode is True
@@ -139,25 +138,6 @@ def test_prompt_mode_saves_session(monkeypatch, tmp_path, capsys):
     assert [m.name for m in session_store.list_metas()]
 
 
-def test_prompt_mode_budget_exhausted_returns_unfinished(monkeypatch, tmp_path, capsys):
-    """票 03：达续跑上限 -> [未完成] + 退出码 1，且仍落盘。"""
-    # 参数各不相同（避开无进展熔断），--max-steps 1 下连跳上限 4 -> 第 5 轮预算收尾
-    calls = [
-        SimpleNamespace(
-            id=f"c{i}", function=SimpleNamespace(name="add", arguments=f'{{"a": {i}, "b": 2}}')
-        )
-        for i in range(5)
-    ]
-    fake = ScriptedLLM([make_message(tool_calls=[c]) for c in calls])
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
-    code = main(["--root", str(tmp_path), "-p", "循环", "--max-steps", "1"])
-    assert code == 1
-    captured = capsys.readouterr()
-    assert "[未完成]" in captured.err
-    assert (tmp_path / ".polya" / "sessions").exists()
-
-
 def test_prompt_mode_loop_guard_returns_unfinished(monkeypatch, tmp_path, capsys):
     """票 07：-p 熔断收尾复用 last_run_exhausted -> [未完成] + 退出码 1。"""
     call = SimpleNamespace(
@@ -166,7 +146,7 @@ def test_prompt_mode_loop_guard_returns_unfinished(monkeypatch, tmp_path, capsys
     fake = ScriptedLLM([make_message(tool_calls=[call]) for _ in range(4)])
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
-    code = main(["--root", str(tmp_path), "-p", "循环", "--max-steps", "0"])
+    code = main(["--root", str(tmp_path), "-p", "循环"])
     assert code == 1
     assert "[未完成]" in capsys.readouterr().err
     assert (tmp_path / ".polya" / "sessions").exists()

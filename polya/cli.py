@@ -56,12 +56,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--plan", action="store_true", help="启动时进入规划模式（先探查提计划，批准后才动写操作）"
     )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=100,
-        help="单轮迭代预算：每走满该轮数发一次软检查点并自动续跑；0 表示无界（默认 100）",
-    )
     parser.add_argument("--model", help="模型名（默认取 OPENAI_MODEL 环境变量）")
     parser.add_argument("--base-url", help="API 地址（默认取 OPENAI_BASE_URL 环境变量）")
     parser.add_argument("--api-key", help="API key（默认取 OPENAI_API_KEY 环境变量）")
@@ -209,8 +203,7 @@ def build_agent(
         todos=todos,
         plan_mode=args.plan,
         plan_capable=True,  # exit_plan_mode 构造时注册，/plan 随时切换而不动工具数组
-        max_steps=args.max_steps,
-        max_continuations=4,  # 检查点后自动续跑上限：内部策略，不做 CLI 开关
+        max_steps=0,  # pi 式无界：CLI 不设轮数上限，靠无进展熔断与用户中断兜底
         loop_guard=True,  # 无进展熔断始终开启（阈值用 Agent 默认 3；库 API 可调）
         compress=not args.no_compress,
         context_window=context_window,

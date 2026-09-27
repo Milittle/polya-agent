@@ -8,14 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`--max-steps` is now a soft checkpoint, not a hard cap** (breaking): reaching the
-  budget yields a `BudgetCheckpoint` and auto-continues instead of raising
-  `RuntimeError`. `--max-steps` defaults to 100 (was 25); the auto-continuation limit
-  (4, an internal policy with no CLI switch) then raises `BudgetExhausted`, which ends
-  the turn with the full history preserved and a resumable message (no `[任务失败]`).
-  `--max-steps 0` means unbounded (pi semantics). The library `Agent()` default stays
-  bounded (`max_steps=10`, `max_continuations=0`), and sub-agents remain hard-bounded
-  (`max_continuations=0`).
+- **The CLI no longer has a step cap** (breaking): `--max-steps` is gone and `steps()`
+  runs until the model gives a final answer (pi semantics), with the no-progress breaker
+  as the only automatic guard. The engine keeps the soft-checkpoint budget for the
+  library API: `Agent(max_steps=…, max_continuations=…)` yields a `BudgetCheckpoint` at
+  the budget and auto-continues, then `BudgetExhausted` ends the turn with the full
+  history preserved and a resumable message (no `[任务失败]`). The library default stays
+  bounded (`max_steps=10`, `max_continuations=0`), and sub-agents remain hard-bounded.
 - `-p` now saves the session on every exit path (success, budget-exhausted, interrupt,
   error), so one-shot runs are resumable and auditable; hitting the continuation limit
   prints `[未完成]` and exits 1.
@@ -24,10 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - No-progress breaker (always on, no CLI switch): repeating the same tool call with
   identical arguments first nudges the model at the third repetition (the nudge is
-  appended to the tool result), then stops the turn resumably on the next one. It is
-  independent of `--max-steps` and stays active with `--max-steps 0`. Waiting tools are
-  exempt via the new `Tool.poll` flag (e.g. `bash_output` polling); sub-agents keep
-  their hard `max_steps` bound instead. The limit stays tunable through the library API
+  appended to the tool result), then stops the turn resumably on the next one. With the
+  CLI now uncapped this is the only automatic guard. Waiting tools are exempt via the
+  new `Tool.poll` flag (e.g. `bash_output` polling); sub-agents keep their hard
+  `max_steps` bound instead. The limit stays tunable through the library API
   (`Agent(loop_guard=…, loop_repeat_limit=…)`).
 - `/new`, `/clear` and `/reset` now wipe the screen (erase display + cursor home)
   before reprinting the startup banner, so the terminal reads like a freshly
