@@ -106,6 +106,17 @@ def format_context_window(tokens: int) -> str:
     return str(tokens)
 
 
+def format_tokens(count: int) -> str:
+    """token 数的人话格式：1234 → 1.2k、128000 → 128k、1500000 → 1.5M。"""
+    if count < 1000:
+        return str(count)
+    if count < 1_000_000:
+        value = count / 1000
+        return f"{value:.0f}k" if value >= 100 else f"{value:.1f}k"
+    value = count / 1_000_000
+    return f"{value:.0f}M" if value >= 100 else f"{value:.1f}M"
+
+
 def resolve_context_window(model: str | None, entry: ProviderEntry | None = None) -> int:
     """窗口解析（票 03）：条目发现值 → 静态前缀表 → 128k 默认。"""
     if entry is not None and model is not None:

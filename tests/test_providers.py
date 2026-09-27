@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from polya.providers import ModelProfile, profile_for
+import pytest
+
+from polya.providers import (
+    SUBSCRIPTION_PROVIDERS,
+    ModelProfile,
+    estimate_cost,
+    profile_for,
+)
 
 
 def test_profile_for_matches_by_prefix():
@@ -45,3 +52,23 @@ def test_deepseek_flash_gets_1m_window_and_conservative_compaction():
     flash = profile_for("deepseek-flash")
     assert flash.context_window == 1_000_000
     assert flash.supports_inplace_tool_edit is False
+
+
+def test_estimate_cost_uses_prefix_price_table():
+    # deepseek-flash：input 0.3 / output 1.2 / cacheRead 0.006（USD per 1M）
+    cost = estimate_cost("deepseek-flash", 1_000_000, 1_000_000, 1_000_000)
+    assert cost == pytest.approx(0.3 + 1.2 + 0.006)
+    # 更具体的 glm-5.3-flash 不能被 glm-5.3 抢匹配
+    flash = estimate_cost("glm-5.3-flash", 1_000_000, 0)
+    assert flash == pytest.approx(0.15)
+    plain = estimate_cost("glm-5.3", 1_000_000, 0)
+    assert plain == pytest.approx(1.4)
+    # 未列出的模型与空模型不估价
+    assert estimate_cost("totally-unknown", 1_000_000, 0) is None
+    assert estimate_cost(None, 10, 10) is None
+
+
+def test_subscription_providers_marked():
+    assert "zai" in SUBSCRIPTION_PROVIDERS
+    assert "qwen-token-plan-cn" in SUBSCRIPTION_PROVIDERS
+    assert "deepseek" not in SUBSCRIPTION_PROVIDERS

@@ -121,3 +121,62 @@ def reasoning_params(style: str, level: str) -> dict:
         # GLM / DeepSeek：只有开/关，档位粒度忽略（非 off 视为开）。
         return {"thinking": {"type": "disabled" if level == "off" else "enabled"}}
     return {}
+
+
+# 订阅制订阅 provider（coding plan / token plan）：按套餐计费，状态栏以 ``(sub)``
+# 代替金额，不做 token 估价。
+SUBSCRIPTION_PROVIDERS = frozenset(
+    {"zai", "zai-coding-cn", "qwen-token-plan", "qwen-token-plan-cn"}
+)
+
+# 每 1M token 的美元价 ``(input, output, cacheRead, cacheWrite)``，按模型名前缀匹配。
+# 值抄自 pi 内嵌的模型目录（``@earendil-works/pi-ai/dist/providers/data/*.json``，
+# 2026-09 核实）；未列出的模型不显示金额。更具体的模型名要排在更靠前。
+#
+# 更新策略（决策）：静态表，随 polya 版本发布刷新，不做运行时更新管道。
+# 后续若要动态化，参考 pi 的远程目录：``GET {pi.dev}/api/models/providers/<id>``，
+# ETag 条件请求 + 本地缓存 lastModified 竞争（比内置目录新才生效）+ 4h 节流，
+# 失败静默回退本表。
+PRICES: dict[str, tuple[float, float, float, float]] = {
+    # DeepSeek
+    "deepseek-flash": (0.3, 1.2, 0.006, 0.0),
+    "deepseek-v4-pro": (1.32, 3.96, 0.044, 0.0),
+    # GLM（glm-5.3-flash 必须在 glm-5.3 前）
+    "glm-5.3-flash": (0.15, 0.5, 0.03, 0.0),
+    "glm-5.3": (1.4, 4.4, 0.26, 0.0),
+    "glm-5.2": (1.4, 4.4, 0.26, 0.0),
+    "glm-4.7": (0.6, 2.2, 0.11, 0.0),
+    # Kimi / Moonshot（区分大小写：开放平台 vs Together）
+    "moonshotai/kimi-k2.6": (0.95, 4.0, 0.16, 0.0),
+    "moonshotai/Kimi-K2.6": (1.2, 4.5, 0.2, 0.0),
+    "kimi-k2.6": (0.95, 4.0, 0.16, 0.0),
+    "kimi-k2.7-code": (0.95, 4.0, 0.19, 0.0),
+    # Groq
+    "openai/gpt-oss-120b": (0.15, 0.6, 0.075, 0.0),
+    "gpt-oss-120b": (0.15, 0.6, 0.075, 0.0),
+}
+
+
+def estimate_cost(
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float | None:
+    """按 ``PRICES`` 估算累计花费；无匹配价格返回 ``None``（状态栏不显示金额）。
+
+    ``input_tokens`` 是**未命中缓存**的输入（pi 同款语义：``prompt - cacheRead``）；
+    缓存读取按 cacheRead 单价单独计，不按 input 单价重复计。
+    """
+    if not model:
+        return None
+    for prefix, (in_price, out_price, read_price, write_price) in PRICES.items():
+        if model.startswith(prefix):
+            return (
+                input_tokens * in_price
+                + output_tokens * out_price
+                + cache_read_tokens * read_price
+                + cache_write_tokens * write_price
+            ) / 1_000_000
+    return None
