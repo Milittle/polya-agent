@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
 from . import session as session_store
+from . import trust as trust_store
 from .llm import LLM
 from .models import PRESETS, ModelsConfig, Profile, host_of, mask_key
 from .providers import profile_for
@@ -440,6 +441,48 @@ _TRUST_CHOICES = (
 )
 
 
+def _trust_usage() -> str:
+    return "用法 (Usage): /trust [trust|trust-parent|untrust|clear]"
+
+
+def _trust_validate(argument: str) -> str | None:
+    if not argument or argument in dict(_TRUST_CHOICES):
+        return None
+    return _trust_usage()
+
+
+def _trust(ctx: CommandContext, arg: str) -> str:
+    root = ctx.agent.cwd
+    if not root:
+        return "无法确定工作目录，不能处理信任。"
+    target = Path(root).resolve()
+    if not arg:
+        found = trust_store.nearest(root)
+        session = getattr(ctx.agent, "trusted", trust_store.is_trusted(root))
+        lines = [f"目录: {target}"]
+        if found:
+            where = "本目录" if found[0] == str(target) else f"继承自 {found[0]}"
+            lines.append(f"已存决定: {'信任' if found[1] else '不信任'}（{where}）")
+        else:
+            lines.append("已存决定: 无")
+        lines.append(f"当前会话: {'信任' if session else '不信任'}")
+        lines.append("可选: /trust trust | trust-parent | untrust | clear；保存后重启 polya 生效。")
+        return "\n".join(lines)
+    if arg == "trust":
+        trust_store.trust(root)
+        return f"已信任 {target}；重启 polya 生效。"
+    if arg == "untrust":
+        trust_store.untrust(root)
+        return f"已标记不信任 {target}；重启后不加载项目资源。"
+    if arg == "trust-parent":
+        parent = target.parent
+        trust_store.trust(parent)
+        trust_store.forget(root)
+        return f"已信任父目录 {parent}（本目录决定已清除）；重启 polya 生效。"
+    trust_store.forget(root)
+    return f"已清除 {target} 的决定（回退父目录继承）；重启 polya 生效。"
+
+
 def _load(ctx: CommandContext, arg: str) -> str:
     if not arg:
         return "用法 (Usage): /load <会话名>"
@@ -543,6 +586,14 @@ COMMANDS = (
         choices_provider=_session_choices,
         validator=_resume_validate,
         idle=True,
+    ),
+    Command(
+        "/trust",
+        "查看/保存项目信任决定（重启生效）",
+        _trust,
+        argument_hint="[trust|trust-parent|untrust|clear]",
+        choices=_TRUST_CHOICES,
+        validator=_trust_validate,
     ),
     Command(
         "/import",
