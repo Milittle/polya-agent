@@ -57,7 +57,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--plan", action="store_true", help="启动时进入规划模式（先探查提计划，批准后才动写操作）"
     )
     parser.add_argument(
-        "--max-steps", type=int, default=25, help="单次任务的最大迭代轮数（默认 25）"
+        "--max-steps",
+        type=int,
+        default=100,
+        help="单轮迭代预算：每走满该轮数发一次软检查点并自动续跑；0 表示无界（默认 100）",
+    )
+    parser.add_argument(
+        "--max-continuations",
+        type=int,
+        default=4,
+        help="检查点后自动续跑的最多次数；0 表示到点即收尾（默认 4）",
     )
     parser.add_argument("--model", help="模型名（默认取 OPENAI_MODEL 环境变量）")
     parser.add_argument("--base-url", help="API 地址（默认取 OPENAI_BASE_URL 环境变量）")
@@ -207,6 +216,7 @@ def build_agent(
         plan_mode=args.plan,
         plan_capable=True,  # exit_plan_mode 构造时注册，/plan 随时切换而不动工具数组
         max_steps=args.max_steps,
+        max_continuations=args.max_continuations,
         compress=not args.no_compress,
         context_window=context_window,
         micro_threshold=None if args.no_microcompact else 0.6,
@@ -277,16 +287,29 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     renderer.context_window = agent.context_window  # 状态行的上下文占用展示用
     if args.prompt is not None:
+        code = 0
         try:
-            console.print(Markdown(agent.run(args.prompt)))
+            answer = agent.run(args.prompt)
+            console.print(Markdown(answer))
+            if agent.last_run_exhausted:
+                # 预算连跳上限收尾：给出到目前的说明，但不能算成功。
+                print(f"[未完成] {answer}", file=sys.stderr)
+                code = 1
+            else:
+                console.print(f"[用量] {agent.total_usage}", style="dim", markup=False)
         except KeyboardInterrupt:
             print("\n[已中断]", file=sys.stderr)
-            return 130
+            code = 130
         except RuntimeError as exc:
             print(f"[任务失败] {exc}", file=sys.stderr)
-            return 1
-        console.print(f"[用量] {agent.total_usage}", style="dim", markup=False)
-        return 0
+            code = 1
+        finally:
+            # 单次运行也落盘（成功 / 未完成 / 中断 / 异常），供 /resume 与审计。
+            try:
+                agent.autosave()
+            except Exception as exc:  # noqa: BLE001 - 落盘失败不改退出码
+                print(f"[自动保存失败] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return code
     run_repl(agent, args.root, renderer)
     return 0
 

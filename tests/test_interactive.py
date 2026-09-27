@@ -4,6 +4,7 @@ import asyncio
 import threading
 from contextlib import contextmanager
 from io import StringIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -569,3 +570,60 @@ def test_ctrl_s_callback_sets_default_model(tmp_path, monkeypatch):
         message = session.box.on_set_default("p/m-b")
         assert "已设为默认启动模型" in message
         assert ModelsConfig.load().active == "p/m-b"
+
+
+# ---------- 票 02：预算检查点续跑 ----------
+
+
+@tool
+def _noop() -> str:
+    """No-op tool for budget tests."""
+    return "ok"
+
+
+def test_run_task_budget_checkpoint_continues_to_final():
+    llm = FakeLLM(
+        [
+            reply(calls=[call("_noop", "c1")]),
+            reply(calls=[call("_noop", "c2")]),
+            reply(content="完成"),
+        ]
+    )
+    agent = Agent(llm=llm, tools=[_noop], status_bar=False, max_steps=2, max_continuations=1)
+    output = StringIO()
+    renderer = TerminalRenderer(Console(file=output))
+    assert run_task(agent, renderer, "做两次") == "final"
+    text = output.getvalue()
+    assert "检查点" in text  # dim 提示，不是失败
+    assert "完成" in text
+
+
+def test_run_task_budget_exhausted_outcome():
+    llm = FakeLLM([reply(calls=[call("_noop", f"c{i}")]) for i in range(2)])
+    agent = Agent(llm=llm, tools=[_noop], status_bar=False, max_steps=2, max_continuations=0)
+    output = StringIO()
+    renderer = TerminalRenderer(Console(file=output))
+    assert run_task(agent, renderer, "一直做") == "budget"
+    assert "续跑上限" in output.getvalue()
+
+
+def test_budget_exhausted_is_not_a_failure(tmp_path, monkeypatch):
+    """预算收尾走正常路径：给可继续提示，不出现 [任务失败]。"""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    llm = FakeLLM([reply(calls=[call("_noop", f"c{i}")]) for i in range(2)])
+    with session_for(
+        tmp_path, llm, tools=[_noop], max_steps=2, max_continuations=0
+    ) as (session, pipe, output):
+
+        async def scenario():
+            task = asyncio.create_task(session.run())
+            await until(lambda: session.box._session.app.is_running)
+            pipe.send_text("一直做\r")
+            await until(lambda: "达检查点收尾" in output.getvalue())
+            pipe.send_text("\x04")
+            await asyncio.wait_for(task, 3)
+
+        asyncio.run(scenario())
+        text = output.getvalue()
+        assert "已达单轮预算" in text  # 可继续提示
+        assert "[任务失败]" not in text

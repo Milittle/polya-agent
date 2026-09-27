@@ -319,6 +319,23 @@ class TerminalRenderer:
         elif event == "plan_submitted":
             self.phase = PHASE_THINKING
             self._print_plan(payload.get("plan") or "")
+        elif event == "budget_checkpoint":
+            # 软检查点：dim 提示后生成器原地续跑，不是错误、不结束本轮。
+            step = payload.get("step", 0)
+            continuation = payload.get("continuation", 0)
+            self._console.print(
+                Text(f"↻ 第 {step} 轮检查点，自动继续（第 {continuation} 次）", style="dim")
+            )
+        elif event == "budget_exhausted":
+            step = payload.get("step", 0)
+            continuations = payload.get("continuations", 0)
+            self._console.print(
+                Text(
+                    f"⏸ 已达续跑上限（{step} 轮 / 连跳 {continuations} 次），"
+                    "本轮收尾；发送消息可继续",
+                    style="dim",
+                )
+            )
         elif event == "tool_result":
             self._print_tool_result(payload)
             self.current_tool = None

@@ -27,7 +27,15 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
-from .agent import Agent, Iteration, PlanSubmitted, ToolCall, event_payload
+from .agent import (
+    Agent,
+    BudgetCheckpoint,
+    BudgetExhausted,
+    Iteration,
+    PlanSubmitted,
+    ToolCall,
+    event_payload,
+)
 from .commands import (
     HELP_TEXT,  # noqa: F401 - compatibility import
     CommandContext,
@@ -113,16 +121,18 @@ def run_task(
     stop: threading.Event | None = None,
     on_boundary=None,
     on_plan: Callable[[str], None] | None = None,
-) -> bool:
+) -> str:
     """消费一次 ``steps()``：事件转发渲染器，ToolCall/PlanSubmitted 就地处理。
 
-    返回 True 表示本轮因提交计划而结束（驱动层据此记 plan_pending）。中断时
+    返回本轮收尾原因：``"plan"``（提交计划，驱动层据此记 plan_pending）、
+    ``"budget"``（预算连跳上限收尾）或 ``"final"``（给出最终答案）。中断时
     ``gen.close()`` 触发 agent 的 GeneratorExit 回填，历史保持合法。
     """
     if reviewer is None:
         reviewer = agent.reviewer
     gen = agent.steps(text)
     to_send = None
+    outcome = "final"
     try:
         with renderer:
             while True:
@@ -131,11 +141,19 @@ def run_task(
                 try:
                     ev = gen.send(to_send)
                 except StopIteration:
-                    return False
+                    return outcome
                 to_send = None
                 if stop is not None and stop.is_set():
                     raise InterruptedError("用户请求中断")
-                if isinstance(ev, Iteration) and on_boundary is not None:
+                if isinstance(ev, BudgetCheckpoint):
+                    # 软检查点：dim 提示后原地续跑，回合不结束（票 02）。
+                    renderer.update(ev.event, event_payload(ev))
+                    to_send = None
+                elif isinstance(ev, BudgetExhausted):
+                    renderer.update(ev.event, event_payload(ev))
+                    outcome = "budget"
+                    to_send = None
+                elif isinstance(ev, Iteration) and on_boundary is not None:
                     renderer.update(ev.event, event_payload(ev))
                     to_send = on_boundary()
                 elif isinstance(ev, ToolCall):
@@ -149,7 +167,7 @@ def run_task(
                         gen.send("计划已展示；本轮结束，等待用户指示。")
                     except StopIteration:
                         pass
-                    return True
+                    return "plan"
                 else:
                     renderer.update(ev.event, event_payload(ev))
     finally:
@@ -480,7 +498,7 @@ class InteractiveSession:
                     self.state["topic"] = self.topic
                     self.renderer._console.set_window_title(f"polya · {self.topic}")
                 self.say("❯ " + text, "cyan")
-                if run_task(
+                task_outcome = run_task(
                     self.agent,
                     self.renderer,
                     text,
@@ -488,8 +506,15 @@ class InteractiveSession:
                     stop=self.stop,
                     on_boundary=self._boundary,
                     on_plan=self._on_plan,
-                ):
+                )
+                if task_outcome == "plan":
                     outcome = "等待计划确认"
+                elif task_outcome == "budget":
+                    # 软检查点收尾：不是失败，历史完整，下一条消息即可继续。
+                    outcome = "达检查点收尾"
+                    self.say(
+                        "已达单轮预算，历史已保留；继续请直接发送下一条消息。", "yellow"
+                    )
         except InterruptedError:
             outcome = "本轮已中断"
             self.say("已中断本次任务；已完成步骤保留，排队消息回到输入框。", "yellow")

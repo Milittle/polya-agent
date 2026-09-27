@@ -68,7 +68,8 @@ uv run polya -p "修复 pytest 失败的测试" --plan   # 单任务模式：执
 
 常用参数：`--root DIR` 工作目录（默认 `.`，文件操作被限制在内）、`--plan` 启动进入
 规划模式、`--trust` / `--no-trust` 保存并应用项目信任决定（`--trust` 加载其 `AGENTS.md` / 项目 skills，非交互场景必需）、
-`--max-steps N`（默认 25）、`--model/--base-url/
+`--max-steps N`（默认 100；软检查点，到点自动续跑，0 表示无界）、
+`--max-continuations N`（检查点后自动续跑次数，默认 4）、`--model/--base-url/
 --api-key` 覆盖环境变量、`--no-compress` 关闭上下文压缩（默认开启）、`--no-microcompact`
 关闭微压缩、`--context-window N`
 （默认 128000）、`--keep-recent N`
@@ -111,7 +112,8 @@ Tab / Enter 选中，再按 Enter 执行，Esc 关闭菜单。也可直接输入
 需要无运行中的任务，否则提示先按 Esc 中断。管道 REPL 不显示选项菜单，需要显式提供参数。
 
 **会话**：每个会话有稳定名字与元数据（标题 / 创建 / 更新 / cwd），任务收尾自动落盘到
-`~/.polya/sessions/<名字>.jsonl`，所以 `/resume` 列出的是真正用过的会话。无参 `/resume`
+`~/.polya/sessions/<名字>.jsonl`（含 `-p` 单次运行：成功 / 未完成 / 中断 / 异常都会保存），
+所以 `/resume` 列出的是真正用过的会话。无参 `/resume`
 在原输入框展开选择器（名字 · 主题 · 更新时间），`/resume <名字>` 直切。切会话会清零统计、
 TODO 与读改追踪，互不串味。`/fork <id>` 从祖先路径派生新会话，`/clone` 复制当前会话。
 `/export [路径]` 按当前分支导出 Markdown；`/save` 仍落原始 JSONL 供 `/load`。
@@ -237,7 +239,9 @@ agent = Agent(
   （read/write/exec/delegate）标记副作用分类。
 - 同一个 `Agent` 实例会保留对话历史，可直接连续调用 `run()` 进行多轮对话；需要重新开始时调用
   `agent.reset()`。
-- `max_steps` 限制单次 `run()` 内最多循环多少轮，防止模型陷入反复调用工具的循环。
+- `max_steps` 是**软检查点周期**而非硬上限：每走满该轮数发一次 `BudgetCheckpoint` 并
+  自动续跑，连跳 `max_continuations` 次后发 `BudgetExhausted` 收尾（历史完整保留，发下一条
+  消息即可继续）；`max_steps=0` 表示无界（pi 语义）。不再抛「超过最大步数」。
 - `status_bar=True` 开启 Agent 状态栏：每轮迭代以 user 消息在上下文**末尾**追加
   `<agent_status>` 元信息（迭代号、各工具累计调用次数、token 用量、时间），工具结果
   也会标注「第 N 次调用」。模型检索强但归纳弱，让它自己从轨迹里数调用次数既慢又容易
@@ -260,6 +264,8 @@ agent = Agent(
   | `usage` | `{last, total}` | 仅当本次响应带 usage |
   | `compaction` | `{before, after}` | 上下文压缩发生时 |
   | `plan_submitted` | `{plan}` | 规划模式提交计划，驱动层打印后结束本轮 |
+  | `budget_checkpoint` | `{step, limit, continuation}` | 走满一轮预算，自动续跑（软检查点） |
+  | `budget_exhausted` | `{step, limit, continuations}` | 连跳上限后收尾，历史保留可继续 |
 
   注意它与 `status_bar` 不同：后者是给**模型**看的上下文内容，事件流是给**驱动层**看的
   控制与进度信号。

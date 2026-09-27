@@ -15,7 +15,7 @@ import logging
 import threading
 from collections.abc import Callable
 
-from .agent import Agent, Compaction, Iteration, PlanSubmitted, ToolCall
+from .agent import Agent, BudgetExhausted, Compaction, Iteration, PlanSubmitted, ToolCall
 from .builtin import default_tools
 from .i18n import t, tool_text
 from .todos import TodoStore
@@ -95,6 +95,7 @@ class SubagentRunner:
             project_memory=self.memory,  # 子系统提示词含 AGENTS.md 项目记忆
             cwd=self.root,
             max_steps=self.max_steps,
+            max_continuations=0,  # 子代理是有界子任务：首个检查点即报错收尾
             status_bar=None,
             plan_mode=parent.plan_mode,  # 子 Context 继承父规划模式
             plan_capable=False,  # 子无 exit_plan_mode
@@ -139,6 +140,10 @@ class SubagentRunner:
                 elif isinstance(ev, PlanSubmitted):
                     # 子无 plan_capable，正常不会走到；防御性回绝
                     to_send = "Error: 子任务不含计划审批；把需要的变更写进最终报告。"
+                elif isinstance(ev, BudgetExhausted):
+                    # 子代理有界（max_continuations=0）：不续跑，直接以错误报告收尾。
+                    report = f"Error: 子代理未能完成（已达步数上限 {ev.limit}）"
+                    break
                 elif isinstance(ev, Iteration):
                     rounds = ev.step
                     to_send = None
@@ -148,7 +153,7 @@ class SubagentRunner:
                     to_send = None
                 else:
                     to_send = None  # 吞掉流式片段与其余事件
-        except RuntimeError as exc:  # 子超步数等
+        except RuntimeError as exc:  # 上下文超限 / 前缀破坏等运行时错误
             report = f"Error: 子代理未能完成（{exc}）"
         finally:
             gen.close()  # GeneratorExit 回填保证子历史合法

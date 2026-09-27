@@ -424,3 +424,21 @@ def test_pending_shell_result_does_not_claim_completion():
     feed_tool_call(renderer)
     feed_tool_result(renderer, "日志中包含仍在运行这几个字\n退出码 0")
     assert "Ran Bash" in buf.getvalue()
+
+
+# ---------- 票 02：预算检查点 ----------
+
+
+def test_budget_checkpoint_renders_dim_notice():
+    renderer, buf = make_renderer()
+    renderer.update("iteration", {"step": 100, "max_steps": 100})
+    renderer.update("budget_checkpoint", {"step": 100, "limit": 100, "continuation": 1})
+    out = buf.getvalue()
+    assert "检查点" in out and "100" in out
+
+
+def test_budget_exhausted_renders_notice():
+    renderer, buf = make_renderer()
+    renderer.update("budget_exhausted", {"step": 500, "limit": 100, "continuations": 4})
+    out = buf.getvalue()
+    assert "续跑上限" in out and "500" in out

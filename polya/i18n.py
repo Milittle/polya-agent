@@ -133,6 +133,10 @@ _ZH = {
         "你的上一条回复因输出长度限制被截断。请从中断处继续，"
         "不要重复已输出的内容；若其实已完整，请直接说“已完成”。"
     ),
+    "agent.budget_exhausted": (
+        "已达单轮预算的续跑上限，本轮收尾（历史已完整保留）；"
+        "发送下一条消息即可继续。"
+    ),
     "agent.rejected": "Error: 用户拒绝了工具调用 {name}",
     "agent.interrupted": "Error: 用户中断了本次任务。",
     "agent.compact_disabled": "压缩未启用：启动时带了 --no-compress，无法归档原文。",
@@ -274,6 +278,10 @@ result directly, with no preamble or explanation.""",
         "Your previous reply was truncated by the output length limit. Continue from where "
         "it stopped and do not repeat what you already printed; if it was in fact complete, "
         'just say "done".'
+    ),
+    "agent.budget_exhausted": (
+        "Reached the continuation limit for this turn's budget; the turn ended with full "
+        "history preserved. Send another message to continue."
     ),
     "agent.rejected": "Error: the user rejected the tool call {name}",
     "agent.interrupted": "Error: the user interrupted this task.",

@@ -70,6 +70,30 @@ class Iteration(Event):
 
 
 @dataclass(frozen=True)
+class BudgetCheckpoint(Event):
+    """软检查点：走满 max_steps 轮但模型仍要继续时发出，随后自动续跑。
+
+    ``step`` 是已完成的轮数（max_steps 的整数倍），``continuation`` 是第几次续跑
+    （1 起）。检查点不是错误——驱动层只做 dim 提示，回合不结束。
+    """
+
+    event: ClassVar[str] = "budget_checkpoint"
+    step: int
+    limit: int
+    continuation: int
+
+
+@dataclass(frozen=True)
+class BudgetExhausted(Event):
+    """连跳 max_continuations 次后仍要继续：本轮收尾，历史保留，可再发消息继续。"""
+
+    event: ClassVar[str] = "budget_exhausted"
+    step: int
+    limit: int
+    continuations: int
+
+
+@dataclass(frozen=True)
 class ReasoningDelta(Event):
     event: ClassVar[str] = "reasoning_delta"
     delta: str
@@ -150,6 +174,7 @@ class Agent:
         tools: list[Tool] | ToolRegistry | None = None,
         system_prompt: str | None = None,
         max_steps: int = 10,
+        max_continuations: int = 0,
         status_bar: bool | Callable[[StatusSnapshot], str] | None = None,
         todos: TodoStore | None = None,
         plan_mode: bool = False,
@@ -181,6 +206,11 @@ class Agent:
         if compress:
             self.tools.add(self._history_read_tool())
         self.max_steps = max_steps
+        # 软检查点：max_steps>0 时每走满 max_steps 轮发一次 BudgetCheckpoint 并自动
+        # 续跑，最多连跳 max_continuations 次后以 BudgetExhausted 收尾。max_steps==0
+        # 表示无界（pi 语义）。库默认 0 连跳 = 有界硬停（不抛异常，返回提示串）。
+        self.max_continuations = max_continuations
+        self.last_run_exhausted = False  # 本次 run 是否因预算收尾（驱动层判定未完成）
         # 审查器缝（review.py）：默认放行，plan 只读约束在 AllowAllReviewer 内。
         # 未来模型审查器（Jev 类）实现同一协议即可接入。
         self.reviewer: Reviewer = reviewer or AllowAllReviewer()
@@ -636,11 +666,15 @@ class Agent:
         # 复用的前提），因此在这里冻结注册表，防止运行中途增删工具。
         self.tools.freeze()
         self._truncation_continues = 0
+        self.last_run_exhausted = False
         self.tree.append(KIND_USER, {"content": user_input})
         messages = self.tree.project()
         schemas = self.tools.schemas() or None
 
-        for step in range(1, self.max_steps + 1):
+        step = 0
+        continuations = 0
+        while True:
+            step += 1
             yield Iteration(step=step, max_steps=self.max_steps)
             # 驱动可在迭代边界追加排队输入。此时上一批 tool_call 已全部回填，
             # 从树重建请求，确保新消息进入本轮且保留前缀不变量。
@@ -884,7 +918,21 @@ class Agent:
                 self._backfill_tool_results(messages, message.tool_calls or [])
                 raise
 
-        raise RuntimeError(f"超过最大步数 {self.max_steps}，仍未得到最终答案")
+            # 软检查点（while 内、中断回填的 try 之外）：一轮工具回填完毕后判定。
+            # 无界模式（max_steps==0）跳过；到点先发检查点并原地续跑，连跳上限后
+            # 发 BudgetExhausted 收尾——不再是 raise，历史完整保留。
+            if self.max_steps > 0 and step % self.max_steps == 0:
+                if continuations < self.max_continuations:
+                    continuations += 1
+                    yield BudgetCheckpoint(
+                        step=step, limit=self.max_steps, continuation=continuations
+                    )
+                else:
+                    yield BudgetExhausted(
+                        step=step, limit=self.max_steps, continuations=continuations
+                    )
+                    self.last_run_exhausted = True
+                    return t("agent.budget_exhausted")
 
     # ---------- 内置驱动 ----------
 

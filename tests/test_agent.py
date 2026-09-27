@@ -9,7 +9,15 @@ from types import SimpleNamespace
 import pytest
 
 from polya import Agent, ToolRegistry, tool
-from polya.agent import DEFAULT_SYSTEM_PROMPT, PlanSubmitted, ToolCall, drive, event_payload
+from polya.agent import (
+    DEFAULT_SYSTEM_PROMPT,
+    BudgetCheckpoint,
+    BudgetExhausted,
+    PlanSubmitted,
+    ToolCall,
+    drive,
+    event_payload,
+)
 
 
 def make_message(content=None, tool_calls=None):
@@ -262,12 +270,49 @@ def test_history_is_preserved_across_turns():
     assert agent.history == []
 
 
-def test_raises_when_max_steps_exceeded():
+def test_budget_exhausted_returns_message_not_raises():
+    """票 01：预算耗尽不再抛异常，而是发 BudgetExhausted 并返回提示串。"""
     looping = [make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')])] * 3
     agent = Agent(llm=ScriptedLLM(looping), tools=[add], max_steps=3)
 
-    with pytest.raises(RuntimeError):
-        agent.run("死循环")
+    answer, events = collect(agent, "死循环")
+    assert agent.last_run_exhausted is True
+    assert answer  # i18n 提示串
+    exhausted = [e for e in events if isinstance(e, BudgetExhausted)]
+    assert len(exhausted) == 1
+    assert (exhausted[0].step, exhausted[0].limit, exhausted[0].continuations) == (3, 3, 0)
+    assert not [e for e in events if isinstance(e, BudgetCheckpoint)]
+
+
+def test_budget_checkpoint_auto_continues():
+    """票 01：走满 max_steps 后发检查点并自动续跑，任务正常收尾。"""
+    replies = [
+        make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')]),
+        make_message(tool_calls=[make_tool_call("c2", "add", '{"a": 2, "b": 2}')]),
+        make_message(content="完成"),
+    ]
+    agent = Agent(llm=ScriptedLLM(replies), tools=[add], max_steps=2, max_continuations=1)
+
+    answer, events = collect(agent, "做两次")
+    assert answer == "完成"
+    checkpoints = [e for e in events if isinstance(e, BudgetCheckpoint)]
+    assert len(checkpoints) == 1
+    assert (checkpoints[0].step, checkpoints[0].limit, checkpoints[0].continuation) == (2, 2, 1)
+    assert agent.last_run_exhausted is False
+
+
+def test_max_steps_zero_is_unbounded():
+    """票 01：max_steps=0 表示无界，不发检查点。"""
+    replies = [
+        make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')])
+        for _ in range(3)
+    ] + [make_message(content="完成")]
+    agent = Agent(llm=ScriptedLLM(replies), tools=[add], max_steps=0)
+
+    answer, events = collect(agent, "无界")
+    assert answer == "完成"
+    assert not [e for e in events if isinstance(e, (BudgetCheckpoint, BudgetExhausted))]
+    assert agent.last_run_exhausted is False
 
 
 class _DenyReviewer:

@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--max-steps` is now a soft checkpoint, not a hard cap** (breaking): reaching the
+  budget yields a `BudgetCheckpoint` and auto-continues instead of raising
+  `RuntimeError`. `--max-steps` defaults to 100 (was 25) and a new
+  `--max-continuations` (default 4) bounds the auto-continuations; after that a
+  `BudgetExhausted` event ends the turn with the full history preserved and a
+  resumable message (no `[任务失败]`). `--max-steps 0` means unbounded (pi semantics).
+  The library `Agent()` default stays bounded (`max_steps=10`, `max_continuations=0`),
+  and sub-agents remain hard-bounded (`max_continuations=0`).
+- `-p` now saves the session on every exit path (success, budget-exhausted, interrupt,
+  error), so one-shot runs are resumable and auditable; hitting the continuation limit
+  prints `[未完成]` and exits 1.
+
 ### Added
 
 - `/new`, `/clear` and `/reset` now wipe the screen (erase display + cursor home)

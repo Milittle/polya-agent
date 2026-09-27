@@ -5,6 +5,7 @@ REPL 和 -p 模式通过 monkeypatch 注入假 LLM（绕过 API key 构造）与
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from polya import Agent, tool
@@ -105,13 +106,15 @@ def test_build_agent_registers_exit_plan_mode(tmp_path):
     agent = build_agent(parse_args(["--root", str(tmp_path)]), llm=ScriptedLLM([]))
     assert "exit_plan_mode" in [t.name for t in agent.tools]
     assert agent.plan_mode is False
-    assert agent.max_steps == 25
+    assert agent.max_steps == 100
+    assert agent.max_continuations == 4
 
     planned = build_agent(parse_args(["--root", str(tmp_path), "--plan"]), llm=ScriptedLLM([]))
     assert planned.plan_mode is True
 
 
 def test_prompt_mode_prints_answer(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     fake = ScriptedLLM([make_message("答案是 42")])
     monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
     code = main(["--root", str(tmp_path), "-p", "终极问题的答案"])
@@ -119,7 +122,39 @@ def test_prompt_mode_prints_answer(monkeypatch, tmp_path, capsys):
     assert "答案是 42" in capsys.readouterr().out
 
 
+def test_prompt_mode_saves_session(monkeypatch, tmp_path, capsys):
+    """票 03：-p 结束也落盘，供 /resume 与审计。"""
+    from polya import session as session_store
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    fake = ScriptedLLM([make_message("完成")])
+    monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
+    assert main(["--root", str(tmp_path), "-p", "随便"]) == 0
+    assert [m.name for m in session_store.list_metas()]
+
+
+def test_prompt_mode_budget_exhausted_returns_unfinished(monkeypatch, tmp_path, capsys):
+    """票 03：达续跑上限 -> [未完成] + 退出码 1，且仍落盘。"""
+    call = SimpleNamespace(
+        id="c1", function=SimpleNamespace(name="add", arguments='{"a": 1, "b": 2}')
+    )
+    fake = ScriptedLLM([make_message(tool_calls=[call])])
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
+    code = main(
+        [
+            "--root", str(tmp_path), "-p", "循环",
+            "--max-steps", "1", "--max-continuations", "0",
+        ]
+    )
+    assert code == 1
+    captured = capsys.readouterr()
+    assert "[未完成]" in captured.err
+    assert (tmp_path / ".polya" / "sessions").exists()
+
+
 def test_repl_loop_runs_and_exits(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     fake = ScriptedLLM([make_message("1024")])
     monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: fake)
     inputs = iter(["2 的 10 次方", "/status", "/exit"])

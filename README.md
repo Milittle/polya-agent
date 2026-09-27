@@ -69,7 +69,8 @@ uv run polya -p "fix the failing tests" --plan   # one-shot mode
 
 Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 (start in plan mode), `--trust` / `--no-trust` (save and apply a project-trust decision;
-`--trust` is needed for non-interactive runs in a fresh directory), `--max-steps N` (default 25),
+`--trust` is needed for non-interactive runs in a fresh directory), `--max-steps N` (default 100;
+soft checkpoint that auto-continues, `0` = unbounded), `--max-continuations N` (default 4),
 `--model/--base-url/--api-key`, `--no-stream`, `--no-compress`, `--no-microcompact`,
 `--context-window N` (default 128000), `--keep-recent N`, `--keep-recent-tokens N`,
 `--reserve-tokens N` (absolute compaction reserve, default 16384), `--prefix-check`.
@@ -105,8 +106,8 @@ and ask you to press Esc first when a task is running. In a piped REPL, supply o
 explicitly.
 
 **Sessions** get a stable name and metadata (title, created/updated, cwd) and are
-auto-saved to `~/.polya/sessions/<name>.jsonl` after every task, so `/resume` lists
-conversations you actually had. `/resume` with no argument opens a picker in the input
+auto-saved to `~/.polya/sessions/<name>.jsonl` after every task (including one-shot
+`-p` runs) so `/resume` lists conversations you actually had. `/resume` with no argument opens a picker in the input
 box (name · title · updated); `/resume <name>` switches directly. `/fork <id>` derives a
 new session from the ancestor path up to entry `#id` (`/tree` shows ids); `/clone`
 duplicates the current session. Switching resets stats, todos and file tracking so

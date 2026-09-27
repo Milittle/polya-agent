@@ -55,9 +55,15 @@ def render_status(snapshot: StatusSnapshot) -> str:
             for index, item in enumerate(snapshot.todos, 1)
         )
         todo_lines = f"- TODO 清单:\n{items}\n"
+    # max_steps==0 表示无界：不显示分母，避免「第 N/0 轮」。
+    iteration_line = (
+        f"第 {snapshot.iteration} 轮迭代（无上限）"
+        if snapshot.max_steps == 0
+        else f"第 {snapshot.iteration}/{snapshot.max_steps} 轮迭代"
+    )
     return (
         "<agent_status>\n"
-        f"当前状态（第 {snapshot.iteration}/{snapshot.max_steps} 轮迭代；"
+        f"当前状态（{iteration_line}；"
         "历史中若有多条状态，以最后一条为准）：\n"
         f"{mode_line}"
         f"- 工具调用累计:\n{calls}\n"
