@@ -14,13 +14,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-_STATUS_LABELS = {
-    "pending": "待办",
-    "in_progress": "进行中",
-    "completed": "已完成",
-    "cancelled": "已取消",
-}
-
 
 @dataclass
 class StatusSnapshot:
@@ -35,40 +28,42 @@ class StatusSnapshot:
 
 
 def render_status(snapshot: StatusSnapshot) -> str:
-    """默认渲染器：生成 <agent_status> 包裹的状态栏文本。
+    """默认渲染器：生成 <agent_status> 包裹的状态栏文本（固定英文，模型侧）。
 
     注意「本条为最新状态」的提示：持久追加模式下历史里会有多条状态栏，
-    需要明确告诉模型以最后一条为准。
+    需要明确告诉模型以最后一条为准。TODO 状态用原词（pending /
+    in_progress / completed / cancelled），不做中文映射。
     """
     if snapshot.tool_calls:
-        calls = "\n".join(f"  - {name}: {count} 次" for name, count in snapshot.tool_calls.items())
+        calls = "\n".join(f"  - {name}: {count}" for name, count in snapshot.tool_calls.items())
     else:
-        calls = "  - （尚未调用工具）"
+        calls = "  - (no tool calls yet)"
     usage = snapshot.usage
     mode_line = (
-        "- 模式: 规划中（只读；完成计划后调用 exit_plan_mode 提交）\n" if snapshot.plan_mode else ""
+        "- mode: planning (read-only; submit via exit_plan_mode when the plan is complete)\n"
+        if snapshot.plan_mode else ""
     )
     todo_lines = ""
     if snapshot.todos:
         items = "\n".join(
-            f"  [{index}] [{_STATUS_LABELS.get(item['status'], item['status'])}] {item['content']}"
+            f"  [{index}] [{item['status']}] {item['content']}"
             for index, item in enumerate(snapshot.todos, 1)
         )
-        todo_lines = f"- TODO 清单:\n{items}\n"
-    # max_steps==0 表示无界：不显示分母，避免「第 N/0 轮」。
+        todo_lines = f"- TODO list:\n{items}\n"
+    # max_steps==0 表示无界：不显示分母，避免「turn N/0」。
     iteration_line = (
-        f"第 {snapshot.iteration} 轮迭代（无上限）"
+        f"turn {snapshot.iteration}, unbounded"
         if snapshot.max_steps == 0
-        else f"第 {snapshot.iteration}/{snapshot.max_steps} 轮迭代"
+        else f"turn {snapshot.iteration}/{snapshot.max_steps}"
     )
     return (
         "<agent_status>\n"
-        f"当前状态（{iteration_line}；"
-        "历史中若有多条状态，以最后一条为准）：\n"
+        f"Current state ({iteration_line}; "
+        "if multiple snapshots exist, the last one wins):\n"
         f"{mode_line}"
-        f"- 工具调用累计:\n{calls}\n"
+        f"- tool calls:\n{calls}\n"
         f"{todo_lines}"
-        f"- token 用量: prompt {usage.get('prompt_tokens', 0)},"
+        f"- token usage: prompt {usage.get('prompt_tokens', 0)},"
         f" completion {usage.get('completion_tokens', 0)},"
         f" cached {usage.get('cached_tokens', 0)}\n"
         "</agent_status>"

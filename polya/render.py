@@ -16,6 +16,8 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
 
+from .i18n import t
+
 console = Console()  # stdout：只承载答案与命令输出（-p 可安全重定向/管道）
 ui = Console(stderr=True)  # stderr：状态条 / 日志等“界面”输出
 
@@ -122,7 +124,7 @@ def _thinking_summary(reasoning: str) -> Text:
     不展示秒数——交错 thinking（DeepSeek interleave）下计时含糊。尾窗正文由
     ``_reasoning_tail`` 逐行落在标题下方，标题只报字数。
     """
-    return Text(f"✻ 思考 {len(reasoning)} 字", style="dim italic")
+    return Text(t("ui.render.thinking_done", n=len(reasoning)), style="dim italic")
 
 
 def _reasoning_tail(reasoning: str, limit: int) -> list[str]:
@@ -246,7 +248,7 @@ class TerminalRenderer:
         if text:
             header = "⏺"
         elif reasoning and not tool:
-            header = f"✻ 思考中 · {len(reasoning)} 字"
+            header = t("ui.render.thinking_stream", n=len(reasoning))
         else:
             header = f"{self._status_label()} {_header_arg(tool or '', arguments or {})}"
         if folded:
@@ -324,15 +326,14 @@ class TerminalRenderer:
             step = payload.get("step", 0)
             continuation = payload.get("continuation", 0)
             self._console.print(
-                Text(f"↻ 第 {step} 轮检查点，自动继续（第 {continuation} 次）", style="dim")
+                Text(t("ui.render.checkpoint", step=step, continuation=continuation), style="dim")
             )
         elif event == "budget_exhausted":
             step = payload.get("step", 0)
             continuations = payload.get("continuations", 0)
             self._console.print(
                 Text(
-                    f"⏸ 已达续跑上限（{step} 轮 / 连跳 {continuations} 次），"
-                    "本轮收尾；发送消息可继续",
+                    t("ui.render.budget_exhausted", step=step, continuations=continuations),
                     style="dim",
                 )
             )
@@ -341,9 +342,9 @@ class TerminalRenderer:
             tool = payload.get("tool", "?")
             count = payload.get("count", 0)
             if payload.get("phase") == "stopped":
-                line = f"⏹ 检测到重复调用 {tool} ×{count}，已停止；发送消息可继续"
+                line = t("ui.render.no_progress_stopped", tool=tool, count=count)
             else:
-                line = f"↺ 检测到重复调用 {tool} ×{count}，已提醒模型"
+                line = t("ui.render.no_progress_nudged", tool=tool, count=count)
             self._console.print(Text(line, style="dim"))
         elif event == "tool_result":
             self._print_tool_result(payload)
@@ -433,10 +434,10 @@ class TerminalRenderer:
             return
         if self._blocks and self._blocks[-1]["kind"] == "tool":
             self._console.print()
-        self._console.print(Text("⏺ 计划已提交", style="cyan"))
+        self._console.print(Text(t("ui.render.plan_submitted"), style="cyan"))
         self._console.print(Markdown(plan))
         self._console.print(
-            Text("  /plan go 开始执行 · 或直接输入修改意见（仍在计划模式）", style="dim")
+            Text(t("ui.render.plan_hint"), style="dim")
         )
 
     def _print_tool_header(self, name: str, arguments: dict) -> None:
@@ -457,9 +458,9 @@ class TerminalRenderer:
         after = payload.get("after", 0)
         if payload.get("mode") == "micro":
             cleared = payload.get("cleared", 0)
-            message = f"⌁ 上下文微压缩：清理旧工具结果约 {cleared} 字符（可 history_read 回查）"
+            message = t("ui.render.compact_micro", cleared=cleared)
         else:
-            message = f"⌁ 上下文已压缩：{before} → {after} 条消息"
+            message = t("ui.render.compacted", before=before, after=after)
         self._console.print(Text(message, style="dim"))
 
     def _print_tool_result(self, payload: dict) -> None:
@@ -474,7 +475,7 @@ class TerminalRenderer:
         status = "Denied" if payload.get("denied") else "Failed" if error else "Ran"
         if (
             name in ("bash", "bash_output")
-            and result.rsplit("\n", 1)[-1].startswith("仍在运行")
+            and result.rsplit("\n", 1)[-1].startswith("still running")
             and not error
         ):
             status = "Running"
@@ -510,7 +511,7 @@ class TerminalRenderer:
     def expand_blocks(self, count: int = 5) -> str:
         """展开最近 count 块的全文（/expand 命令的输出，纯文本走命令通道）。"""
         if not self._blocks:
-            return "（暂无可展开的块——先跑一个任务，或非终端会话不记录）"
+            return t("ui.render.no_blocks")
         return "\n\n".join(self._block_details(block) for block in self._blocks[-count:])
 
     def show_details(self, block_id: int) -> str:
@@ -524,7 +525,7 @@ class TerminalRenderer:
     def _block_details(block: dict) -> str:
         if block["kind"] == "thinking":
             content = block["content"]
-            return f"✻ 思考全文（{len(content)} 字）：\n{content}"
+            return t("ui.render.thinking_full", n=len(content)) + "\n" + content
         name = display_tool_name(block["name"])
         arguments = json.dumps(block["arguments"], ensure_ascii=False, indent=2)
         return f"{block['status']} {name} · {block['duration_s']}s\n{arguments}\n{block['result']}"

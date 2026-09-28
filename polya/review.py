@@ -19,8 +19,8 @@ from .tools import Tool
 
 # plan 模式拒绝文案：只读约束的唯一实现点（审批栈删除后迁到这里）
 PLAN_DENY_TEMPLATE = (
-    "Error: 规划模式下只能使用只读工具（{name} 被拒绝）。"
-    "完成计划后调用 exit_plan_mode 提交，批准后进入执行模式。"
+    "Error: only read-only tools are allowed in plan mode ({name} denied). "
+    "Finish the plan and call exit_plan_mode; approved plans switch to execution."
 )
 
 # 计划批准白名单（05 号票）：整条消息去首尾空白与尾标点、英文小写后精确匹配，

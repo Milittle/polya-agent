@@ -345,10 +345,10 @@ def test_loop_guard_nudges_then_stops():
     assert [e.phase for e in _progress(events)] == ["nudged", "stopped"]
     assert [e.count for e in _progress(events)] == [2, 3]
     assert agent.last_run_exhausted is True
-    assert "已停止" in answer
+    assert "the turn stopped" in answer
     # nudge 拼进了对应工具结果（独立于 status_bar）
     tool_messages = [m for m in agent.history if m["role"] == "tool"]
-    assert any("相同参数" in m["content"] for m in tool_messages)
+    assert any("identical arguments" in m["content"] for m in tool_messages)
 
 
 def test_loop_guard_ignores_different_arguments():
@@ -440,7 +440,7 @@ def test_loop_guard_stop_is_resumable():
     )
 
     first = agent.run("循环")
-    assert agent.last_run_exhausted is True and "已停止" in first
+    assert agent.last_run_exhausted is True and "the turn stopped" in first
     second = agent.run("继续")
     assert second == "完成" and agent.last_run_exhausted is False
 
@@ -612,13 +612,13 @@ def test_status_bar_appends_user_message_each_iteration():
     first_status = llm.calls[0]["messages"][-1]
     assert first_status["role"] == "user"
     assert "<agent_status>" in first_status["content"]
-    assert "第 1/" in first_status["content"]  # 迭代号
-    assert "尚未调用工具" in first_status["content"]  # 第一轮还没有调用
+    assert "turn 1/" in first_status["content"]  # 迭代号
+    assert "no tool calls yet" in first_status["content"]  # 第一轮还没有调用
 
     second_status = llm.calls[1]["messages"][-1]
     assert "<agent_status>" in second_status["content"]
-    assert "第 2/" in second_status["content"]
-    assert "add: 1 次" in second_status["content"]  # 计数已累计
+    assert "turn 2/" in second_status["content"]
+    assert "add: 1\n" in second_status["content"]  # 计数已累计
 
     # 持久追加：第二次请求的消息序列仍是第一次的严格扩展（KV Cache 纪律不被破坏）
     earlier, later = llm.calls
@@ -705,8 +705,8 @@ def test_interrupt_backfills_pending_tool_results():
     tool_messages = [m for m in agent.history if m["role"] == "tool"]
     assert len(tool_messages) == 3
     assert tool_messages[0]["content"] == "ok1"
-    assert "中断" in tool_messages[1]["content"]
-    assert "中断" in tool_messages[2]["content"]
+    assert "interrupted" in tool_messages[1]["content"]
+    assert "interrupted" in tool_messages[2]["content"]
 
     # 中断后历史仍合法：下一次 run() 正常收尾（残缺序列会在 API 侧 400）
     assert agent.run("继续") == "继续"

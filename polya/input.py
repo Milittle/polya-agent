@@ -28,11 +28,12 @@ from prompt_toolkit.utils import get_cwidth
 
 from .commands import COMMANDS, command_error, parse_command
 from .filefind import ProjectFiles
+from .i18n import t
 from .models import format_tokens
 
 PASTE_FOLD_THRESHOLD = 10  # 粘贴超过此行数即折叠为占位符
 QUIT_WINDOW_S = 2.0  # 空框双击 Ctrl+C 的判定窗口（秒）
-KEY_HINTS = "Enter 发送 · /help"
+KEY_HINTS = t("ui.input.key_hints")
 
 # 补全菜单样式（2026-09 样式原型裁决，变体 B「极简暗色」）：无底色，未选中
 # 暗灰、选中亮青加粗。每个类都显式 bg:default——PT 默认样式是浅灰块 +
@@ -142,7 +143,7 @@ class SlashCompleter(Completer):
 def _command_meta(command) -> str:
     parts = [p for p in (command.argument_hint, command.description) if p]
     if command.aliases:
-        parts.append(f"别名 {'、'.join(command.aliases)}")
+        parts.append(t("ui.input.aliases", aliases=", ".join(command.aliases)))
     return " · ".join(parts)
 
 
@@ -333,7 +334,7 @@ class InputBox:
             # 自动补全统一由下方 _auto_complete 驱动（插入与删除都触发）；
             # 库自带的 insert 驱动只覆盖插入且重复起任务，关掉保持单一来源。
             complete_while_typing=False,
-            placeholder=[("class:placeholder", "输入任务，或用 @ 引用文件")],
+            placeholder=[("class:placeholder", t("ui.input.placeholder"))],
             style=Style.from_dict(
                 {
                     "prompt": "bold cyan",
@@ -628,11 +629,11 @@ class InputBox:
         busy = state.get("busy", False)
         mode = state.get("mode", "normal")
         if state.get("queued"):
-            mode += f" · 已排队 {state['queued']} 条"
-        hint = "Enter 引导 · Alt+Enter 追加" if busy else KEY_HINTS
+            mode += " · " + t("ui.input.queued_count", count=state['queued'])
+        hint = t("ui.input.hint_steer") if busy else KEY_HINTS
         buffer = self._session.default_buffer
         if buffer.complete_state:
-            hint = "Tab / Enter 选择 · Esc 关闭"
+            hint = t("ui.input.hint_select")
         elif buffer.text.lstrip().startswith("/"):
             command, _ = parse_command(buffer.text)
             if command is not None:
@@ -640,13 +641,19 @@ class InputBox:
                 # 底栏接过参数提示与说明；菜单打开时说明在菜单里，不重复。
                 hint = " · ".join(p for p in (command.argument_hint, command.description) if p)
         elif buffer.text and not busy:
-            hint = "Ctrl+J 换行 · Alt+Enter 追加"
+            hint = t("ui.input.hint_multiline")
         flashed = time.monotonic() < self._hint_until
         if flashed:
             hint = self._hint
         # 窄屏：提示退到最短，但模式（plan/normal）一定保留。
         if not flashed and get_cwidth(mode) + get_cwidth(hint) + 4 > width:
-            hint = "Esc 关闭" if buffer.complete_state else "Enter 引导" if busy else "/help"
+            hint = (
+            t("ui.input.hint_esc_close")
+            if buffer.complete_state
+            else t("ui.input.hint_enter_steer")
+            if busy
+            else "/help"
+        )
         return [("class:rule", "  " + _align(mode, hint, width))]
 
     def _flash_hint(self, message: str) -> None:
@@ -690,7 +697,11 @@ class InputBox:
                     Completion(
                         value,
                         display_meta=label
-                        + (" · 当前" if value == self._current_choice(command.name) else ""),
+                        + (
+                            t("ui.input.current")
+                            if value == self._current_choice(command.name)
+                            else ""
+                        ),
                     )
                     for value, label in choices
                 ]
@@ -698,9 +709,9 @@ class InputBox:
                 # （prompt_toolkit 3.0.53 验证）；complete_index=0 预选首项。
                 buffer.complete_state = CompletionState(buffer.document, completions, 0)
                 buffer.on_completions_changed.fire()
-                hint = "选择选项后 Enter 执行 · Esc 关闭"
+                hint = t("ui.input.hint_selector_run")
                 if command.name == "/model":
-                    hint = "Enter 切换 · Ctrl+S 设为默认 · Esc 关闭"
+                    hint = t("ui.input.hint_selector_model")
                 self._flash_hint(hint)
                 return
         buffer.validate_and_handle()
@@ -722,13 +733,13 @@ class InputBox:
             self._pastes.clear()
             self._tokens.clear()
             self._last_cancel = 0.0
-            self._flash_hint("已清空（空框双击 Ctrl+C 退出）")
+            self._flash_hint(t("ui.input.cleared"))
             return
         now = time.monotonic()
         if now - self._last_cancel <= QUIT_WINDOW_S:
             raise KeyboardInterrupt
         self._last_cancel = now
-        self._flash_hint("再按一次 Ctrl+C 退出")
+        self._flash_hint(t("ui.input.quit_confirm"))
 
     def _on_paste(self, data: str, buffer) -> None:
         """大段粘贴折叠为 ``[Pasted #N +M lines]``，提交时展开（见 ask）。"""

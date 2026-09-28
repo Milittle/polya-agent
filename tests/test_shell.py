@@ -8,7 +8,7 @@ from polya.shell import ShellSession
 def test_run_returns_exit_code_and_output(tmp_path):
     session = ShellSession(str(tmp_path))
     result = session.run("echo hi")
-    assert "退出码 0" in result
+    assert "Exit code 0" in result
     assert "hi" in result
 
 
@@ -25,7 +25,7 @@ def test_state_persists_across_calls(tmp_path):
 
 def test_nonzero_exit_code_is_reported(tmp_path):
     session = ShellSession(str(tmp_path))
-    assert "退出码 1" in session.run("false")
+    assert "Exit code 1" in session.run("false")
 
 
 def test_wait_timeout_keeps_command_and_environment(tmp_path):
@@ -34,12 +34,12 @@ def test_wait_timeout_keeps_command_and_environment(tmp_path):
 
     result = session.run("sleep 0.15; echo finished", timeout=0.01)
 
-    assert "仍在运行" in result
+    assert "still running" in result
     assert session.alive
     assert session.run("echo must-not-run").startswith("Error:")
     result = session.output(timeout=2)
-    assert "finished" in result and "退出码 0" in result
-    assert "退出码 0" in session.run("echo ok")
+    assert "finished" in result and "Exit code 0" in result
+    assert "Exit code 0" in session.run("echo ok")
     assert "42" in session.run("echo $MI_Z_TEST")
     session.kill()
 
@@ -47,16 +47,16 @@ def test_wait_timeout_keeps_command_and_environment(tmp_path):
 def test_output_returns_pending_lines_without_waiting(tmp_path):
     session = ShellSession(str(tmp_path))
     session.run("echo before")
-    assert "before" in session.output() or session.output() == "(暂无新输出)"
-    assert session.output() == "(暂无新输出)"  # 取空后再取没有新输出
+    assert "before" in session.output() or session.output() == "(no new output)"
+    assert session.output() == "(no new output)"  # 取空后再取没有新输出
 
 
 def test_kill_then_restart(tmp_path):
     session = ShellSession(str(tmp_path))
-    assert "退出码 0" in session.run("echo a")
+    assert "Exit code 0" in session.run("echo a")
     session.kill()
     assert not session.alive
-    assert "退出码 0" in session.run("echo b")  # 自动重启
+    assert "Exit code 0" in session.run("echo b")  # 自动重启
 
 
 def test_run_streams_lines_via_callback(tmp_path):
@@ -65,14 +65,14 @@ def test_run_streams_lines_via_callback(tmp_path):
     seen: list[str] = []
     result = session.run("echo one; echo two", on_line=seen.append)
     assert seen == ["one", "two"]
-    assert "退出码 0" in result and "one" in result
+    assert "Exit code 0" in result and "one" in result
     assert all("__polya_done_" not in line for line in seen)
 
 
 def test_no_newline_output_and_real_failure_code(tmp_path):
     session = ShellSession(str(tmp_path))
     result = session.run("printf partial; false")
-    assert "partial" in result and "退出码 1" in result
+    assert "partial" in result and "Exit code 1" in result
     assert "polya_" not in result
     session.kill()
 
@@ -81,7 +81,7 @@ def test_large_output_keeps_failure_tail_and_full_log(tmp_path):
     session = ShellSession(str(tmp_path))
     result = session.run("for i in {1..1800}; do echo line-$i; done; echo TEST_FAILED; false")
     assert "line-1\n" in result
-    assert "TEST_FAILED" in result and result.endswith("退出码 1")
+    assert "TEST_FAILED" in result and result.endswith("Exit code 1")
     assert len(result) < 8300
     middle = session.output(command_id=1, start_line=900, end_line=902)
     assert "line-900" in middle and "line-902" in middle
@@ -96,10 +96,10 @@ def test_wait_deadline_is_total_even_with_output(tmp_path):
     start = time.monotonic()
     result = session.run("for i in {1..30}; do echo tick; sleep 0.05; done", timeout=0.1)
     assert time.monotonic() - start < 1
-    assert "仍在运行" in result
+    assert "still running" in result
     session.kill()
     assert not session.alive
-    assert "退出码 0" in session.run("echo restart")
+    assert "Exit code 0" in session.run("echo restart")
     session.kill()
 
 

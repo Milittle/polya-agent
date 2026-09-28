@@ -25,7 +25,7 @@ from dataclasses import MISSING, dataclass, is_dataclass
 from dataclasses import fields as dataclass_fields
 from typing import Annotated, Any, Literal, Union, get_args, get_origin, get_type_hints
 
-from .i18n import t, tool_description
+from .prompts import msg, tool_description
 
 _JSON_TYPES: dict[Any, str] = {
     str: "string",
@@ -199,7 +199,7 @@ class ToolRegistry:
 
     def add(self, item: Tool) -> Tool:
         if self._frozen:
-            raise RuntimeError(t("agent.tools_frozen"))
+            raise RuntimeError(msg("agent.tools_frozen"))
         self._tools[item.name] = item
         return item
 

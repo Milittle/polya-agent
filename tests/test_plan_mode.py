@@ -60,7 +60,7 @@ def test_builtin_run_submits_plan_ends_turn_and_releases_mode():
     assert agent.run("做事") == "三步走"
     assert agent.plan_mode is False  # 展示即释放执行
     denial = llm.calls[1]["messages"][-1]["content"]
-    assert "规划模式" in denial and "exit_plan_mode" in denial
+    assert "plan mode" in denial and "exit_plan_mode" in denial
     # 工具数组全程不变（缓存纪律）：每次请求的 tools 完全一致
     assert llm.calls[0]["tools"] == llm.calls[1]["tools"]
 
@@ -75,7 +75,7 @@ def test_plan_mode_denies_write_but_allows_read():
     )
     agent = Agent(llm=llm, tools=[add, write_thing], plan_mode=True)
     assert agent.run("做事") == "完成"
-    assert "规划模式" in llm.calls[1]["messages"][-1]["content"]  # 写被拒
+    assert "plan mode" in llm.calls[1]["messages"][-1]["content"]  # 写被拒
     assert llm.calls[2]["messages"][-1]["content"] == "3"  # 只读放行
     assert agent.plan_mode is True  # 未提交计划，保持规划模式
 
@@ -105,9 +105,9 @@ def test_status_bar_shows_plan_mode():
     llm = ScriptedLLM([_message(content="好")])
     agent = Agent(llm=llm, tools=[add], plan_mode=True, status_bar=True)
     agent.run("hi")
-    assert "规划" in llm.calls[0]["messages"][-1]["content"]
+    assert "planning" in llm.calls[0]["messages"][-1]["content"]
 
     llm2 = ScriptedLLM([_message(content="好")])
     agent2 = Agent(llm=llm2, tools=[add], status_bar=True)
     agent2.run("hi")
-    assert "规划" not in llm2.calls[0]["messages"][-1]["content"]
+    assert "planning" not in llm2.calls[0]["messages"][-1]["content"]

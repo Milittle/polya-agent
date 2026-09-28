@@ -27,7 +27,7 @@ def test_store_rewrite_validates_atomically():
         )
         raised = False
     except ValueError as exc:
-        raised = "status 非法" in str(exc)
+        raised = "invalid status" in str(exc)
     assert raised
     assert store.as_dicts() == [{"content": "保留项", "status": "pending"}]  # 原子：未变
 
@@ -68,21 +68,21 @@ def test_todo_write_tool_updates_store_and_echoes():
         },
     )
 
-    assert "2 项" in result
+    assert "(2 items)" in result
     assert "[1] [completed] 读代码" in result
     assert store.as_dicts()[1] == {"content": "修 bug", "status": "in_progress"}
 
-    assert "已清空" in tools.call("todo_write", {"items": []})
+    assert "TODO list cleared" in tools.call("todo_write", {"items": []})
     assert len(store) == 0
 
 
 def test_todo_write_bad_input_returns_error_to_model():
     tools = registry(todos=TodoStore())
     result = tools.call("todo_write", {"items": [{"content": "x", "status": "wat"}]})
-    assert "Error" in result and "status 非法" in result
+    assert "Error" in result and "invalid status" in result
 
 
-def test_status_bar_renders_todos_with_chinese_labels():
+def test_status_bar_renders_todos_with_raw_labels():
     snapshot = StatusSnapshot(
         iteration=1,
         max_steps=10,
@@ -92,9 +92,9 @@ def test_status_bar_renders_todos_with_chinese_labels():
         ],
     )
     text = render_status(snapshot)
-    assert "- TODO 清单:" in text
-    assert "[1] [已完成] 读代码" in text
-    assert "[2] [进行中] 修 bug" in text
+    assert "- TODO list:" in text
+    assert "[1] [completed] 读代码" in text
+    assert "[2] [in_progress] 修 bug" in text
 
 
 def _message(content=None, tool_calls=None):
@@ -138,9 +138,9 @@ def test_todo_write_flows_into_status_bar_end_to_end():
     agent.run("修一下")
 
     second_status = llm.calls[1]["messages"][-1]["content"]
-    assert "- TODO 清单:" in second_status
-    assert "[1] [进行中] 定位问题" in second_status
-    assert "[2] [待办] 修复" in second_status
+    assert "- TODO list:" in second_status
+    assert "[1] [in_progress] 定位问题" in second_status
+    assert "[2] [pending] 修复" in second_status
 
     agent.reset()
     assert len(store) == 0  # 清单随会话重置

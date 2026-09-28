@@ -36,7 +36,7 @@ def test_plan_denies_non_read_but_allows_read_and_delegate():
     assert reviewer.review(delegate_thing, {}, plan=True).verdict == "allow"
     denied = reviewer.review(write_thing, {"path": "x", "content": "y"}, plan=True)
     assert denied.verdict == "deny"
-    assert "规划模式" in denied.reason and "exit_plan_mode" in denied.reason
+    assert "plan mode" in denied.reason and "exit_plan_mode" in denied.reason
 
 
 def test_plan_approval_whitelist_is_exact_match():

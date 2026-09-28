@@ -75,10 +75,10 @@ def test_development_survives_compaction_and_repairs_failed_check(tmp_path):
                 assert self.compactions == 1
                 context = json.dumps(messages, ensure_ascii=False)
                 assert "develop-polya" in context and "保持函数签名" in context
-                assert "退出码 1" in context and "AssertionError" in context
+                assert "Exit code 1" in context and "AssertionError" in context
             if self.step == 6:
                 assert messages[-1]["role"] == "tool"
-                assert messages[-1]["content"].endswith("退出码 0")
+                assert messages[-1]["content"].endswith("Exit code 0")
             if self.step < len(actions):
                 name, args = actions[self.step]
                 call = SimpleNamespace(

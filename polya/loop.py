@@ -48,8 +48,10 @@ from .commands import (
 from .executor import execute
 from .filefind import ProjectFiles
 from .gitinfo import current_branch
+from .i18n import t
 from .input import InputBox, InputSuspended
 from .models import ModelsConfig, format_context_window
+from .prompts import PLAN_PRESENTED
 from .providers import SUBSCRIPTION_PROVIDERS, estimate_cost
 from .render import TerminalRenderer, console
 from .review import Reviewer, is_plan_approval
@@ -171,7 +173,7 @@ def run_task(
                         on_plan(ev.plan)
                     # 回填计划结果并结束本轮；plan_mode 由驱动层在批准时翻转。
                     try:
-                        gen.send("计划已展示；本轮结束，等待用户指示。")
+                        gen.send(PLAN_PRESENTED)
                     except StopIteration:
                         pass
                     return "plan"
@@ -208,7 +210,7 @@ def _topic_from(first_input: str) -> str:
     sentence = _first_sentence(text).strip()
     if len(sentence) > _TOPIC_MAX:
         return sentence[: _TOPIC_MAX - 1].rstrip() + "…"
-    return sentence or "新会话"
+    return sentence or t("ui.loop.new_session")
 
 
 def _run_shell_bang(agent: Agent, root: str, command: str, say) -> None:
@@ -223,7 +225,9 @@ def _run_shell_bang(agent: Agent, root: str, command: str, say) -> None:
     say(f"$ {command}", "yellow")
     if output:
         say(output, "none")
-    truncated = output if len(output) <= 8000 else output[:8000] + "\n…（已截断）"
+    truncated = (
+        output if len(output) <= 8000 else output[:8000] + "\n" + t("ui.loop.truncated_tail")
+    )
     # 直接注入历史（不触发 LLM 轮）：作为后续对话的上下文证据
     agent.append_user_message(f"[shell] $ {command}\n{truncated}")
 
@@ -236,7 +240,7 @@ def _append_project_memory(root: str, text: str, say) -> None:
         if header_needed:
             fh.write("# 项目记忆（polya 会话启动时自动载入；# 前缀追加）\n\n")
         fh.write(f"{text}\n")
-    say(f"已记入 {path}", "dim")
+    say(t("ui.loop.noted", path=path), "dim")
 
 
 def print_welcome(
@@ -252,16 +256,16 @@ def print_welcome(
     """
     output.set_window_title("polya")
     output.print(Text(f"  polya · v{version('polya')}", style="bold cyan"))
-    output.print(Text("  和你一起理解问题、制定计划、完成验证", style="dim"))
+    output.print(Text("  " + t("ui.loop.tagline"), style="dim"))
     if not trusted:
         output.print(
             Text(
-                "  ⚠ 未信任此目录：AGENTS.md / 项目 skills 未加载（/trust 查看）",
+                "  " + t("ui.loop.untrusted"),
                 style="yellow",
             )
         )
     elif project_memory:
-        output.print(Text("  已加载项目记忆 AGENTS.md", style="dim"))
+        output.print(Text("  " + t("ui.loop.loaded_memory"), style="dim"))
     output.print()
 
 
@@ -314,7 +318,7 @@ class InteractiveSession:
                 self.renderer,
                 ev,
                 self.agent.reviewer,
-                origin="子任务",
+                origin=t("ui.loop.origin_subtask"),
                 progress=runner.progress,
             )
 
@@ -388,8 +392,8 @@ class InteractiveSession:
         with self.lock:
             (self.steering if kind == "steering" else self.follow_up).append(text)
         self._sync_queue_state()
-        hint = "（下一轮请求前交给模型）" if kind == "steering" else "（本轮结束后交给模型）"
-        self.say("＋ 已排队" + hint + "：" + text.replace("\n", " ")[:60], "dim")
+        key = "ui.loop.queued_steering" if kind == "steering" else "ui.loop.queued_followup"
+        self.say(t(key, text=text.replace("\n", " ")[:60]), "dim")
 
     def _pop_next_task(self) -> str | None:
         """下一个任务：steering 优先，其次 follow-up。"""
@@ -410,8 +414,8 @@ class InteractiveSession:
             provider_id, model = config.use(ref)
             config.save()
         except ValueError as exc:
-            return f"[错误] {exc}"
-        return f"已设为默认启动模型：{provider_id}/{model}"
+            return t("ui.loop.error", exc=exc)
+        return t("ui.loop.default_model_set", provider=provider_id, model=model)
 
     def _dequeue_to_editor(self) -> str:
         """Alt+Up / Esc：把排队消息取回编辑器。"""
@@ -436,7 +440,7 @@ class InteractiveSession:
         self.state["topic"] = topic
         self.renderer._console.set_window_title(f"polya · {topic}")
         self.box._session.app.invalidate()
-        return f"已更新会话主题：{topic}"
+        return t("ui.loop.topic_updated", topic=topic)
 
     def _restart(self) -> str:
         """/new 的会话级重置：清屏重印启动区、主题、标题、计划与排队消息。"""
@@ -458,7 +462,7 @@ class InteractiveSession:
             project_memory=self.agent.project_memory,
             trusted=self.agent.trusted,
         )
-        return f"（已丢弃 {dropped} 条排队消息）" if dropped else ""
+        return t("ui.loop.queue_dropped", count=dropped) if dropped else ""
 
     def _local(self, text: str) -> bool:
         if text.startswith("/"):
@@ -486,7 +490,7 @@ class InteractiveSession:
             if not self._local(text):
                 self.agent.append_user_message(text)
                 self.say("❯ " + text, "cyan")
-                self.say("＋ 补充已交给模型，将用于下一轮请求。", "dim")
+                self.say(t("ui.loop.steering_delivered"), "dim")
 
     def _borrow_terminal(self, callback):
         if self.stop.is_set() or self.closing:
@@ -514,15 +518,15 @@ class InteractiveSession:
     def _work(self, text: str) -> None:
         task = not text.startswith(("/", "!", "#"))
         started = time.monotonic()
-        outcome = "本轮结束"
+        outcome = t("ui.loop.outcome_final")
         try:
             if self.plan_pending and task:
                 if is_plan_approval(text):
                     self.agent.leave_plan_mode()
                     self.plan_pending = False
-                    self.say("已批准计划，进入执行。", "green")
+                    self.say(t("ui.loop.plan_approved"), "green")
                 else:
-                    self.say("计划修改意见已交给模型；仍在计划模式（只读）。", "dim")
+                    self.say(t("ui.loop.plan_feedback"), "dim")
             if not self._local(text):
                 if self.topic is None:
                     self.topic = _topic_from(text)
@@ -542,27 +546,26 @@ class InteractiveSession:
                     on_plan=self._on_plan,
                 )
                 if task_outcome == "plan":
-                    outcome = "等待计划确认"
+                    outcome = t("ui.loop.outcome_plan_wait")
                 elif task_outcome == "budget":
                     # 软检查点收尾：不是失败，历史完整，下一条消息即可继续。
-                    outcome = "达检查点收尾"
+                    outcome = t("ui.loop.outcome_checkpoint")
                     self.say(
-                        "已达单轮预算，历史已保留；继续请直接发送下一条消息。", "yellow"
+                        t("ui.loop.budget_message"), "yellow"
                     )
                 elif task_outcome == "no_progress":
                     # 无进展熔断收尾：同样不是失败。
-                    outcome = "检测到重复调用，已停止"
+                    outcome = t("ui.loop.outcome_no_progress")
                     self.say(
-                        "检测到重复调用，本轮已停止；历史已保留，"
-                        "继续请直接发送下一条消息。",
+                        t("ui.loop.no_progress_message"),
                         "yellow",
                     )
         except InterruptedError:
-            outcome = "本轮已中断"
-            self.say("已中断本次任务；已完成步骤保留，排队消息回到输入框。", "yellow")
+            outcome = t("ui.loop.outcome_interrupted")
+            self.say(t("ui.loop.interrupted_message"), "yellow")
         except Exception as exc:  # noqa: BLE001 - 网络和工具错误不结束会话
-            outcome = "本轮失败"
-            self.say(f"[任务失败] {type(exc).__name__}: {exc}", "red")
+            outcome = t("ui.loop.outcome_failed")
+            self.say(t("ui.loop.task_failed", exc=f"{type(exc).__name__}: {exc}"), "red")
         finally:
             if task:
                 elapsed = max(0, int(time.monotonic() - started))
@@ -572,12 +575,14 @@ class InteractiveSession:
                 try:
                     self.agent.autosave()
                 except Exception as exc:  # noqa: BLE001 - 落盘失败不结束会话
-                    self.say(f"[自动保存失败] {type(exc).__name__}: {exc}", "yellow")
+                    self.say(
+                        t("ui.loop.autosave_failed", exc=f"{type(exc).__name__}: {exc}"), "yellow"
+                    )
 
     def _run_command(self, text: str, command) -> None:
         """命令在主循环（输入线程）执行；`idle` 命令遇到运行中的任务则拒绝。"""
         if command.idle and self.state.get("busy"):
-            self.say(f"当前任务运行中；先按 Esc 中断再执行 {command.name}。", "yellow")
+            self.say(t("ui.loop.busy_command", command=command.name), "yellow")
             return
         output = dispatch_command(text, self._command_context())
         if output is None:
@@ -776,8 +781,8 @@ def run_repl(agent: Agent, root: str, renderer: TerminalRenderer) -> None:
         else:
             try:
                 console.print(Markdown(agent.run(text)))
-                say(f"[用量] {agent.total_usage}", "dim")
+                say(t("ui.loop.usage", usage=agent.total_usage), "dim")
             except KeyboardInterrupt:
-                say("已中断本次任务", "yellow")
+                say(t("ui.loop.interrupted_short"), "yellow")
             except Exception as exc:  # noqa: BLE001
-                say(f"[任务失败] {type(exc).__name__}: {exc}", "red")
+                say(t("ui.loop.task_failed", exc=f"{type(exc).__name__}: {exc}"), "red")

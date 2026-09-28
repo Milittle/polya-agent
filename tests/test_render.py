@@ -416,13 +416,13 @@ def test_pending_shell_result_does_not_claim_completion():
     renderer, buf = make_renderer()
     renderer.use_scrollback(renderer._console)
     feed_tool_call(renderer)
-    feed_tool_result(renderer, "[命令 1]\n仍在运行；用 bash_output 等待，或 kill_bash 终止")
+    feed_tool_result(renderer, "[Command 1]\nstill running; wait with bash_output or kill_bash")
     assert "Running Bash" in buf.getvalue()
     assert "Ran Bash" not in buf.getvalue()
     buf.truncate(0)
     buf.seek(0)
     feed_tool_call(renderer)
-    feed_tool_result(renderer, "日志中包含仍在运行这几个字\n退出码 0")
+    feed_tool_result(renderer, "a log mentioning still running mid-text\nExit code 0")
     assert "Ran Bash" in buf.getvalue()
 
 
@@ -455,4 +455,7 @@ def test_no_progress_renders_dim_notice():
         {"tool": "read_file", "arguments": {}, "count": 4, "phase": "stopped"},
     )
     out = buf.getvalue()
-    assert "已提醒模型" in out and "已停止" in out and "read_file" in out
+    from polya.i18n import t
+
+    assert t("ui.render.no_progress_nudged", tool="read_file", count=3) in out
+    assert t("ui.render.no_progress_stopped", tool="read_file", count=4) in out

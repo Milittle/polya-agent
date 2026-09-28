@@ -352,7 +352,7 @@ def test_full_context_fails_locally_and_preserves_history():
     llm = ScriptedLLM([])
     agent = Agent(llm=llm, compress=True, context_window=10000)
     agent._compress_failures = 3
-    with pytest.raises(RuntimeError, match="上下文接近上限"):
+    with pytest.raises(RuntimeError, match="Context is near its limit"):
         agent.run("x" * 32000)
     assert llm.calls == []
     assert agent.history[0]["content"] == "x" * 32000

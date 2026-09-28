@@ -41,10 +41,11 @@ class TodoStore:
             content = str(item.get("content", "")).strip()
             status = item.get("status", "pending")
             if not content:
-                raise ValueError(f"第 {index} 项缺少 content")
+                raise ValueError(f"Item {index} is missing content")
             if status not in VALID_STATUSES:
                 raise ValueError(
-                    f"第 {index} 项 status 非法: {status!r}（可选 {', '.join(VALID_STATUSES)}）"
+                    f"Item {index} has invalid status: {status!r} "
+                    f"(one of {', '.join(VALID_STATUSES)})"
                 )
             cleaned.append(Todo(content=content, status=status))
         self._items = cleaned

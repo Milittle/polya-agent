@@ -20,7 +20,8 @@ def preview(text: str, limit: int = 8000) -> str:
     if len(text) <= limit:
         return text
     half = (limit - 100) // 2
-    return text[:half] + "\n... [中段省略；用 bash_output 按行读取完整输出] ...\n" + text[-half:]
+    note = "\n... [middle omitted; page the full log with bash_output] ...\n"
+    return text[:half] + note + text[-half:]
 
 
 @dataclass
@@ -82,9 +83,12 @@ class ShellSession:
         self, command: str, timeout: float = 10.0, on_line: Callable[[str], None] | None = None
     ) -> str:
         if not 0 <= timeout <= 300:
-            raise ValueError("timeout 应在 0–300 秒之间（只控制本次等待时间）")
+            raise ValueError("timeout must be 0-300 seconds (it only caps this wait)")
         if self._active is not None and self._active.code is None:
-            return f"Error: 命令 {self._active.id} 仍在运行；先 bash_output 等待或 kill_bash 终止。"
+            return (
+                f"Error: command {self._active.id} is still running; "
+                "wait via bash_output or kill_bash."
+            )
         self._ensure_started()
         if self._directory is None:
             self._directory = tempfile.TemporaryDirectory(prefix="polya-shell-")
@@ -130,11 +134,11 @@ class ShellSession:
                 if time.monotonic() >= deadline:
                     break
         status = (
-            f"退出码 {record.code}"
+            f"Exit code {record.code}"
             if record.code is not None
-            else "仍在运行；用 bash_output 等待，或 kill_bash 终止"
+            else "still running; wait with bash_output or kill_bash"
         )
-        return f"[命令 {record.id}]\n{output.strip() or '(无新输出)'}\n{status}"
+        return f"[Command {record.id}]\n{output.strip() or '(no new output)'}\n{status}"
 
     def output(
         self,
@@ -145,18 +149,18 @@ class ShellSession:
         offset: int = 0,
     ) -> str:
         if not 0 <= timeout <= 300:
-            raise ValueError("timeout 应在 0–300 秒之间")
+            raise ValueError("timeout must be 0-300 seconds")
         record = self._commands.get(command_id) if command_id is not None else self._active
         if record is None:
             if command_id is not None:
-                raise ValueError("未知命令编号")
-            return "(暂无新输出)"
+                raise ValueError("Unknown command id")
+            return "(no new output)"
         update = ""
         if record.code is None:
             update = self._collect(record, timeout)
         if start_line is not None:
             if start_line < 1 or offset < 0 or (end_line is not None and end_line < start_line):
-                raise ValueError("行号范围无效")
+                raise ValueError("Invalid line range")
             end = min(end_line or start_line + 199, start_line + 199)
             lines = []
             with record.log.open(encoding="utf-8") as log:
@@ -165,21 +169,22 @@ class ShellSession:
                         break
                     if i >= start_line:
                         lines.append(f"{i:>6}\t{line.rstrip()}")
-            status = f"退出码 {record.code}" if record.code is not None else "仍在运行"
+            status = f"Exit code {record.code}" if record.code is not None else "still running"
             text = "\n".join(lines)
             more = (
-                f"\n[此行范围未读完；保持行范围并用 offset={offset + 8000} 继续]"
+                f"\n[line range unfinished; keep the range and continue with "
+                f"offset={offset + 8000}]"
                 if len(text) > offset + 8000
                 else ""
             )
             return (
-                f"[命令 {record.id}; 行 {start_line}–{end}]\n"
+                f"[Command {record.id}; lines {start_line}-{end}]\n"
                 f"{text[offset : offset + 8000]}{more}\n{status}"
             )
         if update:
             return update
         if command_id is not None:
-            return f"[命令 {record.id}]\n用 start_line=1 回查输出\n退出码 {record.code}"
+            return f"[Command {record.id}]\npage output with start_line=1\nExit code {record.code}"
         # 已完成前台命令后仍支持显式后台进程的增量输出。
         output = ""
         while True:
@@ -190,7 +195,7 @@ class ShellSession:
             if pending is None:
                 break
             output = preview(output + pending)
-        return output.strip() or "(暂无新输出)"
+        return output.strip() or "(no new output)"
 
     def kill(self) -> None:
         """POSIX 下终止整个会话进程组（含子进程）；随后可重启。"""

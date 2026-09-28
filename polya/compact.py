@@ -30,7 +30,7 @@ import json
 import re
 from typing import Protocol
 
-from .i18n import t
+from .prompts import SUMMARY_SYSTEM_PROMPT
 
 COMPRESS_MARKER = "[COMPRESSED]"
 MICROCLEAR_MARKER = "[CLEARED]"
@@ -93,9 +93,6 @@ def extract_file_operations(messages: list[dict]) -> tuple[set[str], set[str]]:
                 continue
             (modified_files if name in writers else read_files).add(path)
     return read_files, modified_files
-
-
-SUMMARY_SYSTEM_PROMPT = t("prompt.summary")
 
 
 class _Chat(Protocol):

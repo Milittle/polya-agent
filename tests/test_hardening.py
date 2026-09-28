@@ -226,7 +226,7 @@ def test_length_truncation_continues_then_answers():
     agent = Agent(llm=llm, tools=[echo])
     assert agent.run("写长文") == "后半段完成"
     assert any(
-        "被截断" in (m.get("content") or "") for m in agent.history if m.get("role") == "user"
+        "truncated" in (m.get("content") or "") for m in agent.history if m.get("role") == "user"
     )
 
 
@@ -247,7 +247,7 @@ def test_compact_now_compacts_regardless_of_threshold():
         ]
     )
     message = agent.compact_now("聚焦任务")
-    assert "已压缩" in message
+    assert "Compacted" in message
     assert any(
         m.get("role") == "tool" and (m.get("content") or "").startswith(COMPRESS_MARKER)
         for m in agent.history
@@ -387,11 +387,16 @@ def test_cached_tokens_are_collected_and_accumulated():
 
 
 def test_language_selection_via_env(monkeypatch):
+    """语言分层：POLYA_LANG 只影响界面文案；模型侧固定英文不受影响。"""
     from polya import i18n
+    from polya.prompts import CODING_SYSTEM_PROMPT, msg
 
     monkeypatch.setenv("POLYA_LANG", "en")
     assert i18n.current_language() == "en"
-    assert i18n.t("agent.interrupted").startswith("Error: the user")
+    assert i18n.t("ui.render.plan_submitted") == "⏺ Plan submitted"
     monkeypatch.setenv("POLYA_LANG", "klingon")
     assert i18n.current_language() == "zh"  # 未知值回落
-    assert i18n.t("agent.interrupted").startswith("Error: 用户中断")
+    assert i18n.t("ui.render.plan_submitted") == "⏺ 计划已提交"
+    # 模型侧固定英文，且提示词带「按用户语言回复」防线（language-policy spec）。
+    assert "user's language" in CODING_SYSTEM_PROMPT
+    assert msg("agent.interrupted") == "Error: the user interrupted this task."

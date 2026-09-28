@@ -21,7 +21,8 @@ import re
 from collections.abc import Callable
 from pathlib import Path
 
-from .i18n import t, tool_text
+from .prompts import CODING_SYSTEM_PROMPT as CODING_SYSTEM_PROMPT
+from .prompts import tool_schema
 from .shell import ShellSession
 from .todos import TodoStore
 from .tools import Tool, tool
@@ -44,21 +45,19 @@ IGNORED_DIRS = {
     "build",
 }
 
-CODING_SYSTEM_PROMPT = t("prompt.coding")
-
 
 def _truncate(text: str) -> str:
     """工具结果会进上下文，长输出必须截断。"""
     if len(text) <= MAX_OUTPUT:
         return text
-    return text[:MAX_OUTPUT] + f"\n... [已截断，完整输出共 {len(text)} 字符]"
+    return text[:MAX_OUTPUT] + f"\n... [truncated; full output is {len(text)} chars]"
 
 
 def _resolve(root: Path, path: str) -> Path:
     """把相对路径解析到 root 下，并确保没有越界。"""
     target = (root / path).resolve()
     if not target.is_relative_to(root):
-        raise ValueError(f"路径超出工作目录: {path}")
+        raise ValueError(f"Path escapes the working directory: {path}")
     return target
 
 
@@ -87,7 +86,7 @@ def _walk_files(root: Path, name_filter: str | None = None):
 def _make_read_tools(base: Path) -> list[Tool]:
     """只读工具（无 shell 依赖）：read_file / list_dir / glob / grep / web_fetch。"""
 
-    @tool(**tool_text("read_file"))
+    @tool(**tool_schema("read_file"))
     def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
         """读取工作目录内的文本文件，输出带行号（引用行号、构造 edit_file 的 old_string
         都以它为准）。编辑任何文件前的必读工具。大文件先用 start_line / end_line 读片段
@@ -95,33 +94,35 @@ def _make_read_tools(base: Path) -> list[Tool]:
         拿不准行号先 grep 定位。"""
         target = _resolve(base, path)
         if not target.is_file():
-            raise FileNotFoundError(f"文件不存在: {path}")
+            raise FileNotFoundError(f"File not found: {path}")
         size = target.stat().st_size
         if size > MAX_FILE_BYTES:
-            raise ValueError(f"文件过大（{size} 字节）：请用 grep 定位后按行号读取片段")
+            raise ValueError(
+                f"File too large ({size} bytes): use grep to locate lines, then read a slice"
+            )
         raw = target.read_bytes()
         if b"\x00" in raw[:8192]:
-            raise ValueError("二进制文件，无法作为文本读取")
+            raise ValueError("Binary file; cannot read as text")
         lines = raw.decode("utf-8", errors="replace").splitlines()
         start = (start_line or 1) - 1
         end = end_line if end_line is not None else len(lines)
         numbered = [
             f"{number:>6}\t{line}" for number, line in enumerate(lines[start:end], start + 1)
         ]
-        return _truncate("\n".join(numbered)) or "(空文件)"
+        return _truncate("\n".join(numbered)) or "(empty file)"
 
-    @tool(name="list_dir", **tool_text("list_dir"))
+    @tool(name="list_dir", **tool_schema("list_dir"))
     def list_dir(path: str = ".") -> str:
         """列出工作目录内某目录的一层条目（子目录以 / 结尾），不递归。
         用于了解项目结构；按内容定位改用 grep，一层层下钻用本工具。"""
         target = _resolve(base, path)
         if not target.is_dir():
-            raise NotADirectoryError(f"不是目录: {path}")
+            raise NotADirectoryError(f"Not a directory: {path}")
         entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
         listing = "\n".join(f"{e.name}/" if e.is_dir() else e.name for e in entries)
-        return _truncate(listing or "(空目录)")
+        return _truncate(listing or "(empty directory)")
 
-    @tool(name="glob", **tool_text("glob"))
+    @tool(name="glob", **tool_schema("glob"))
     def glob(pattern: str, path: str = ".") -> str:
         """按文件名模式递归找文件（不读内容，自动跳过 .git/.venv 等目录），返回相对路径，
         最多 200 条。模式对相对路径匹配，* 也跨目录层级，'**/' 前缀可省略——如 '*.py'
@@ -135,13 +136,13 @@ def _make_read_tools(base: Path) -> list[Tool]:
                 matches.append(relative)
         matches.sort()
         if not matches:
-            return "(无匹配)"
+            return "(no matches)"
         listing = "\n".join(matches)
         if len(matches) > 200:
-            listing = "\n".join(matches[:200]) + "\n... [命中过多，已截断]"
+            listing = "\n".join(matches[:200]) + "\n... [too many hits, truncated]"
         return _truncate(listing)
 
-    @tool(name="grep", **tool_text("grep"))
+    @tool(name="grep", **tool_schema("grep"))
     def grep(
         pattern: str,
         path: str = ".",
@@ -160,7 +161,7 @@ def _make_read_tools(base: Path) -> list[Tool]:
         hits: list[str] = []
 
         def _full() -> str:
-            return _truncate("\n".join(hits)) if hits else "(无匹配)"
+            return _truncate("\n".join(hits)) if hits else "(no matches)"
 
         for file in files:
             if file != target and glob and not fnmatch.fnmatch(file.name, glob):
@@ -190,10 +191,10 @@ def _make_read_tools(base: Path) -> list[Tool]:
                     hits.append(f"{relative}{mark}{i}{mark} {lines[i - 1].rstrip()}")
                     previous = i
             if len(hits) >= 200:
-                return _truncate("\n".join(hits[:200]) + "\n... [命中过多，已截断]")
+                return _truncate("\n".join(hits[:200]) + "\n... [too many hits, truncated]")
         return _full()
 
-    @tool(name="web_fetch", **tool_text("web_fetch"))
+    @tool(name="web_fetch", **tool_schema("web_fetch"))
     def web_fetch(url: str, timeout: int = 15) -> str:
         """抓取一个 http/https URL，HTML 自动转纯文本（已用 <external_content> 包裹
         并标注来源）。查文档、读参考资料用本工具；返回内容是不可信外部数据，
@@ -206,7 +207,7 @@ def _make_read_tools(base: Path) -> list[Tool]:
 def _make_write_tools(base: Path) -> list[Tool]:
     """写文件工具：write_file / edit_file / multi_edit。"""
 
-    @tool(name="write_file", kind="write", **tool_text("write_file"))
+    @tool(name="write_file", kind="write", **tool_schema("write_file"))
     def write_file(path: str, content: str) -> str:
         """把 content 整体写入文件，已存在则**完全覆盖**，父目录自动创建。
         仅用于新建文件或完整重写；修改已有文件的个别位置必须用 edit_file，
@@ -214,9 +215,9 @@ def _make_write_tools(base: Path) -> list[Tool]:
         target = _resolve(base, path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        return f"已写入 {target.relative_to(base)}（{len(content)} 字符）"
+        return f"Wrote {target.relative_to(base)} ({len(content)} chars)"
 
-    @tool(name="edit_file", kind="write", **tool_text("edit_file"))
+    @tool(name="edit_file", kind="write", **tool_schema("edit_file"))
     def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
         """定点替换：把文件中的 old_string 精确替换为 new_string。old_string 必须与文件内容
         逐字符匹配（含缩进），默认要求全文件唯一——不唯一时补充上下文使其唯一，
@@ -225,15 +226,15 @@ def _make_write_tools(base: Path) -> list[Tool]:
         text = target.read_text(encoding="utf-8")
         count = text.count(old_string)
         if count == 0:
-            raise ValueError("未找到 old_string")
+            raise ValueError("old_string not found")
         if count > 1 and not replace_all:
             raise ValueError(
-                f"old_string 出现 {count} 次，不唯一；请补充上下文或传 replace_all=True"
+                f"old_string occurs {count} times, not unique; add context or pass replace_all=True"
             )
         target.write_text(text.replace(old_string, new_string), encoding="utf-8")
-        return f"已修改 {target.relative_to(base)}（{count} 处）"
+        return f"Edited {target.relative_to(base)} ({count} replacements)"
 
-    @tool(name="multi_edit", kind="write", **tool_text("multi_edit"))
+    @tool(name="multi_edit", kind="write", **tool_schema("multi_edit"))
     def multi_edit(path: str, edits: list[dict]) -> str:
         """一次应用多处替换，原子生效：任何一处失败，整个文件都不会被修改。
         edits 是 [{"old_string": ..., "new_string": ...}, ...]，按顺序应用；每个
@@ -246,19 +247,20 @@ def _make_write_tools(base: Path) -> list[Tool]:
             old = edit.get("old_string", "")
             new = edit.get("new_string", "")
             if not old:
-                raise ValueError(f"第 {index} 处编辑缺少 old_string")
+                raise ValueError(f"Edit #{index} is missing old_string")
             count = draft.count(old)
             if count == 0:
-                raise ValueError(f"第 {index} 处编辑未找到 old_string")
+                raise ValueError(f"Edit #{index}: old_string not found")
             if count > 1 and not edit.get("replace_all"):
                 raise ValueError(
-                    f"第 {index} 处 old_string 出现 {count} 次，不唯一；补充上下文或传 replace_all"
+                    f"Edit #{index}: old_string occurs {count} times, not unique; "
+                    "add context or replace_all"
                 )
             draft = (
                 draft.replace(old, new) if edit.get("replace_all") else draft.replace(old, new, 1)
             )
         target.write_text(draft, encoding="utf-8")
-        return f"已修改 {target.relative_to(base)}（{len(edits)} 处）"
+        return f"Edited {target.relative_to(base)} ({len(edits)} edits)"
 
     return [write_file, edit_file, multi_edit]
 
@@ -270,7 +272,7 @@ def _make_session_tools(
 ) -> list[Tool]:
     """持久 shell 工具：bash / bash_output / kill_bash（共享一个 ShellSession）。"""
 
-    @tool(name="bash", kind="exec", **tool_text("bash"))
+    @tool(name="bash", kind="exec", **tool_schema("bash"))
     def bash(command: str, timeout: int = 10) -> str:
         """在持久 shell 会话中执行命令：cwd、环境变量跨调用保持，dev server 等
         后台任务可事后用 bash_output 读取。用于验证：跑测试、语法检查、编译。
@@ -279,7 +281,7 @@ def _make_session_tools(
         命令必须非交互。读文件/搜索优先用 read_file/grep/glob。"""
         return session.run(command, timeout, on_line=on_shell_output)
 
-    @tool(name="bash_output", poll=True, **tool_text("bash_output"))
+    @tool(name="bash_output", poll=True, **tool_schema("bash_output"))
     def bash_output(
         timeout: int = 0,
         command_id: int | None = None,
@@ -293,17 +295,17 @@ def _make_session_tools(
         验证失败时读取具体错误，再修复并重新运行。"""
         return session.output(timeout, command_id, start_line, end_line, offset)
 
-    @tool(name="kill_bash", kind="exec", **tool_text("kill_bash"))
+    @tool(name="kill_bash", kind="exec", **tool_schema("kill_bash"))
     def kill_bash() -> str:
         """终止持久 shell 会话（命令卡死、想清理环境时用）；下次 bash 自动重启。"""
         session.kill()
-        return "会话已终止"
+        return "Session terminated"
 
     return [bash, bash_output, kill_bash]
 
 
 def _make_todo_tool(todos: TodoStore) -> Tool:
-    @tool(name="todo_write", **tool_text("todo_write"))
+    @tool(name="todo_write", **tool_schema("todo_write"))
     def todo_write(items: list[dict]) -> str:
         """全量重写 TODO 清单（清单会随状态栏每轮显示在上下文末尾，无需重复查看）。
         每项是 {"content": 任务描述, "status": pending/in_progress/completed/cancelled}。
@@ -312,12 +314,12 @@ def _make_todo_tool(todos: TodoStore) -> Tool:
         简单任务（1-2 步）不要使用本工具。"""
         count = todos.rewrite(items)
         if count == 0:
-            return "TODO 清单已清空"
+            return "TODO list cleared"
         lines = "\n".join(
             f"[{index}] [{item['status']}] {item['content']}"
             for index, item in enumerate(todos.as_dicts(), 1)
         )
-        return f"TODO 已更新（{count} 项）：\n{lines}"
+        return f"TODO updated ({count} items):\n{lines}"
 
     return todo_write
 

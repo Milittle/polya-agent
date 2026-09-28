@@ -17,13 +17,11 @@ from collections.abc import Callable
 
 from .agent import Agent, BudgetExhausted, Compaction, Iteration, PlanSubmitted, ToolCall
 from .builtin import default_tools
-from .i18n import t, tool_text
+from .prompts import SUBAGENT_SYSTEM_PROMPT, tool_schema
 from .todos import TodoStore
 from .tools import Tool, tool
 
 logger = logging.getLogger("polya.subagent")
-
-SUBAGENT_SYSTEM_PROMPT = t("prompt.subagent")
 
 # 默认 dispatch：子 Agent 内置驱动（引擎级测试用；驱动层换闸门版）
 Dispatch = Callable[[Agent, ToolCall], str]
@@ -74,7 +72,7 @@ class SubagentRunner:
     def task_tool(self) -> Tool:
         """构造 ``task`` 工具（构建期注册，先于 registry.freeze）。"""
 
-        @tool(kind="delegate", **tool_text("task"))
+        @tool(kind="delegate", **tool_schema("task"))
         def task(description: str, prompt: str) -> str:
             """把一个有界的探查子任务交给隔离上下文的子代理，只有最终报告回到当前上下文。
             用于把探查链（多轮 grep / read_file）挡在主上下文之外。description 是简短标签，
