@@ -449,7 +449,7 @@ def _sessions(ctx: CommandContext, arg: str) -> str:
 
 
 def _session_choices() -> tuple[tuple[str, str], ...]:
-    "/resume 的动态选项：已存会话，name · title · updated。"
+    "/resume 的动态选项：已存会话，title · name · updated。"
     return tuple((m.name, m.label()) for m in session_store.list_metas())
 
 

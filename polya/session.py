@@ -91,9 +91,7 @@ class SessionMeta:
 
     def label(self) -> str:
         """选项器 / 列表用的一行摘要。"""
-        parts = [self.name]
-        if self.title:
-            parts.append(self.title)
+        parts = [self.title, self.name] if self.title else [self.name]
         if self.updated:
             parts.append(self.updated)
         return " · ".join(parts)

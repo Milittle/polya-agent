@@ -288,6 +288,8 @@ class InteractiveSession:
         self.stop = threading.Event()
         self.closing = False
         self.topic: str | None = None
+        self._title_epoch = 0  # /new、切会话或手动重命名后，旧模型结果失效
+        self._title_generated = False
         self.state = {
             "model": agent.llm.model,
             "project": str(Path(root).resolve()),
@@ -436,6 +438,8 @@ class InteractiveSession:
         )
 
     def _rename(self, topic: str) -> str:
+        self._title_epoch += 1
+        self._title_generated = True
         self.topic = topic
         self.state["topic"] = topic
         self.renderer._console.set_window_title(f"polya · {topic}")
@@ -444,6 +448,8 @@ class InteractiveSession:
 
     def _restart(self) -> str:
         """/new 的会话级重置：清屏重印启动区、主题、标题、计划与排队消息。"""
+        self._title_epoch += 1
+        self._title_generated = False
         self.topic = None
         self.state["topic"] = None
         self.plan_pending = False
@@ -454,9 +460,13 @@ class InteractiveSession:
             self.follow_up.clear()
         self._sync_queue_state()
         # 清屏再重印启动区：/new /clear /reset 后终端像刚启动的新会话，旧输出
-        # 不留在滚动区。经 patched stdout 写出会先擦除输入区、写完再重绘，
-        # 输入框与状态栏回到屏幕底部（见 issues/10-fixed-bottom-tui.md 的全屏方案）。
+        # 不留在滚动区。rich clear() 只擦可见屏（\x1b[2J + 光标归位），终端
+        # scrollback 里旧内容仍在、往回滚还看得到，故追加 E3（\x1b[3J，
+        # Erase Saved Lines）连滚动区一并清空。经 patched stdout 写出会先擦除
+        # 输入区、写完再重绘，输入框与状态栏回到屏幕底部（见
+        # issues/10-fixed-bottom-tui.md 的全屏方案）。
         self.renderer._console.clear()
+        self.renderer._console.file.write("\x1b[3J")
         print_welcome(
             self.renderer._console,
             project_memory=self.agent.project_memory,
@@ -601,6 +611,8 @@ class InteractiveSession:
             self.state.pop("cache_hit", None)
         # 切/换会话后把驱动层主题与窗口标题同步到会话元数据（/new 走 restart 自清）。
         if command.name in ("/resume", "/fork", "/clone", "/load"):
+            self._title_epoch += 1
+            self._title_generated = self.agent.session_title is not None
             self.topic = self.agent.session_title
             self.state["topic"] = self.topic
             title = f"polya · {self.topic}" if self.topic else "polya"
@@ -637,16 +649,37 @@ class InteractiveSession:
             if self.state.get("busy"):
                 self.box._session.app.invalidate()
 
+    def _apply_generated_title(self, epoch: int, title: str) -> None:
+        """只在原会话仍未被手动命名时采用模型结果，并重新落盘。"""
+        if epoch != self._title_epoch or self._title_generated:
+            return
+        self._title_generated = True
+        self.topic = title
+        self.state["topic"] = title
+        self.agent.set_session_title(title)
+        self.renderer._console.set_window_title(f"polya · {title}")
+        self.box._session.app.invalidate()
+        try:
+            self.agent.autosave()
+        except Exception as exc:  # noqa: BLE001 - 元数据保存失败不结束交互会话
+            self.say(t("ui.loop.autosave_failed", exc=f"{type(exc).__name__}: {exc}"), "yellow")
+
     async def run(self) -> None:
         self.loop = asyncio.get_running_loop()
         self._loop_thread = threading.get_ident()
         prompt = None
         worker = None
         command = None
+        title_tasks: dict[asyncio.Task, int] = {}
+        pending_title: tuple[int, str] | None = None
         ticker = asyncio.create_task(self._tick())
         request = asyncio.create_task(self.requests.get())
         try:
             while not self.closing:
+                if pending_title is not None and worker is None and command is None:
+                    epoch, title = pending_title
+                    self._apply_generated_title(epoch, title)
+                    pending_title = None
                 if worker is None and command is None:
                     text = self._pop_next_task()
                     if text is not None:
@@ -658,11 +691,24 @@ class InteractiveSession:
                                 asyncio.to_thread(self._run_command, text, entry)
                             )
                         else:
+                            generator = getattr(self.agent.llm, "generate_title", None)
+                            if (
+                                not text.startswith(("!", "#", "/"))
+                                and not self._title_generated
+                                and callable(generator)
+                                and not any(
+                                    epoch == self._title_epoch for epoch in title_tasks.values()
+                                )
+                            ):
+                                title_tasks[
+                                    asyncio.create_task(asyncio.to_thread(generator, text))
+                                ] = self._title_epoch
                             self._start_task()
                             worker = asyncio.create_task(asyncio.to_thread(self._work, text))
                 if prompt is None and command is None:
                     prompt = asyncio.create_task(self.box.ask_async(self.state))
                 tasks = [t for t in (prompt, request, worker, command) if t is not None]
+                tasks.extend(title_tasks)
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 if worker is not None and worker in done:
                     await worker
@@ -682,6 +728,14 @@ class InteractiveSession:
                     command = None
                     self.box.refresh_file_index()  # 命令可能刚写过文件
                     self.box._session.app.invalidate()
+                for title_task in done.intersection(title_tasks):
+                    epoch = title_tasks.pop(title_task)
+                    try:
+                        generated_title = title_task.result()
+                    except Exception:  # noqa: BLE001 - 标题失败不影响主任务
+                        generated_title = None
+                    if isinstance(generated_title, str) and generated_title:
+                        pending_title = (epoch, generated_title)
                 if prompt is not None and prompt in done:
                     try:
                         text = prompt.result().strip()
@@ -740,6 +794,20 @@ class InteractiveSession:
                 await worker
             if command is not None:
                 await command
+            if pending_title is not None:
+                self._apply_generated_title(*pending_title)
+            for title_task, epoch in title_tasks.items():
+                if epoch != self._title_epoch or self._title_generated:
+                    title_task.cancel()
+                    continue
+                try:
+                    title = await asyncio.wait_for(title_task, timeout=21.0)
+                except Exception:  # noqa: BLE001 - 退出仍以已落盘的临时主题兜底
+                    continue
+                if isinstance(title, str) and title:
+                    self._apply_generated_title(epoch, title)
+            if title_tasks:
+                await asyncio.gather(*title_tasks, return_exceptions=True)
             self.renderer.on_status = lambda renderer: None
             self.box.preview = lambda width, max_lines: ""
 

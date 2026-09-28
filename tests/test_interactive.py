@@ -485,6 +485,73 @@ def test_first_task_topic_is_persisted_as_session_title(tmp_path, monkeypatch):
         assert '"title": "修复登录页面"' in saved.read_text(encoding="utf-8")
 
 
+def test_generated_title_updates_saved_session_and_resume_choice(tmp_path, monkeypatch):
+    from polya.commands import _session_choices
+
+    class TitledLLM(FakeLLM):
+        def __init__(self, responses):
+            super().__init__(responses)
+            self.title_requests = []
+
+        def generate_title(self, message):
+            self.title_requests.append(message)
+            assert message == "如何给 banner 设计会话标题？"
+            return "设计会话 Banner 标题"
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    llm = TitledLLM([reply(content="done"), reply(content="done")])
+    with session_for(tmp_path, llm) as (session, pipe, _):
+
+        async def scenario():
+            task = asyncio.create_task(session.run())
+            await until(lambda: session.box._session.app.is_running)
+            pipe.send_text("如何给 banner 设计会话标题？\r")
+            await until(lambda: session.topic == "设计会话 Banner 标题")
+            saved = tmp_path / ".polya" / "sessions" / f"{session.agent.session_name}.jsonl"
+            await until(
+                lambda: saved.exists()
+                and '"title": "设计会话 Banner 标题"' in saved.read_text()
+            )
+            assert _session_choices()[0][1].startswith("设计会话 Banner 标题 · ")
+            pipe.send_text("继续调整标题\r")
+            await until(lambda: len(llm.requests) == 2 and not session.state["busy"])
+            assert llm.title_requests == ["如何给 banner 设计会话标题？"]
+            pipe.send_text("\x04")
+            await asyncio.wait_for(task, 3)
+
+        asyncio.run(scenario())
+
+
+def test_manual_rename_wins_over_pending_generated_title(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class TitledLLM(FakeLLM):
+        def generate_title(self, message):
+            started.set()
+            release.wait(3)
+            return "模型标题"
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with session_for(tmp_path, TitledLLM([reply(content="done")])) as (session, pipe, _):
+
+        async def scenario():
+            task = asyncio.create_task(session.run())
+            await until(lambda: session.box._session.app.is_running)
+            pipe.send_text("修复登录\r")
+            await until(started.is_set)
+            await until(lambda: not session.state["busy"])
+            pipe.send_text("/rename 手动标题\r")
+            await until(lambda: session.topic == "手动标题")
+            release.set()
+            await asyncio.sleep(0.05)
+            assert session.agent.session_title == "手动标题"
+            pipe.send_text("\x04")
+            await asyncio.wait_for(task, 3)
+
+        asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("command", ["/new", "/clear", "/reset"])
 def test_session_commands_wipe_screen_before_welcome(tmp_path, command):
     """/new /clear /reset 清屏后重印启动区：终端像刚启动的新会话。"""
@@ -495,6 +562,7 @@ def test_session_commands_wipe_screen_before_welcome(tmp_path, command):
         session._local(command)
         wiped = output.getvalue()
         assert "\x1b[2J" in wiped  # rich Control.clear()：擦全屏 + 光标归位
+        assert "\x1b[3J" in wiped  # E3：连终端 scrollback 一起清空，回滚看不到旧内容
         assert wiped.index("\x1b[2J") < wiped.index("polya · v")  # 先清屏，再印 banner
         assert "和你一起理解" in wiped
         assert "旧输出" not in wiped[wiped.index("\x1b[2J") :]  # 旧内容只留在清屏之前

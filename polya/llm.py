@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from openai import APITimeoutError, BadRequestError, OpenAI, RateLimitError
 
 from .providers import profile_for, reasoning_params
+from .title import parse_title, title_messages
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -206,6 +207,14 @@ class LLM:
         if self.thinking_level and self.reasoning_style != "none":
             kwargs.update(reasoning_params(self.reasoning_style, self.thinking_level))
         return kwargs
+
+    def generate_title(self, user_message: str) -> str | None:
+        """独立短请求生成会话主题，不改变主对话或流式状态。"""
+        response = self.client.with_options(timeout=20.0, max_retries=0).chat.completions.create(
+            model=self.model,
+            messages=title_messages(user_message),
+        )
+        return parse_title(response.choices[0].message.content)
 
     def _open_stream(self, kwargs: dict):
         """打开流式请求；端点不认 stream_options 时去掉重试一次并记住，

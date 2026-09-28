@@ -138,6 +138,20 @@ def test_prompt_mode_saves_session(monkeypatch, tmp_path, capsys):
     assert [m.name for m in session_store.list_metas()]
 
 
+def test_prompt_mode_saves_generated_title(monkeypatch, tmp_path):
+    from polya import session as session_store
+
+    class TitledLLM(ScriptedLLM):
+        def generate_title(self, message):
+            assert message == "请修复登录页面"
+            return "修复登录页面"
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("polya.cli.LLM", lambda **kwargs: TitledLLM([make_message("完成")]))
+    assert main(["--root", str(tmp_path), "-p", "请修复登录页面"]) == 0
+    assert session_store.list_metas()[0].title == "修复登录页面"
+
+
 def test_prompt_mode_loop_guard_returns_unfinished(monkeypatch, tmp_path, capsys):
     """票 07：-p 熔断收尾复用 last_run_exhausted -> [未完成] + 退出码 1。"""
     call = SimpleNamespace(

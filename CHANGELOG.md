@@ -18,10 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `-p` now saves the session on every exit path (success, budget-exhausted, interrupt,
   error), so one-shot runs are resumable and auditable; hitting the continuation limit
   prints `[未完成]` and exits 1.
-- The auto session topic now takes the **first sentence** of the first task (Chinese and
+- The provisional session topic takes the **first sentence** of the first task (Chinese and
   English sentence-final punctuation; an English period ends a sentence only when followed
   by whitespace or end-of-input, so `polya.py` / `1.5` are not split), then collapses
-  whitespace and caps at 48 characters with a trailing `…`.
+  whitespace and caps at 48 characters with a trailing `…`. A separate asynchronous
+  model request then replaces it with a concise generated title, saves the updated
+  session, and displays the title first in `/resume`. Manual `/rename` always wins;
+  successful automatic titles do not change on later turns.
 
 ### Fixed
 
@@ -38,9 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `Tool.poll` flag (e.g. `bash_output` polling); sub-agents keep their hard
   `max_steps` bound instead. The limit stays tunable through the library API
   (`Agent(loop_guard=…, loop_repeat_limit=…)`).
-- `/new`, `/clear` and `/reset` now wipe the screen (erase display + cursor home)
-  before reprinting the startup banner, so the terminal reads like a freshly
-  launched session instead of stacking on the old scrollback.
+- `/new`, `/clear` and `/reset` now wipe the screen (erase display, cursor home,
+  and the terminal scrollback via E3 `CSI 3 J`) before reprinting the startup
+  banner, so the terminal reads like a freshly launched session — scrolling no
+  longer reveals the previous session's output.
 - Compaction trigger now guarantees an absolute reserve (`--reserve-tokens`, default
   16384, matching pi's `reserveTokens`): the trigger is
   `min(window × threshold, window − reserve)` floored at half the window, so small

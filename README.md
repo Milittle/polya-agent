@@ -107,7 +107,7 @@ explicitly.
 **Sessions** get a stable name and metadata (title, created/updated, cwd) and are
 auto-saved to `~/.polya/sessions/<name>.jsonl` after every task (including one-shot
 `-p` runs) so `/resume` lists conversations you actually had. `/resume` with no argument opens a picker in the input
-box (name · title · updated); `/resume <name>` switches directly. `/fork <id>` derives a
+box (title · name · updated); `/resume <name>` switches directly. `/fork <id>` derives a
 new session from the ancestor path up to entry `#id` (`/tree` shows ids); `/clone`
 duplicates the current session. Switching resets stats, todos and file tracking so
 sessions never bleed into each other. `/export [path]` writes the active branch as
@@ -207,8 +207,10 @@ holds mode and queue state on the left and context-sensitive action hints on the
 right. Narrow terminals drop provider, thinking, branch, topic and usage details in
 that order, always keeping the model, project name and mode.
 `/rename <topic>` changes the topic and terminal title (one line, up to 120 characters).
-`/new` (and its aliases `/clear`, `/reset`) resets the topic; it is re-derived from
-the first task, without an extra model request.
+`/new` (and its aliases `/clear`, `/reset`) resets the topic. In interactive mode,
+the first task supplies a provisional topic; a separate asynchronous model request
+generates a concise title and saves it with the session. One-shot `-p` generates the
+title before saving. Manual `/rename` takes precedence.
 
 You can keep typing while the agent runs. `Enter` sends a **steering** message: it is
 injected before the next model request, after **all** results of the current tool batch

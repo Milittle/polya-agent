@@ -30,7 +30,7 @@ from rich_argparse import RichHelpFormatter
 from .agent import Agent
 from .builtin import CODING_SYSTEM_PROMPT, default_tools
 from .llm import LLM
-from .loop import run_repl, run_tool_call
+from .loop import _topic_from, run_repl, run_tool_call
 from .models import ModelsConfig, resolve_connection, resolve_context_window
 from .providers import profile_for
 from .render import TerminalRenderer, console, ui
@@ -294,6 +294,15 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             # 单次运行也落盘（成功 / 未完成 / 中断 / 异常），供 /resume 与审计。
             try:
+                if agent.history and agent.session_title is None:
+                    title = None
+                    generator = getattr(agent.llm, "generate_title", None)
+                    if code == 0 and callable(generator):
+                        try:
+                            title = generator(args.prompt)
+                        except Exception:  # noqa: BLE001 - 标题失败不改变任务结果
+                            pass
+                    agent.set_session_title(title or _topic_from(args.prompt))
                 agent.autosave()
             except Exception as exc:  # noqa: BLE001 - 落盘失败不改退出码
                 print(f"[自动保存失败] {type(exc).__name__}: {exc}", file=sys.stderr)
