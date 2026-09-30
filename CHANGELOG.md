@@ -25,15 +25,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   model request then replaces it with a concise generated title, saves the updated
   session, and displays the title first in `/resume`. Manual `/rename` always wins;
   successful automatic titles do not change on later turns.
+- Busy-line action labels moved into the interface i18n catalog (`ui.status.*`):
+  `Waiting for model` / `Thinking` / `Responding` / `Running …` / `Reviewing` /
+  `Stopping` and the two `esc` hints now go through `t()`, so the default Chinese UI
+  shows `等待模型` / `思考中` / `回答中` / `执行 …` / `审核中` / `停止中`, while
+  `POLYA_LANG=en` renders the previous English strings unchanged. Scrollback
+  tool-block headers (`Running`, `Ran`) stay English per the language policy
+  (`.scratch/language-policy`).
+- Interface language selection now persists in `~/.polya/settings.json` (`"language"`:
+  `"en"` / `"zh"`), with `POLYA_LANG` as a per-run override, and the default flipped
+  from `zh` to `en` (user preference). Invalid values at any level fall through to the
+  next; the file is read once per process, so edits need a restart. Tests pin
+  `POLYA_LANG=zh` as their assertion baseline (`tests/conftest.py`).
 
 ### Fixed
 
+- Session labels in `/resume`, `/sessions` and the picker now show the **topic**
+  with a friendly `MM-DD HH:MM` time, instead of the internal timestamp session
+  name and an ISO date; `/new` no longer announces the timestamp name either.
+- An auto-created session (`/new`, `/fork`, `/clone`) is now renamed to a
+  **topic-derived slug** once the topic is known, so the session name and the
+  topic match; the provisional timestamp file is removed. `/save <name>` and
+  `/resume` lock the name so explicit names are never rewritten.
+- The file-index background rebuild now clears its single-flight flag, so repeated
+  `refresh_soon()` calls (after each task boundary) actually rebuild the index
+  instead of silently doing nothing after the first one.
+- Busy `/plan` is now refused like other mode-changing commands, so a task's tool
+  review semantics can no longer change halfway through (ticket 01); `/sessions`,
+  `/tree`, `/export`, `/thinking` and `/rename` are likewise `idle` commands.
+- Exiting polya no longer blocks on a pending automatic title request: in-flight
+  title tasks are cancelled and the provisional topic (already persisted) stands
+  (ticket 10).
 - The topic derived from the first task is now **persisted as the session `title`**, so
   `/resume` and `/sessions` show a readable topic instead of only the timestamp name
   (previously only `/rename` wrote a title, and the auto topic was lost on save).
 
 ### Added
 
+- `/resume` (and `/load`, `/import`) now **replays the restored conversation into the
+  scrollback**: user turns as `❯ …`, assistant turns as `● …` (reasoning tail included),
+  and tool results as collapsed `Ran/Failed` summaries bound to their tree entry id, so
+  `/details <id>` expands them. Replay is bounded to the most recent 30 entries with a dim
+  omission notice for the rest, uses original payloads (not the projection), and is skipped
+  on failure or when there is no renderer (ticket 10).
+- `/queue` inspects the busy-time queue: `list` shows each steering / follow-up
+  message in delivery order with its timing, `drop N` discards a single item and
+  `take N` pulls one back into the editor (ticket 04).
+- `/paste` inspects folded paste blocks (ticket 08): `list` summarises each block,
+  `show N` prints the original text, `expand N` replaces the placeholder in the
+  editor with the original, and `drop N` removes it. Editing the placeholder by
+  hand still submits exactly what remains, so what you see is what is sent.
+- `Esc` now cancels a running foreground `bash` immediately by sending SIGINT to
+  the shell's process group (`ShellSession.cancel`); the session auto-restarts on
+  the next `bash` call instead of waiting out the tool timeout (ticket 02).
+- `/details` now resolves IDs as **session-tree entry ids** (the same space as
+  `/tree` and `history_read`), reading the durable tree instead of a 20-block
+  in-memory ring, so early tool output stays retrievable and survives `/resume`
+  (ADR 0005, ticket 07). Tool headers print the entry id.
+- The `@` file index is warmed in the background at startup; the first `@` no
+  longer runs `rg --files` synchronously, and the bottom bar shows `indexing…`
+  until it is ready (ticket 09).
+- `LLM.generate_title` records its usage in a separate `title_usage` map, keeping
+  the decorative title request out of the session's `total_usage` (ticket 10).
 - No-progress breaker (always on, no CLI switch): repeating the same tool call with
   identical arguments first nudges the model at the third repetition (the nudge is
   appended to the tool result), then stops the turn resumably on the next one. With the
@@ -41,10 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new `Tool.poll` flag (e.g. `bash_output` polling); sub-agents keep their hard
   `max_steps` bound instead. The limit stays tunable through the library API
   (`Agent(loop_guard=…, loop_repeat_limit=…)`).
-- `/new`, `/clear` and `/reset` now wipe the screen (erase display, cursor home,
-  and the terminal scrollback via E3 `CSI 3 J`) before reprinting the startup
-  banner, so the terminal reads like a freshly launched session — scrolling no
-  longer reveals the previous session's output.
+- `/new` and `/reset` now clear only the visible screen (erase display, cursor
+  home) before reprinting the startup banner, so the terminal scrollback is kept
+  and you can still scroll back to the previous session. `/clear` is now a
+  separate, explicit command that additionally wipes the scrollback via E3
+  (`CSI 3 J`) when you really want the terminal to read like a fresh launch.
 - Compaction trigger now guarantees an absolute reserve (`--reserve-tokens`, default
   16384, matching pi's `reserveTokens`): the trigger is
   `min(window × threshold, window − reserve)` floored at half the window, so small

@@ -386,17 +386,42 @@ def test_cached_tokens_are_collected_and_accumulated():
 # ---------- i18n ----------
 
 
-def test_language_selection_via_env(monkeypatch):
+def _isolate_language_sources(monkeypatch, i18n, tmp_path):
+    """settings.json 指到空 tmp 并清缓存，语言只由测试显式写入的来源决定。"""
+    monkeypatch.setattr(i18n, "settings_path", lambda: tmp_path / "settings.json")
+    monkeypatch.setattr(i18n, "_stored_read", False)
+    monkeypatch.setattr(i18n, "_stored_language", None)
+
+
+def test_language_selection_via_env(monkeypatch, tmp_path):
     """语言分层：POLYA_LANG 只影响界面文案；模型侧固定英文不受影响。"""
     from polya import i18n
     from polya.prompts import CODING_SYSTEM_PROMPT, msg
 
+    _isolate_language_sources(monkeypatch, i18n, tmp_path)
     monkeypatch.setenv("POLYA_LANG", "en")
     assert i18n.current_language() == "en"
-    assert i18n.t("ui.render.plan_submitted") == "⏺ Plan submitted"
+    assert i18n.t("ui.render.plan_submitted") == "● Plan submitted"
     monkeypatch.setenv("POLYA_LANG", "klingon")
-    assert i18n.current_language() == "zh"  # 未知值回落
-    assert i18n.t("ui.render.plan_submitted") == "⏺ 计划已提交"
+    assert i18n.current_language() == "en"  # 未知值回落默认
     # 模型侧固定英文，且提示词带「按用户语言回复」防线（language-policy spec）。
     assert "user's language" in CODING_SYSTEM_PROMPT
     assert msg("agent.interrupted") == "Error: the user interrupted this task."
+
+
+def test_language_selection_via_settings_json(monkeypatch, tmp_path):
+    """settings.json 的 language 持久化；POLYA_LANG 临时覆盖；非法值回落默认。"""
+    from polya import i18n
+
+    _isolate_language_sources(monkeypatch, i18n, tmp_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text('{"language": "zh"}', encoding="utf-8")
+    monkeypatch.delenv("POLYA_LANG", raising=False)
+    assert i18n.current_language() == "zh"
+    assert i18n.t("ui.status.thinking") == "思考中"
+    monkeypatch.setenv("POLYA_LANG", "en")  # 环境变量覆盖 settings.json
+    assert i18n.current_language() == "en"
+    monkeypatch.delenv("POLYA_LANG", raising=False)
+    settings.write_text('{"language": "klingon"}', encoding="utf-8")
+    monkeypatch.setattr(i18n, "_stored_read", False)  # 进程内缓存，改文件需重读
+    assert i18n.current_language() == "en"  # 非法值回落默认

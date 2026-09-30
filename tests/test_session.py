@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 from pathlib import Path
+
+from rich.console import Console
 
 from polya import Agent
 from polya import session as session_store
 from polya.commands import CommandContext, dispatch_command
+from polya.render import TerminalRenderer
 from polya.tree import SessionTree
 
 
@@ -71,7 +75,7 @@ def test_load_session_resets_derived_state(tmp_path, monkeypatch):
 def test_new_session_assigns_name_and_clear_also_starts_fresh(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     agent = _seed(_agent())
-    context = CommandContext(agent, restart=lambda: "")
+    context = CommandContext(agent, restart=lambda *, wipe_scrollback=False: "")
 
     name = dispatch_command("/new", context)
     assert "新会话" in name
@@ -182,9 +186,111 @@ def test_tree_copy_branch_upto_and_copy():
     assert clone.project() == tree.project()
 
 
+def test_session_label_shows_topic_not_timestamp():
+    """展示层只看主题：时间戳会话名与 ISO 日期不进 /resume 标签。"""
+    meta = session_store.SessionMeta(
+        name="20260928-234105",
+        title="修复登录页面",
+        updated="2026-09-28T23:41:05",
+    )
+    assert meta.label() == "修复登录页面 · 09-28 23:41"
+    # 无主题时回落显示名字（仍不拼 ISO 日期）
+    assert session_store.SessionMeta(name="20260928-234105").label() == "20260928-234105"
+
+
+def test_auto_session_renamed_to_topic_slug(tmp_path, monkeypatch):
+    """自动会话：主题确定后会话名重命名为主题 slug，name 与 topic 对得上。"""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = _agent()
+    stale = agent.new_session()
+    _seed(agent)  # 有历史才能落盘
+    agent.set_session_title("修复登录页面")
+    assert agent.session_name == agent.session_title == "修复登录页面"
+    agent.autosave()
+    sessions = tmp_path / ".polya" / "sessions"
+    assert (sessions / "修复登录页面.jsonl").exists()
+    assert not (sessions / f"{stale}.jsonl").exists()  # 不残留时间戳幽灵会话
+
+
+def test_generated_title_renames_and_removes_provisional(tmp_path, monkeypatch):
+    """模型标题替换临时主题时，会话文件跟着改名并清掉旧的临时名文件。"""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = _agent()
+    agent.new_session()
+    _seed(agent)
+    agent.set_session_title("修复登录")  # 临时主题 → 立即落盘
+    agent.set_session_title("修复登录页样式")  # 模型标题 → 改名
+    sessions = tmp_path / ".polya" / "sessions"
+    assert agent.session_name == "修复登录页样式"
+    assert (sessions / "修复登录页样式.jsonl").exists()
+    assert not (sessions / "修复登录.jsonl").exists()
+
+
+def test_explicit_name_and_resume_are_locked(tmp_path, monkeypatch):
+    """显式 /save 命名与 /resume 恢复的会话不随主题改名。"""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = _agent()
+    _seed(agent)
+    agent.save_session("我的会话")
+    agent.set_session_title("换个主题")
+    assert agent.session_name == "我的会话"
+
+    restored = _agent()
+    restored.load_session("我的会话")
+    restored.set_session_title("又一个主题")
+    assert restored.session_name == "我的会话"
+
+
+def test_slug_sanitizes_title_for_filenames():
+    assert session_store.slug("修复 登录/页面") == "修复-登录-页面"
+    assert session_store.slug("a:*?b") == "a-b"
+    assert session_store.slug("")  # 空主题回落时间戳名
+
+
 def test_unique_name_avoids_same_second_collision(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     first = session_store.unique_name("20260101-000000")
     second = session_store.unique_name("20260101-000000")
     assert first == "20260101-000000"
     assert second == "20260101-000000-2"
+
+
+def _scrollback_renderer() -> tuple[TerminalRenderer, StringIO]:
+    buf = StringIO()
+    renderer = TerminalRenderer(Console(file=buf, force_terminal=False, width=120))
+    renderer.use_scrollback(renderer._console)
+    return renderer, buf
+
+
+def test_resume_replays_history_into_scrollback(tmp_path, monkeypatch):
+    """用户报告：/resume 恢复后要看得见会话内容，而不只是一行「已恢复」。"""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    source = _seed(_agent())
+    source.tree.append(
+        "assistant",
+        {
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "bash", "arguments": '{"command": "ls"}'}}
+            ],
+        },
+    )
+    source.tree.append("tool", {"tool_call_id": "c1", "content": "列目录输出"})
+    source.save_session("alpha")
+
+    target = _agent()
+    renderer, buf = _scrollback_renderer()
+    result = dispatch_command("/resume alpha", CommandContext(target, renderer=renderer))
+
+    assert "已恢复会话" in result
+    out = buf.getvalue()
+    assert "❯ 任务一" in out and "答一" in out
+    assert "Ran Bash" in out and "ls" in out and "列目录输出" in out
+
+
+def test_failed_resume_does_not_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    renderer, buf = _scrollback_renderer()
+    result = dispatch_command("/resume missing", CommandContext(_agent(), renderer=renderer))
+    assert result.startswith("无法")
+    assert buf.getvalue() == ""

@@ -58,6 +58,24 @@ def valid_name(name: str) -> bool:
     )
 
 
+def slug(title: str) -> str:
+    """把主题转成合法会话名（slug）：空白与路径/保留字符 → ``-``，限长 48。
+
+    中文主题原样保留（文件系统支持 Unicode）；只确保无空白与分隔符，
+    避免主题与文件名“对不上”。
+    """
+    cleaned = "".join(
+        "-" if (char.isspace() or char in '/\\:*?"<>|') else char for char in title.strip()
+    )
+    cleaned = "-".join(part for part in cleaned.split("-") if part)
+    return cleaned[:48] or timestamp()
+
+
+def delete(name: str) -> None:
+    """删除会话文件（自动命名重命名时清理旧的临时名文件）。"""
+    session_path(name).unlink(missing_ok=True)
+
+
 @dataclass
 class SessionMeta:
     name: str
@@ -90,11 +108,15 @@ class SessionMeta:
         )
 
     def label(self) -> str:
-        """选项器 / 列表用的一行摘要。"""
-        parts = [self.title, self.name] if self.title else [self.name]
-        if self.updated:
-            parts.append(self.updated)
-        return " · ".join(parts)
+        """选项器 / 列表用的一行摘要：主题优先，时间只保留 MM-DD HH:MM。
+
+        时间戳会话名是内部稳定 id（文件名 / ``/resume`` 取值），不进展示——
+        否则会出现「主题 · 日期 · 日期」这类与用户无关的杂讯。无主题时
+        才回落显示名字。
+        """
+        when = f"{self.updated[5:10]} {self.updated[11:16]}" if len(self.updated) >= 16 else ""
+        primary = self.title or self.name
+        return f"{primary} · {when}" if when else primary
 
 
 def session_path(name: str) -> Path:

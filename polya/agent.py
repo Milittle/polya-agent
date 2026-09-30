@@ -34,6 +34,7 @@ from .prompt import SystemPrompt, diff_sections, tool_guidelines, tool_snippets
 from .prompts import DEFAULT_SYSTEM_PROMPT, PLAN_PRESENTED, msg, tool_schema
 from .providers import ModelProfile, profile_for
 from .review import AllowAllReviewer, Reviewer
+from .shell import ShellSession
 from .skills import SkillCatalog
 from .status import StatusSnapshot, render_status
 from .todos import TodoStore
@@ -252,11 +253,17 @@ class Agent:
         # TODO 存储：todo_write 工具写入（default_tools(todos=...) 接同一个实例），
         # 状态栏每轮把它渲染到上下文末尾——外部记忆，不靠模型回忆。
         self.todos = todos if todos is not None else TodoStore()
+        # 持久 shell 引用（交互驱动在 Esc 时用它取消运行中的前台 bash，票 02）；
+        # 由 cli.build_agent 装配，库／测试路径可为 None。
+        self.shell_session: ShellSession | None = None
         self.tree = SessionTree()
         # 会话身份（session-lifecycle 票 01）：当前会话名 + 元数据。autosave/`/save`
         # 写头，`/resume`/`/fork`/`/clone` 读改。
         self.session_name: str | None = None
         self.session_title: str | None = None
+        # 名字是否自动生成（未显式命名）：自动名在主题确定后重命名为主题 slug，
+        # 让“会话名”与“主题”对得上；用户显式 /save <名> 与恢复的会话保持锁定。
+        self._auto_name = False
         self.session_created: str = ""
         self.session_updated: str = ""
         # 项目信任态（CLI 门控的元信息，供 /trust 状态查询；引擎本身不读）。
@@ -436,11 +443,40 @@ class Agent:
     def set_session_title(self, title: str) -> None:
         self.session_title = title
         self.session_updated = session_store.iso_now()
+        self._rename_to_title(title)
+
+    def _rename_to_title(self, title: str) -> None:
+        """自动会话：主题确定后把会话名重命名为主题 slug，让 name 与 topic 对得上。
+
+        仅当名字是自动生成的（``/new``、``/fork``、``/clone``、首次 autosave）时生效；
+        用户显式命名（``/save <名>``）或 ``/resume`` 恢复的会话保持不变。已落盘的旧自动
+        文件在写入新名字后删除，避免留下时间戳幽灵会话。
+        """
+        if not self._auto_name or not title:
+            return
+        target = session_store.slug(title)
+        if target == self.session_name:
+            return
+        old = self.session_name
+        self.session_name = session_store.unique_name(target)
+        if not self.history:
+            return  # 尚未落盘：首次 autosave 会直接写新名字，无需清理
+        try:
+            self.save_session()
+        except OSError:
+            self.session_name = old  # 写入失败则回滚，不丢旧文件
+            return
+        if old and old != self.session_name:
+            try:
+                session_store.delete(old)
+            except OSError:
+                pass
 
     def _ensure_session_name(self) -> str:
         """无名字时生成自动名（不重置会话），供 autosave / 导出用。"""
         if self.session_name is None:
             self.session_name = session_store.unique_name()
+            self._auto_name = True
             self.session_created = self.session_created or session_store.iso_now()
         return self.session_name
 
@@ -448,7 +484,9 @@ class Agent:
         """把会话树与元数据持久化到 ``~/.polya/sessions/<name>.jsonl``。"""
         if name is None:
             name = self._ensure_session_name()
-        name = name.strip()
+        else:
+            name = name.strip()
+            self._auto_name = False  # 用户显式命名，锁定不再随主题改名
         if not session_store.valid_name(name):
             return "会话名不能含空白或路径分隔符。"
         self.session_name = name
@@ -487,6 +525,7 @@ class Agent:
             self.system_prompt = projected[0]["content"]
         self.session_name = meta.name
         self.session_title = meta.title
+        self._auto_name = False  # 恢复的会话已命名，不随主题改名
         self.session_created = meta.created
         self.session_updated = meta.updated
         self._adopt_session()
@@ -496,6 +535,7 @@ class Agent:
         """开新会话：清树与派生状态，分配新名字（不落盘，首次 autosave 写）。"""
         self.reset()
         self.session_name = name.strip() if name else session_store.unique_name()
+        self._auto_name = name is None
         self.session_title = None
         self.session_created = session_store.iso_now()
         self.session_updated = self.session_created
@@ -509,6 +549,7 @@ class Agent:
             return f"无法分叉：{exc}"
         self.tree = forked
         self.session_name = name.strip() if name else session_store.unique_name()
+        self._auto_name = name is None
         self.session_title = None
         self.session_created = session_store.iso_now()
         self.session_updated = self.session_created
@@ -520,6 +561,7 @@ class Agent:
         """复制整棵当前会话（含投影覆盖）为新会话，主题沿用。"""
         self.tree = self.tree.copy()
         self.session_name = name.strip() if name else session_store.unique_name()
+        self._auto_name = name is None
         self.session_created = session_store.iso_now()
         self.session_updated = self.session_created
         self._adopt_session()
@@ -610,6 +652,7 @@ class Agent:
             self.system_prompt = projected[0]["content"]
         base = target.stem if session_store.valid_name(target.stem) else None
         self.session_name = session_store.unique_name(base)
+        self._auto_name = True
         self.session_title = meta.title
         self.session_created = meta.created or session_store.iso_now()
         self.session_updated = self.session_created

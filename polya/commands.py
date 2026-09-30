@@ -43,11 +43,15 @@ _T = TypeVar("_T")
 class CommandContext:
     agent: Agent
     renderer: TerminalRenderer | None = None
-    restart: Callable[[], str] | None = None
+    restart: Callable[..., str] | None = None
     # 终端让位（/login 向导）：交互会话借道挂起机制运行交互闭包
     # （输入框让位、key 走 getpass 不进屏幕与输入历史）；缺省直接跑（管道 stdin）。
     in_terminal: Callable[[Callable[[], _T]], _T] | None = None
     rename: Callable[[str], str] | None = None
+    # 队列查看/单条撤回（票 04）：由交互驱动提供，缺省（非交互）不支持。
+    queue: Callable[[str], str] | None = None
+    # 粘贴块检查（票 08）：由交互驱动提供，缺省不支持。
+    paste: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -151,13 +155,71 @@ def _plan(ctx: CommandContext, arg: str) -> str:
     return "已进入规划模式：只读探查，模型完成计划后会调用 exit_plan_mode 提交。"
 
 
+def _entry_details(entry) -> str:
+    """把一条会话树入口渲染成可读详情（/details 的树侧实现，ADR 0005 同源）。"""
+    payload = entry.payload
+    header = f"#{entry.id} [{entry.kind}]"
+    if entry.kind == "tool":
+        return f"{header} tool_call_id={payload.get('tool_call_id')}\n{payload.get('content', '')}"
+    if entry.kind == "assistant":
+        parts: list[str] = []
+        if payload.get("reasoning_content"):
+            parts.append("[reasoning]\n" + str(payload["reasoning_content"]))
+        if payload.get("content"):
+            parts.append(str(payload["content"]))
+        if payload.get("tool_calls"):
+            names = ", ".join(tc["function"]["name"] for tc in payload["tool_calls"])
+            parts.append(f"[tool_calls: {names}]")
+        return header + ("\n" + "\n\n".join(parts) if parts else "")
+    return f"{header}\n{payload.get('content', '')}"
+
+
+def _recent_details(tree, count: int = 5) -> str:
+    """当前分支最近 count 条可展开入口（工具/助手）。"""
+    entries = [
+        entry
+        for entry in tree.active_branch()
+        if entry.kind in ("tool", "assistant")
+        and (entry.payload.get("content") or entry.payload.get("reasoning_content"))
+    ]
+    if not entries:
+        return "（暂无可展开的详情入口）"
+    return "\n\n".join(_entry_details(entry) for entry in entries[-count:])
+
+
 def _details(ctx: CommandContext, arg: str) -> str:
-    """查看留档块：带 ID 看指定块；无参看最近 5 块（合并旧 /expand）。"""
-    if ctx.renderer is None:
-        return "No details recorded in this session."
+    """查看详情：ID 是会话树入口 id（与 /tree、history_read 同源，ADR 0005）；
+    无参看当前分支最近 5 条。非交互路径回退到渲染器内存存档。"""
+    tree = getattr(ctx.agent, "tree", None)
     if arg:
-        return ctx.renderer.show_details(int(arg))
-    return ctx.renderer.expand_blocks(5)
+        entry_id = int(arg)
+        if tree is not None:
+            try:
+                return _entry_details(tree.get(entry_id))
+            except ValueError:
+                pass
+        if ctx.renderer is not None:
+            return ctx.renderer.show_details(entry_id)
+        return f"Details #{entry_id} unavailable (not found)."
+    if tree is not None:
+        return _recent_details(tree)
+    if ctx.renderer is not None:
+        return ctx.renderer.expand_blocks(5)
+    return "No details recorded in this session."
+
+
+def _queue(ctx: CommandContext, arg: str) -> str:
+    """查看/撤回排队消息（票 04）：list（默认）| drop N | take N。由驱动层提供。"""
+    if ctx.queue is None:
+        return "（非交互会话不支持队列查看）"
+    return ctx.queue(arg.strip())
+
+
+def _paste(ctx: CommandContext, arg: str) -> str:
+    """检查折叠的粘贴块（票 08）：list（默认）| show N | expand N | drop N。"""
+    if ctx.paste is None:
+        return "（非交互会话不支持粘贴检查）"
+    return ctx.paste(arg.strip())
 
 
 def _rename(ctx: CommandContext, arg: str) -> str:
@@ -171,14 +233,27 @@ def _rename_error(argument: str) -> str | None:
     return "用法 (Usage): /rename <主题>（1–120 字，单行）"
 
 
-def _new(ctx: CommandContext, arg: str) -> str:
-    """统一 /new /clear /reset：开新会话，旧会话保留可 /resume 找回。"""
-    name = ctx.agent.new_session()
-    note = "（旧会话保留，/resume 找回）"
+def _restart_session(ctx: CommandContext, *, wipe_scrollback: bool) -> str:
+    """会话级重置的共用体：开新会话 + 由驱动层清屏重印启动区。
+
+    时间戳会话名是内部稳定 id，不打印（展示看主题；首条任务后 /resume 按主题找回）。
+    """
+    ctx.agent.new_session()
+    note = "（旧会话保留，首条任务后可在 /resume 按主题找回）"
     if ctx.restart is None:
-        return f"已开始新会话 {name}{note}。"
-    # 会话级重置（主题、排队消息）由驱动层提供；返回附注（如丢弃条数）
-    return f"已开始新会话 {name}{note}：主题与排队消息已重置。" + ctx.restart()
+        return f"已开始新会话{note}。"
+    detail = "已清屏（含 scrollback）" if wipe_scrollback else "主题与排队消息已重置"
+    return f"已开始新会话{note}：{detail}。" + ctx.restart(wipe_scrollback=wipe_scrollback)
+
+
+def _new(ctx: CommandContext, arg: str) -> str:
+    """开新会话，旧会话保留可 /resume 找回；只擦可见屏，scrollback 保留回看。"""
+    return _restart_session(ctx, wipe_scrollback=False)
+
+
+def _clear(ctx: CommandContext, arg: str) -> str:
+    """显式清屏：连终端 scrollback 一并清空（区别于 /new 只擦可见屏）。"""
+    return _restart_session(ctx, wipe_scrollback=True)
 
 
 def _model_choices() -> tuple[tuple[str, str], ...]:
@@ -449,7 +524,7 @@ def _sessions(ctx: CommandContext, arg: str) -> str:
 
 
 def _session_choices() -> tuple[tuple[str, str], ...]:
-    "/resume 的动态选项：已存会话，title · name · updated。"
+    "/resume 的动态选项：已存会话，主题 · 时间（MM-DD HH:MM）。"
     return tuple((m.name, m.label()) for m in session_store.list_metas())
 
 
@@ -458,10 +533,22 @@ def _resume_validate(argument: str) -> str | None:
     return _session_name_error(argument) if argument else None
 
 
+def _restore_replay(ctx: CommandContext, output: str) -> str:
+    """恢复/导入成功后把当前分支回放到滚动区（/resume 后看得见历史内容）。
+
+    失败回执以「无法」开头，不回放；无 renderer（非交互）跳过。回放用原文 payload,
+    是「用户当初看到的对话」而非投影；有界（最近 N 条）控在 renderer.replay 里。
+    """
+    tree = getattr(ctx.agent, "tree", None)
+    if ctx.renderer is not None and tree is not None and not output.startswith("无法"):
+        ctx.renderer.replay(tree.active_branch())
+    return output
+
+
 def _resume(ctx: CommandContext, arg: str) -> str:
     if not arg:
         return _sessions(ctx, "")
-    return ctx.agent.load_session(arg)
+    return _restore_replay(ctx, ctx.agent.load_session(arg))
 
 
 def _fork_validate(argument: str) -> str | None:
@@ -502,7 +589,7 @@ def _import_validate(argument: str) -> str | None:
 
 
 def _import(ctx: CommandContext, arg: str) -> str:
-    return ctx.agent.import_session(arg)
+    return _restore_replay(ctx, ctx.agent.import_session(arg))
 
 
 _TRUST_CHOICES = (
@@ -558,7 +645,7 @@ def _trust(ctx: CommandContext, arg: str) -> str:
 def _load(ctx: CommandContext, arg: str) -> str:
     if not arg:
         return "用法 (Usage): /load <会话名>"
-    return ctx.agent.load_session(arg)
+    return _restore_replay(ctx, ctx.agent.load_session(arg))
 
 
 def _tree(ctx: CommandContext, arg: str) -> str:
@@ -632,6 +719,18 @@ COMMANDS = (
         idle=True,
     ),
     Command("/status", "显示模式、用量与工具计数", _status),
+    Command(
+        "/queue",
+        "查看/撤回排队消息（list | drop N | take N）",
+        _queue,
+        argument_hint="[list|drop N|take N]",
+    ),
+    Command(
+        "/paste",
+        "检查折叠的粘贴块（list | show N | expand N | drop N）",
+        _paste,
+        argument_hint="[list|show N|expand N|drop N]",
+    ),
     Command("/reload", "热加载技能目录（重扫 .polya/skills 等）", _reload, idle=True),
     Command(
         "/rewind",
@@ -649,7 +748,7 @@ COMMANDS = (
         validator=_save_validate,
         idle=True,
     ),
-    Command("/sessions", "列出已保存会话", _sessions),
+    Command("/sessions", "列出已保存会话", _sessions, idle=True),
     Command(
         "/resume",
         "恢复已保存会话（无参数打开选择器）",
@@ -690,6 +789,7 @@ COMMANDS = (
         _export,
         argument_hint="[路径]",
         validator=_export_validate,
+        idle=True,
     ),
     Command(
         "/thinking",
@@ -702,8 +802,9 @@ COMMANDS = (
             ("medium", "中"),
             ("high", "高"),
         ),
+        idle=True,
     ),
-    Command("/tree", "显示整棵树：分叉点与所有分支", _tree),
+    Command("/tree", "显示整棵树：分叉点与所有分支", _tree, idle=True),
     Command(
         "/edit",
         "编辑某入口在投影里的内容（原文保留，remove 删除）",
@@ -739,10 +840,11 @@ COMMANDS = (
             ("go", "批准当前计划，进入执行"),
             ("off", "执行：退出规划模式"),
         ),
+        idle=True,
     ),
     Command(
         "/details",
-        "查看留档块详情（无参数=最近 5 块）",
+        "查看入口详情（ID=会话树入口 id；无参=最近 5 条）",
         _details,
         argument_hint="[ID]",
         integer=True,
@@ -753,6 +855,7 @@ COMMANDS = (
         _rename,
         argument_hint="<主题>",
         validator=_rename_error,
+        idle=True,
     ),
     Command(
         "/login",
@@ -784,9 +887,15 @@ COMMANDS = (
     ),
     Command(
         "/new",
-        "开新会话：清空上下文，旧会话保留可 /resume 找回",
+        "开新会话：清空上下文，旧会话保留可 /resume 找回（保留 scrollback）",
         _new,
-        aliases=("/clear", "/reset"),
+        aliases=("/reset",),
+        idle=True,
+    ),
+    Command(
+        "/clear",
+        "开新会话并清空终端 scrollback（回滚不再可见）",
+        _clear,
         idle=True,
     ),
     Command("/exit", "退出", _exit, aliases=("/quit",), idle=True),

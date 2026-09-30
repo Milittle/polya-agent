@@ -34,6 +34,7 @@ from .loop import _topic_from, run_repl, run_tool_call
 from .models import ModelsConfig, resolve_connection, resolve_context_window
 from .providers import profile_for
 from .render import TerminalRenderer, console, ui
+from .shell import ShellSession
 from .skills import SkillCatalog
 from .subagent import SubagentRunner
 from .todos import TodoStore
@@ -177,10 +178,12 @@ def build_agent(
         trusted = is_trusted(args.root)
     memory = _project_memory(args.root) if trusted else None
     runner = SubagentRunner(root=args.root, memory=memory, renderer=renderer)
+    shell = ShellSession(str(Path(args.root).resolve()))
     tools = [
         *default_tools(
             root=args.root,
             todos=todos,
+            session=shell,  # 交互驱动持有引用，Esc 可取消运行中的 bash（票 02）
             # bash 运行中的实时输出直接喂渲染器（agent 线程内同步回调）。
             # 引擎不感知 UI；headless 下 renderer.update 只积累不打印，无副作用。
             on_shell_output=(
@@ -217,6 +220,7 @@ def build_agent(
         skills=SkillCatalog.discover(args.root, trusted=trusted),
     )
     runner.attach(agent)
+    agent.shell_session = shell  # Esc 取消运行中的 bash（票 02）
     agent.trusted = trusted  # /trust 状态查询用（会话启动时的实际信任态）
     # 默认 runner（-p / 管道）：走子 Agent 自带审查器（继承父 reviewer）。交互
     # REPL 会在 InteractiveSession 里重绑 dispatch 到父渲染器与共享审查器。

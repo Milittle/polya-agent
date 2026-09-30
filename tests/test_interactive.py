@@ -13,6 +13,7 @@ from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from polya import Agent, tool
+from polya.i18n import t
 from polya.input import InputBox, InputSuspended
 from polya.loop import InteractiveSession, run_task
 from polya.render import TerminalRenderer
@@ -105,7 +106,21 @@ def test_tick_repaints_only_while_busy(tmp_path):
         asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("command", ["/reset", "/clear", "/new", "/exit", "/quit"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/reset",
+        "/clear",
+        "/new",
+        "/exit",
+        "/quit",
+        "/sessions",
+        "/tree",
+        "/export",
+        "/thinking",
+        "/rename x",
+    ],
+)
 def test_idle_command_refused_while_busy(tmp_path, command):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
         session.state["busy"] = True
@@ -114,14 +129,27 @@ def test_idle_command_refused_while_busy(tmp_path, command):
         assert not session.closing  # /exit 未被误执行
 
 
+@pytest.mark.parametrize(
+    "command, initial", [("/plan on", False), ("/plan off", True), ("/plan go", True)]
+)
+def test_plan_toggle_refused_while_busy_keeps_mode(tmp_path, command, initial):
+    """规划模式只在任务边界生效：忙时 /plan 拒绝执行，审查语义不中途改变。"""
+    with session_for(tmp_path, FakeLLM([])) as (session, _, output):
+        session.agent.plan_mode = initial
+        session.state["busy"] = True
+        session._submit_input(command)
+        assert "先按 Esc 中断" in output.getvalue()
+        assert session.agent.plan_mode is initial
+
+
 def test_queued_message_applies_at_boundary(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
         session.state["busy"] = True
         session._submit_input("补充一句")
-        assert "下一轮请求前交给模型" in output.getvalue()
+        assert "当前工具批次结束后注入下一轮请求" in output.getvalue()
         session._boundary()
         assert session.agent.history[-1]["content"] == "补充一句"
-        assert "补充已交给模型" in output.getvalue()
+        assert "已注入上下文" in output.getvalue()
 
 
 def test_idle_command_borrows_terminal_without_freezing_the_loop(tmp_path, monkeypatch):
@@ -175,6 +203,30 @@ def test_follow_up_queues_separately_from_steering(tmp_path):
         assert "本轮结束后交给模型" in output.getvalue()
 
 
+def test_queue_lists_drops_and_recalls_single_message(tmp_path):
+    """票 04：/queue 按送达顺序列出两类消息，可单条 drop / 取回编辑。"""
+    with session_for(tmp_path, FakeLLM([])) as (session, _, _):
+        session.state["busy"] = True
+        session._submit_input("first")
+        session.box.last_kind = "follow_up"
+        session._submit_input("second")
+
+        listing = session._queue_handler("")
+        assert "1. [引导] first" in listing
+        assert "2. [追加] second" in listing
+
+        assert "已丢弃" in session._queue_handler("drop 1")
+        assert list(session.steering) == [] and list(session.follow_up) == ["second"]
+        assert session.state["queued"] == 1
+
+        assert "已取回编辑" in session._queue_handler("take 1")
+        assert session.state["queued"] == 0
+        assert session.box._draft.text == "second"
+        # 越界与非法动作给出明确反馈
+        assert "超出范围" in session._queue_handler("drop 5")
+        assert "用法" in session._queue_handler("nonsense")
+
+
 def test_dequeue_moves_queue_back_to_editor(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, _):
         session.state["busy"] = True
@@ -214,7 +266,7 @@ def test_status_computes_uncached_input_and_cost(tmp_path):
         assert session.state["subscribed"] is False
 
 
-def test_clear_alias_starts_fresh_session_and_drops_queue(tmp_path):
+def test_clear_command_starts_fresh_session_and_drops_queue(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
         session.agent.history.append({"role": "user", "content": "stale"})
         session.topic = "old-topic"
@@ -281,6 +333,35 @@ def test_busy_input_enters_next_request_after_entire_tool_batch(tmp_path):
         assert [m["role"] for m in messages[-3:]] == ["tool", "tool", "user"]
         assert messages[-1]["content"] == "also check callers"
         assert "已排队" in output.getvalue()
+
+
+def test_tool_details_use_entry_id_and_expand_full_output(tmp_path, monkeypatch):
+    """工具头行的 /details 用会话树入口 id；该 id 可展开完整输出（票 07 / ADR 0005）。"""
+    from polya.commands import _details
+
+    @tool
+    def big() -> str:
+        """Return a long body that /details can expand."""
+        return "\n".join(f"line-{i}" for i in range(30))
+
+    llm = FakeLLM([reply(calls=[call("big", "c1")]), reply("done")])
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with session_for(tmp_path, llm, [big]) as (session, pipe, output):
+
+        async def scenario():
+            task = asyncio.create_task(session.run())
+            await until(lambda: session.box._session.app.is_running)
+            pipe.send_text("run big\r")
+            await until(lambda: not session.state["busy"] and session.agent.session_title)
+            pipe.send_text("\x04")
+            await asyncio.wait_for(task, 3)
+
+        asyncio.run(scenario())
+        text = output.getvalue()
+        entry = next(e for e in session.agent.tree.active_branch() if e.kind == "tool")
+        assert f"/details {entry.id}" in text  # 头行引用的是入口 id
+        assert "line-29" not in text  # 头行只折叠前几行
+        assert "line-29" in _details(session._command_context(), str(entry.id))
 
 
 def test_escape_preserves_draft_and_completed_tool_result(tmp_path):
@@ -419,7 +500,7 @@ def test_narrow_status_preserves_mode_and_interrupt(tmp_path):
         box._state = {"busy": True, "mode": "plan", "model": "very-long-model-name"}
         text = "".join(fragment for _, fragment in box._bottom_bar())
         assert get_cwidth(text) <= 40
-        assert "esc to interrupt" in "".join(t for _, t in box._working_bar())
+        assert t("ui.input.hint_interrupt") in "".join(frag for _, frag in box._working_bar())
         assert "plan" in text
         assert "very-long-model-name" not in text
 
@@ -552,20 +633,75 @@ def test_manual_rename_wins_over_pending_generated_title(tmp_path, monkeypatch):
         asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("command", ["/new", "/clear", "/reset"])
-def test_session_commands_wipe_screen_before_welcome(tmp_path, command):
-    """/new /clear /reset 清屏后重印启动区：终端像刚启动的新会话。"""
+@pytest.mark.parametrize("command", ["/new", "/reset"])
+def test_session_commands_keep_scrollback(tmp_path, command):
+    """/new /reset 只擦可见屏：terminal scrollback 保留，往回滚仍可核对旧输出。"""
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
         # 清屏走 rich Control.clear()，只在终端上输出 ANSI：测试用强制终端捕获。
         session.renderer._console = Console(file=output, force_terminal=True)
         output.write("旧输出\n")
         session._local(command)
         wiped = output.getvalue()
-        assert "\x1b[2J" in wiped  # rich Control.clear()：擦全屏 + 光标归位
-        assert "\x1b[3J" in wiped  # E3：连终端 scrollback 一起清空，回滚看不到旧内容
+        assert "\x1b[2J" in wiped  # 擦可见屏
+        assert "\x1b[3J" not in wiped  # 不清 scrollback
         assert wiped.index("\x1b[2J") < wiped.index("polya · v")  # 先清屏，再印 banner
         assert "和你一起理解" in wiped
-        assert "旧输出" not in wiped[wiped.index("\x1b[2J") :]  # 旧内容只留在清屏之前
+
+
+def test_clear_command_wipes_scrollback(tmp_path):
+    """/clear 是显式清屏：连终端 scrollback 一并清空（回看不再可见）。"""
+    with session_for(tmp_path, FakeLLM([])) as (session, _, output):
+        session.renderer._console = Console(file=output, force_terminal=True)
+        output.write("旧输出\n")
+        session._local("/clear")
+        wiped = output.getvalue()
+        assert "\x1b[2J" in wiped
+        assert "\x1b[3J" in wiped  # E3：连 scrollback 一起清空
+        assert wiped.index("\x1b[2J") < wiped.index("polya · v")
+        assert "和你一起理解" in wiped
+
+
+def test_paste_handler_lists_shows_expands_and_drops(tmp_path):
+    """票 08：/paste 可列/看全文/展开到编辑器/删除折叠块。"""
+    from prompt_toolkit.document import Document
+
+    with session_for(tmp_path, FakeLLM([])) as (session, _, _):
+        original = "alpha\nbeta\ngamma"
+        session.box._pastes.append(original)
+        session.box._tokens.append("[Pasted #1 +3 lines]")
+        session.box._draft = Document("前 [Pasted #1 +3 lines] 后")
+
+        assert "[Pasted #1 +3 lines]" in session._paste_handler("")
+        assert session._paste_handler("show 1") == original
+        assert "已展开" in session._paste_handler("expand 1")
+        assert session.box._draft.text == f"前 {original} 后"
+        assert "超出范围" in session._paste_handler("show 9")
+        assert "用法" in session._paste_handler("nonsense")
+
+
+def test_interrupt_cancels_running_shell(tmp_path):
+    """Esc 立即取消运行中的前台 bash，不等工具返回（票 02）。"""
+
+    class FakeShell:
+        busy = True
+        canceled = False
+
+        def cancel(self) -> bool:
+            self.canceled = True
+            return True
+
+    with session_for(tmp_path, FakeLLM([])) as (session, _, _):
+        shell = FakeShell()
+        session.agent.shell_session = shell
+        session.state["busy"] = True
+        session.interrupt()
+        assert session.stop.is_set() and shell.canceled
+        # 无运行中命令时不去打扰（保留会话环境）
+        shell.busy = False
+        shell.canceled = False
+        session.stop.clear()
+        session.interrupt()
+        assert not shell.canceled
 
 
 def test_interrupt_returns_queued_messages_to_editor(tmp_path):
@@ -620,10 +756,39 @@ def test_queued_supplement_receives_delivery_receipt(tmp_path):
     with session_for(tmp_path, FakeLLM([])) as (session, _, output):
         session.state["busy"] = True
         session._submit_input("keep the interface")
-        assert "下一轮请求前交给模型" in output.getvalue()
+        assert "当前工具批次结束后注入下一轮请求" in output.getvalue()
         session._boundary()
         assert session.agent.history[-1]["content"] == "keep the interface"
-        assert "补充已交给模型" in output.getvalue()
+        assert "已注入上下文" in output.getvalue()
+
+
+def test_exit_does_not_block_on_pending_title(tmp_path, monkeypatch):
+    """退出不等自动标题：临时主题已落盘，在飞的标题请求被取消（票 10）。"""
+    started = threading.Event()
+    release = threading.Event()
+
+    class SlowTitleLLM(FakeLLM):
+        def generate_title(self, message):
+            started.set()
+            release.wait(5)
+            return "慢标题"
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    with session_for(tmp_path, SlowTitleLLM([reply(content="done")])) as (session, pipe, _):
+
+        async def scenario():
+            task = asyncio.create_task(session.run())
+            await until(lambda: session.box._session.app.is_running)
+            pipe.send_text("修复登录\r")
+            await until(started.is_set)
+            await until(lambda: not session.state["busy"])
+            # 标题请求仍在飞：退出应立即返回，不等 20s
+            pipe.send_text("\x04")
+            await asyncio.wait_for(task, 2)
+            assert session.agent.session_title == "修复登录"  # 临时主题兜底
+            release.set()
+
+        asyncio.run(scenario())
 
 
 def test_ctrl_s_callback_sets_default_model(tmp_path, monkeypatch):

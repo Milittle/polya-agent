@@ -184,7 +184,7 @@ def test_no_stream_flag_disables_streaming(tmp_path):
     assert agent.stream is False
 
 
-def test_details_command_dispatches_to_renderer():
+def test_details_command_prefers_session_tree_then_renderer_fallback():
     from io import StringIO
 
     from rich.console import Console
@@ -195,11 +195,17 @@ def test_details_command_dispatches_to_renderer():
         "tool_result",
         {"name": "bash", "call_id": "c1", "result": "完整输出", "duration_s": 0.1, "error": False},
     )
-    # 无参：最近 5 块；带 ID：指定块
-    assert "完整输出" in handle_command("/details", make_agent(), renderer)
-    assert "Ran Bash" in handle_command("/details 1", make_agent(), renderer)
-    # 无渲染器（非终端会话）：给出解释而不是炸
-    assert "No details" in handle_command("/details", make_agent())
+    # 树侧优先（ADR 0005 同源）：ID 就是会话树入口 id
+    agent = make_agent()
+    entry = agent.tree.append("tool", {"tool_call_id": "c1", "content": "树里的完整输出"})
+    assert "树里的完整输出" in handle_command(f"/details {entry.id}", agent, renderer)
+    assert "树里的完整输出" in handle_command("/details", agent, renderer)  # 无参=最近入口
+    # 入口不存在时回退渲染器内存存档（无 agent 的纯渲染路径）
+    from polya.commands import CommandContext, _details
+
+    assert "Ran Bash" in _details(CommandContext(None, renderer), "1")
+    # 无渲染器且无树：给出解释而不是炸
+    assert "No details" in _details(CommandContext(None), "")
     assert "用法" in handle_command("/details x", make_agent(), renderer)
 
 

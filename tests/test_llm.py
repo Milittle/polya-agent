@@ -222,6 +222,34 @@ def fake_llm(monkeypatch):
     return LLM(api_key="k"), completions
 
 
+def test_generate_title_records_usage_separately(monkeypatch):
+    """标题请求用量单独计量，不进 total_usage（票 10）。"""
+    captured: dict = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"title":"会话标题"}'))],
+                usage=SimpleNamespace(prompt_tokens=11, completion_tokens=4),
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def with_options(self, **kwargs):
+            captured["options"] = kwargs
+            return self
+
+    monkeypatch.setattr("polya.llm.OpenAI", FakeClient)
+    llm = LLM(api_key="k")
+    assert llm.title_usage == {}
+    assert llm.generate_title("帮我修登录") == "会话标题"
+    assert llm.title_usage == {"prompt_tokens": 11, "completion_tokens": 4}
+    assert captured["options"] == {"timeout": 20.0, "max_retries": 0}
+
+
 def test_chat_streams_when_on_delta_given(fake_llm):
     llm, completions = fake_llm
     completions.chunks = [

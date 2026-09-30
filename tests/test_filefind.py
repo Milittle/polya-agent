@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from shutil import which
 
@@ -74,3 +75,37 @@ def test_refresh_soon_reindexes_background_writes(tmp_path):
             break
         time.sleep(0.02)
     assert files.search("b.txt") == ["new_b.txt"]
+    # 单飞标志必须复位，否则后续刷新永久静默（票 09 顺带修）
+    (tmp_path / "later_c.txt").write_text("x", encoding="utf-8")
+    files.refresh_soon()
+    for _ in range(200):
+        if "later_c.txt" in files.search("c.txt"):
+            break
+        time.sleep(0.02)
+    assert files.search("c.txt") == ["later_c.txt"]
+
+
+def test_warmup_keeps_first_search_non_blocking(tmp_path, monkeypatch):
+    """预热后首次 search 不阻塞输入线程：未就绪先答空，后台填好后可命中（票 09）。"""
+    files = ProjectFiles(tmp_path)
+    release = threading.Event()
+
+    def slow_rebuild(self):
+        release.wait(2)
+        with self._lock:
+            self._paths = ["a.txt"]
+            self._listed_at = time.monotonic()
+        self._refreshing.clear()
+
+    monkeypatch.setattr(ProjectFiles, "_rebuild", slow_rebuild)
+    files.warmup()
+    assert files.warmed and not files.ready
+    started = time.monotonic()
+    assert files.search("a") == []  # 不阻塞、先答空
+    assert time.monotonic() - started < 0.5
+    release.set()
+    for _ in range(200):
+        if files.ready:
+            break
+        time.sleep(0.01)
+    assert files.ready and files.search("a") == ["a.txt"]

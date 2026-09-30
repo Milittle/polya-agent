@@ -182,12 +182,15 @@ def test_edit_and_remove_entry_change_projection_only():
 
 
 def test_new_clear_reset_all_start_fresh_session():
-    """/new /clear /reset 统一为开新会话：换名 + 清空 + 会话级 restart（旧会话可 /resume）。"""
+    """/new /clear /reset 统一为开新会话：换名 + 清空 + 会话级 restart（旧会话可 /resume）。
+
+    /clear 额外带 wipe_scrollback=True（显式清 scrollback），/new /reset 保留回看。
+    """
     agent = Agent(llm=object(), tools=[])
     calls = []
 
-    def restart() -> str:
-        calls.append(1)
+    def restart(*, wipe_scrollback: bool = False) -> str:
+        calls.append(wipe_scrollback)
         return "（已丢弃 2 条排队消息）"
 
     context = CommandContext(agent, restart=restart)
@@ -199,7 +202,7 @@ def test_new_clear_reset_all_start_fresh_session():
         assert "新会话" in result and "旧会话保留" in result
         names.append(agent.session_name)
 
-    assert calls == [1, 1, 1]
+    assert calls == [True, False, False]
     assert "已丢弃 2 条排队消息" in result
     assert len(set(names)) == 3  # 每次重新分配会话名，旧会话保留在 /resume
 

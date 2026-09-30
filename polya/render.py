@@ -2,7 +2,8 @@
 
 正文按段落边界实时提交进滚动区（原生 scrollback），未完成的尾部留在编辑器
 上方的短尾窗（prompt_toolkit 通过 ``preview()`` 自取）；工具结果一次写入。
-思考与工具结果保留有界归档，供 /details 使用；流式 bash 结果不重复打印。
+思考与工具结果留档供 /details 展开（交互路径经会话树入口 id 定位，见 ADR 0005）；
+流式 bash 结果不重复打印。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 from .i18n import t
+from .tree import KIND_ASSISTANT, KIND_SUMMARY, KIND_SYSTEM, KIND_TOOL, KIND_USER
 
 console = Console()  # stdout：只承载答案与命令输出（-p 可安全重定向/管道）
 ui = Console(stderr=True)  # stderr：状态条 / 日志等“界面”输出
@@ -118,6 +120,19 @@ def _header_arg(name: str, arguments: dict) -> str:
     return _args_preview(arguments)
 
 
+def _parse_arguments(raw: object) -> dict:
+    """工具调用参数（可能已是 dict，也可能是 JSON 串）→ dict；坏输入回空 dict。"""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _thinking_summary(reasoning: str) -> Text:
     """思考标题行（Claude Code 的 ✻ 语汇）：字数，dim italic 单行。
 
@@ -182,7 +197,7 @@ class TerminalRenderer:
         self._tool_dropped = 0  # 尾窗装不下而丢弃的行数（渲染 … 标记用）
         self._reasoning_buf: list[str] = []
         self._text_buf: list[str] = []
-        self._answer_started = False  # 本段正文的 ⏺ 标题是否已打（流式多块只打一次）
+        self._answer_started = False  # 本段正文的 ● 标题是否已打（流式多块只打一次）
         self._in_fence = False  # 正文是否停在代码围栏内（提交切点须避开围栏）
         self._blocks: list[dict] = []  # 滚动区已提交块的留档（/details 用）
         self._max_blocks = 20
@@ -246,7 +261,7 @@ class TerminalRenderer:
         lines = buffer.getvalue().splitlines()
         folded = len(lines) > max_lines or (not text and self._tool_dropped > 0)
         if text:
-            header = "⏺"
+            header = "●"
         elif reasoning and not tool:
             header = t("ui.render.thinking_stream", n=len(reasoning))
         else:
@@ -387,7 +402,7 @@ class TerminalRenderer:
             self._record_block({"kind": "thinking", "content": reasoning})
         content = payload.get("content") or ""
         # 流式期间完整段落已落滚动区，这里只补未提交的尾部；无 delta 的非流式
-        # 回复（text_buf 空且 ⏺ 未打）直接落 content。
+        # 回复（text_buf 空且 ● 未打）直接落 content。
         text = "".join(self._text_buf)
         if text or not self._answer_started:
             self._print_answer(text or content)
@@ -411,14 +426,14 @@ class TerminalRenderer:
         self._text_buf = [text[cut:]] if text[cut:] else []
 
     def _print_answer(self, chunk: str) -> None:
-        """把正文的一块渲染进滚动区；「⏺」标题与工具块后的空行只打一次。"""
+        """把正文的一块渲染进滚动区；「●」标题与工具块后的空行只打一次。"""
         if not chunk.strip():
             return
         if not self._answer_started:
             if self._blocks and self._blocks[-1]["kind"] == "tool":
                 self._console.print()  # 与 ⎿ 块空行分组
             if self.scrollback:
-                self._console.print(Text("⏺", style="cyan"))
+                self._console.print(Text("●", style="cyan"))
             self._answer_started = True
         self._console.print(Markdown(chunk))
 
@@ -466,7 +481,7 @@ class TerminalRenderer:
     def _print_tool_result(self, payload: dict) -> None:
         """Compact completion summary, with a bounded preview and archived details."""
         result = payload.get("result") or ""
-        duration = payload.get("duration_s", 0.0)
+        duration = payload.get("duration_s")
         body, hidden = _collapse(result, self._max_result_lines, self._max_result_chars)
         exit_match = re.search(r"(?:退出码|Exit code) (-?\d+|-)\s*$", result)
         exit_code = exit_match[1] if exit_match else None
@@ -496,10 +511,17 @@ class TerminalRenderer:
             arg = _header_arg(name, self._current_arguments)
             if arg:
                 header.append(f"  {arg[:100]}", style="dim")
-        header.append(f" · {duration}s", style="dim")
+        if duration is not None:
+            header.append(f" · {duration}s", style="dim")
         if exit_code is not None:
             header.append(f" · exit {exit_code}", style="red" if error else "dim")
-        header.append(f" · + Show details: /details {block_id}", style="dim")
+        # 详情 ID 与会话树入口同源（ADR 0005）：驱动层在入口回填后传入 entry_id；
+        # 非交互路径（无树）回退到渲染器内存块号。
+        entry_id = payload.get("entry_id")
+        header.append(
+            f" · + Show details: /details {entry_id if entry_id is not None else block_id}",
+            style="dim",
+        )
         self._console.print(header)
         for line in body.splitlines():
             self._console.print(Text("  " + line, style="red" if error else "dim"))
@@ -528,20 +550,89 @@ class TerminalRenderer:
             return t("ui.render.thinking_full", n=len(content)) + "\n" + content
         name = display_tool_name(block["name"])
         arguments = json.dumps(block["arguments"], ensure_ascii=False, indent=2)
-        return f"{block['status']} {name} · {block['duration_s']}s\n{arguments}\n{block['result']}"
+        duration = block.get("duration_s")
+        when = f" · {duration}s" if duration is not None else ""
+        return f"{block['status']} {name}{when}\n{arguments}\n{block['result']}"
+
+    # ---------- 历史回放（/resume 后看得见内容） ----------
+
+    REPLAY_MAX_ENTRIES = 30
+
+    def replay(self, entries, *, max_entries: int | None = None) -> None:
+        """把恢复的会话入口回放进滚动区，复用实时渲染的同一套块格式。
+
+        user 用 ``❯``、assistant 走 ``_commit``（思考尾窗 + ``●`` + Markdown）、
+        工具结果折叠成 Ran/Failed 摘要（从上游 assistant 的 tool_calls 解析工具名与
+        参数，绑定树入口 id 供 ``/details`` 展开）。历史没有耗时，工具头省略 ``· Ns``。
+
+        有界：入口数超 ``max_entries``（默认 :attr:`REPLAY_MAX_ENTRIES`）时只放最近
+        这批，先打一行 dim 省略提示；更早的可经入口 id 回查。用**原文 payload** 而非
+        投影——回放的是用户当初看到的对话（ADR 0005：投影覆盖不改写原文）。
+        """
+        limit = max(1, max_entries if max_entries is not None else self.REPLAY_MAX_ENTRIES)
+        restored = [entry for entry in entries if entry.kind != KIND_SYSTEM]
+        if not restored:
+            return
+        omitted = max(0, len(restored) - limit)
+        shown = restored[omitted:]
+        if omitted:
+            self._console.print(Text(t("ui.render.replay_omitted", count=omitted), style="dim"))
+        calls: dict[str, tuple[str, dict]] = {}
+        for entry in shown:
+            payload = entry.payload
+            if entry.kind == KIND_ASSISTANT:
+                for call in payload.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function") or {}
+                    identifier = str(call.get("id") or "")
+                    if identifier:
+                        calls[identifier] = (
+                            str(function.get("name") or "?"),
+                            _parse_arguments(function.get("arguments")),
+                        )
+                self._commit(
+                    {
+                        "reasoning": payload.get("reasoning_content"),
+                        "content": payload.get("content"),
+                    }
+                )
+            elif entry.kind == KIND_USER:
+                content = str(payload.get("content") or "")
+                if content:
+                    self._console.print(Text("❯ " + content, style="cyan"))
+            elif entry.kind == KIND_TOOL:
+                name, arguments = calls.get(str(payload.get("tool_call_id") or ""), ("?", {}))
+                self._current_arguments = arguments
+                result = str(payload.get("content") or "")
+                self._print_tool_result(
+                    {
+                        "name": name,
+                        "result": result,
+                        "duration_s": None,
+                        "error": result.startswith("Error"),
+                        "entry_id": entry.id,
+                    }
+                )
+            elif entry.kind == KIND_SUMMARY:
+                content = str(payload.get("content") or "")
+                if content:
+                    self._console.print()
+                    self._console.print(Text(t("ui.render.replay_summary"), style="dim"))
+                    self._console.print(Markdown(content))
 
     # ---------- 状态标签（preview 头行用） ----------
 
     def _status_label(self) -> str:
         if self.phase == PHASE_TOOL:
-            return f"Running {display_tool_name(self.current_tool or '')}"
+            return t("ui.status.running_tool", tool=display_tool_name(self.current_tool or ""))
         if self.phase == "reviewing":
-            return "Reviewing"
+            return t("ui.status.reviewing")
         if self.phase == PHASE_STREAMING:
-            return "Responding"
+            return t("ui.status.responding")
         if self._reasoning_buf:
-            return "Thinking"
-        return "Waiting for model"
+            return t("ui.status.thinking")
+        return t("ui.status.waiting_model")
 
     # ---------- 生命周期 ----------
 
@@ -560,6 +651,6 @@ class TerminalRenderer:
         self._answer_started = False
         self._in_fence = False
         if partial.strip():
-            self._console.print(Text("⏺ Partial response", style="dim"))
+            self._console.print(Text("● Partial response", style="dim"))
             self._console.print(Markdown(partial))
         self.on_status(self)

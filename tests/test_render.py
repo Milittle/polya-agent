@@ -6,7 +6,9 @@ from io import StringIO
 
 from rich.console import Console
 
+from polya.i18n import t
 from polya.render import TerminalRenderer, _collapse
+from polya.tree import SessionTree
 
 
 def make_renderer(**kwargs) -> tuple[TerminalRenderer, StringIO]:
@@ -47,7 +49,7 @@ def test_collapse_limits_lines_and_chars():
     assert _collapse("", 8, 600) == ("", 0)
 
 
-# ---------- 滚动区：工具块（Claude Code 树形：⏺ 头 + ⎿ 结果） ----------
+# ---------- 滚动区：工具块（Claude Code 树形：● 头 + ⎿ 结果） ----------
 
 
 def test_tool_block_header_and_collapsed_result():
@@ -179,7 +181,7 @@ def test_answer_header_printed_once_across_streamed_blocks():
 
     renderer.update("text_delta", {"delta": "一\n\n二\n\n三"})
     renderer.update("assistant_message", {"content": "一\n\n二\n\n三"})
-    assert output.getvalue().count("⏺") == 1  # 多块正文共用一个 ⏺ 标题
+    assert output.getvalue().count("●") == 1  # 多块正文共用一个 ● 标题
 
 
 # ---------- 工具头行：按工具特化的人话参数 ----------
@@ -207,13 +209,13 @@ def test_header_arg_specializes_by_tool():
 def test_status_label_migrates_with_phase():
     renderer, _buf = make_renderer()
     renderer.update("iteration", {"step": 1, "max_steps": 25})
-    assert renderer._status_label() == "Waiting for model"
+    assert renderer._status_label() == t("ui.status.waiting_model")
 
     renderer.update("text_delta", {"delta": "答案"})
-    assert renderer._status_label() == "Responding"
+    assert renderer._status_label() == t("ui.status.responding")
 
     feed_tool_call(renderer)
-    assert renderer._status_label() == "Running Bash"
+    assert renderer._status_label() == t("ui.status.running_tool", tool="Bash")
 
 
 def test_thinking_tail_renders_dim_italic_header_and_lines():
@@ -239,7 +241,7 @@ def test_thinking_tail_yields_to_tool_then_text():
     feed_tool_call(renderer, name="read_file", arguments={"path": "a.py"})
     preview = renderer.preview(80)
     assert "正在推理" not in preview  # 工具执行时不显示上一段思考
-    assert "Running Read File" in preview
+    assert t("ui.status.running_tool", tool="Read File") in preview
 
     renderer.update("text_delta", {"delta": "答案"})
     preview = renderer.preview(80)
@@ -397,7 +399,7 @@ def test_interrupted_live_thinking_does_not_leak_into_next_task():
     # has_preview 现在包含 reasoning：中断后必须显式清，否则半截思考挂在尾窗。
     assert not renderer.has_preview
     assert renderer.preview(80) == ""
-    assert renderer._status_label() == "Waiting for model"
+    assert renderer._status_label() == t("ui.status.waiting_model")
     with renderer:
         renderer.update("iteration", {"step": 1})
         renderer.update("reasoning_delta", {"delta": "新一轮思考"})
@@ -407,7 +409,7 @@ def test_interrupted_live_thinking_does_not_leak_into_next_task():
 def test_plan_submitted_prints_plan_to_scrollback():
     renderer, output = make_renderer()
     renderer.update("plan_submitted", {"plan": "## 步骤\n1. 读文件"})
-    assert renderer._status_label() == "Waiting for model"
+    assert renderer._status_label() == t("ui.status.waiting_model")
     assert "计划已提交" in output.getvalue()
     assert "读文件" in output.getvalue()
 
@@ -455,7 +457,60 @@ def test_no_progress_renders_dim_notice():
         {"tool": "read_file", "arguments": {}, "count": 4, "phase": "stopped"},
     )
     out = buf.getvalue()
-    from polya.i18n import t
-
     assert t("ui.render.no_progress_nudged", tool="read_file", count=3) in out
     assert t("ui.render.no_progress_stopped", tool="read_file", count=4) in out
+
+
+# ---------- 历史回放（/resume 后看得见内容） ----------
+
+
+def _restored_tree() -> SessionTree:
+    tree = SessionTree()
+    tree.reset_with_system("sys")
+    tree.append("user", {"content": "修复登录"})
+    tree.append(
+        "assistant",
+        {
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "bash", "arguments": '{"command": "pytest"}'}}
+            ],
+        },
+    )
+    tree.append("tool", {"tool_call_id": "c1", "content": "ok"})
+    tree.append("assistant", {"content": "已完成", "reasoning_content": "想想看"})
+    return tree
+
+
+def test_replay_renders_restored_conversation():
+    renderer, buf = make_renderer()
+    renderer.use_scrollback(renderer._console)
+    renderer.replay(_restored_tree().active_branch())
+
+    out = buf.getvalue()
+    assert "sys" not in out  # system 入口不回放
+    assert "❯ 修复登录" in out
+    assert "已完成" in out and "想想看" in out
+    assert "Ran Bash" in out and "pytest" in out
+    assert "/details 4" in out  # tool 入口 id 绑定到 /details
+    assert "0.0s" not in out  # 历史无耗时，不印 · Ns
+
+
+def test_replay_bounded_notes_omission():
+    tree = SessionTree()
+    tree.reset_with_system("sys")
+    for index in range(5):
+        tree.append("user", {"content": f"q{index}"})
+
+    renderer, buf = make_renderer()
+    renderer.replay(tree.active_branch(), max_entries=3)
+    out = buf.getvalue()
+    assert "已省略更早 2 条入口" in out
+    assert "❯ q2" in out and "❯ q4" in out
+    assert "q0" not in out and "q1" not in out
+
+
+def test_replay_empty_branch_prints_nothing():
+    renderer, buf = make_renderer()
+    renderer.replay([])
+    assert buf.getvalue() == ""

@@ -66,20 +66,21 @@ def _result_summary(result: str, duration: float, limit: int = 80) -> str:
     return f"{first} · {round(duration, 2)}s"
 
 
-def run_tool_call(
+def _run_tool(
     agent: Agent,
     renderer: TerminalRenderer | None,
     ev: ToolCall,
-    reviewer: Reviewer | None = None,
+    reviewer: Reviewer | None,
     *,
-    origin: str | None = None,
-    progress: Callable[[str], None] | None = None,
-) -> str:
-    """一次工具调用的驱动侧处理：渲染 → 审查 → 执行 → 渲染结果。
+    origin: str | None,
+    progress: Callable[[str], None] | None,
+) -> tuple[str, dict | None]:
+    """审查 + 执行一次工具调用，并发渲染事件（tool_review / tool_call）。
 
-    审查器（review.py）默认放行；deny 只作为工具结果回传模型，不弹窗、不让位。
-    ``progress`` 为 None（父会话）：三个渲染事件全发；非 None（子代理路径）：
-    不发渲染事件，改用 ``progress`` 输出进度行与结果摘要。
+    返回 ``(result, tool_result 载荷)``。载荷的 ``entry_id`` 留空，由 \
+    `run_task` 在生成器回填入口后绑定真实的树入口 id（ADR 0005 同源）；
+    子代理路径（``progress`` 非 None）不产载荷，只发进度行。
+    审查器（review.py）默认放行；deny 只作为工具结果回传模型，不弹窗。
     """
     if reviewer is None:
         reviewer = agent.reviewer
@@ -100,18 +101,38 @@ def run_tool_call(
             result, duration = outcome.reason or "Error: Tool call denied", 0.0
     if progress is not None:
         progress(f"← {ev.name} {_result_summary(result, duration)}")
-    elif renderer is not None:
-        renderer.update(
-            "tool_result",
-            {
-                "name": ev.name,
-                "call_id": ev.call_id,
-                "result": result,
-                "duration_s": round(duration, 3),
-                "error": result.startswith("Error"),
-                "denied": item is not None and not approved,
-            },
-        )
+        return result, None
+    payload = {
+        "name": ev.name,
+        "call_id": ev.call_id,
+        "result": result,
+        "duration_s": round(duration, 3),
+        "error": result.startswith("Error"),
+        "denied": item is not None and not approved,
+        "entry_id": None,
+    }
+    return result, payload
+
+
+def run_tool_call(
+    agent: Agent,
+    renderer: TerminalRenderer | None,
+    ev: ToolCall,
+    reviewer: Reviewer | None = None,
+    *,
+    origin: str | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> str:
+    """一次工具调用的驱动侧处理：渲染 → 审查 → 执行 → 渲染结果。
+
+    内置驱动 / 子代理共用；交互驱动走 \
+    `run_task`（把结果渲染延后到入口回填后，带上 entry_id）。
+    """
+    result, payload = _run_tool(
+        agent, renderer, ev, reviewer, origin=origin, progress=progress
+    )
+    if payload is not None and renderer is not None:
+        renderer.update("tool_result", payload)
     return result
 
 
@@ -136,6 +157,24 @@ def run_task(
     gen = agent.steps(text)
     to_send = None
     outcome = "final"
+    pending_result: dict | None = None
+
+    def _entry_id_for(call_id: str) -> int | None:
+        for entry in reversed(agent.tree.active_branch()):
+            if entry.kind == "tool" and entry.payload.get("tool_call_id") == call_id:
+                return entry.id
+        return None
+
+    def flush_result() -> None:
+        """回填后渲染上一次工具结果，并绑定稳定的树入口 id（ADR 0005）。"""
+        nonlocal pending_result
+        if pending_result is None:
+            return
+        payload = pending_result
+        pending_result = None
+        payload["entry_id"] = _entry_id_for(str(payload.get("call_id") or ""))
+        renderer.update("tool_result", payload)
+
     try:
         with renderer:
             while True:
@@ -144,7 +183,9 @@ def run_task(
                 try:
                     ev = gen.send(to_send)
                 except StopIteration:
+                    flush_result()
                     return outcome
+                flush_result()  # 生成器已回填工具入口：补渲结果并绑定 entry id
                 to_send = None
                 if stop is not None and stop.is_set():
                     raise InterruptedError("用户请求中断")
@@ -166,7 +207,9 @@ def run_task(
                     renderer.update(ev.event, event_payload(ev))
                     to_send = on_boundary()
                 elif isinstance(ev, ToolCall):
-                    to_send = run_tool_call(agent, renderer, ev, reviewer)
+                    to_send, pending_result = _run_tool(
+                        agent, renderer, ev, reviewer, origin=None, progress=None
+                    )
                 elif isinstance(ev, PlanSubmitted):
                     renderer.update("plan_submitted", {"plan": ev.plan})
                     if on_plan is not None:
@@ -370,15 +413,18 @@ class InteractiveSession:
         self.state.update(
             busy=True,
             stopping=False,
-            status="Waiting for model",
+            status=t("ui.status.waiting_model"),
             started_at=time.monotonic(),
         )
 
     def interrupt(self) -> None:
-        """Esc：请求中断当前任务；停止后队列里的消息回到编辑器（pi 语义）。"""
+        """Esc：请求中断当前任务；立即取消运行中的前台 bash，不必等工具返回（票 02）。"""
         if self.state["busy"]:
             self.stop.set()
             self.state["stopping"] = True
+            shell = getattr(self.agent, "shell_session", None)
+            if shell is not None and shell.busy:
+                shell.cancel()  # SIGINT 前台命令；必要时下次 bash 自动重启会话
             self.box._session.app.invalidate()
 
     def _sync_queue_state(self) -> None:
@@ -428,6 +474,81 @@ class InteractiveSession:
         self._sync_queue_state()
         return "\n".join(items)
 
+    def _queue_handler(self, arg: str) -> str:
+        """/queue：列出排队消息（序号/类型/摘要/送达时点）；drop N 丢弃，take N 取回编辑。"""
+        parts = arg.split()
+        action = parts[0] if parts else "list"
+        with self.lock:
+            combined = [("steering", item) for item in self.steering] + [
+                ("follow_up", item) for item in self.follow_up
+            ]
+        if action == "list":
+            if not combined:
+                return t("ui.loop.queue_empty")
+            lines = [t("ui.loop.queue_header")]
+            for index, (kind, text) in enumerate(combined, 1):
+                steering = kind == "steering"
+                suffix = "steering" if steering else "followup"
+                label = t(f"ui.loop.queue_kind_{suffix}")
+                when = t(f"ui.loop.queue_when_{suffix}")
+                lines.append(f"  {index}. [{label}] {text.replace(chr(10), ' ')[:60]} · {when}")
+            return "\n".join(lines)
+        if action in ("drop", "take") and len(parts) == 2 and parts[1].isdigit():
+            index = int(parts[1])
+            if not 1 <= index <= len(combined):
+                return t("ui.loop.queue_index_invalid", count=len(combined))
+            _, removed = combined.pop(index - 1)
+            with self.lock:
+                self.steering = deque(text for k, text in combined if k == "steering")
+                self.follow_up = deque(text for k, text in combined if k == "follow_up")
+            self._sync_queue_state()
+            summary = removed.replace("\n", " ")[:60]
+            if action == "take":
+                # 命令可能在 worker 线程（空闲时）；编辑器改动回主循环线程。
+                self._edit_on_main(lambda: self.box.insert_pending(removed))
+                return t("ui.loop.queue_recalled_one", text=summary)
+            return t("ui.loop.queue_dropped_one", text=summary)
+        return t("ui.loop.queue_usage")
+
+    def _edit_on_main(self, fn) -> None:
+        """在主循环线程执行编辑器改动（命令可能跑在 worker 线程）。"""
+        if self.loop is not None and threading.get_ident() != self._loop_thread:
+            self.loop.call_soon_threadsafe(fn)
+        else:
+            fn()
+
+    def _paste_handler(self, arg: str) -> str:
+        """/paste：列出折叠块、看全文、展开到编辑器或删除（票 08）。"""
+        parts = arg.split()
+        action = parts[0] if parts else "list"
+        if action == "list":
+            blocks = self.box.paste_blocks()
+            if not blocks:
+                return t("ui.loop.paste_empty")
+            lines = [t("ui.loop.paste_header")]
+            for index, token, line_count, preview in blocks:
+                lines.append(f"  {index}. {token} · {line_count} lines\n     {preview}")
+            return "\n".join(lines)
+        if action in ("show", "expand", "drop") and len(parts) == 2 and parts[1].isdigit():
+            index = int(parts[1])
+            content = self.box.paste_text(index)
+            placeholder = self.box.paste_token(index)
+            if content is None or placeholder is None:
+                return t("ui.loop.paste_index_invalid", count=len(self.box.paste_blocks()))
+            if action == "show":
+                return content
+            if placeholder not in self.box.current_text():
+                return t("ui.loop.paste_token_missing")
+            replacement = content if action == "expand" else ""
+
+            def apply() -> None:
+                self.box.apply_text(lambda text: text.replace(placeholder, replacement, 1))
+
+            self._edit_on_main(apply)
+            key = "ui.loop.paste_expanded" if action == "expand" else "ui.loop.paste_dropped"
+            return t(key, index=index)
+        return t("ui.loop.paste_usage")
+
     def _command_context(self) -> CommandContext:
         return CommandContext(
             self.agent,
@@ -435,6 +556,8 @@ class InteractiveSession:
             restart=self._restart,
             in_terminal=self._borrow_terminal,  # /login 向导借道终端让位
             rename=self._rename,
+            queue=self._queue_handler,
+            paste=self._paste_handler,
         )
 
     def _rename(self, topic: str) -> str:
@@ -446,7 +569,7 @@ class InteractiveSession:
         self.box._session.app.invalidate()
         return t("ui.loop.topic_updated", topic=topic)
 
-    def _restart(self) -> str:
+    def _restart(self, wipe_scrollback: bool = False) -> str:
         """/new 的会话级重置：清屏重印启动区、主题、标题、计划与排队消息。"""
         self._title_epoch += 1
         self._title_generated = False
@@ -459,14 +582,14 @@ class InteractiveSession:
             self.steering.clear()
             self.follow_up.clear()
         self._sync_queue_state()
-        # 清屏再重印启动区：/new /clear /reset 后终端像刚启动的新会话，旧输出
-        # 不留在滚动区。rich clear() 只擦可见屏（\x1b[2J + 光标归位），终端
-        # scrollback 里旧内容仍在、往回滚还看得到，故追加 E3（\x1b[3J，
-        # Erase Saved Lines）连滚动区一并清空。经 patched stdout 写出会先擦除
-        # 输入区、写完再重绘，输入框与状态栏回到屏幕底部（见
-        # issues/10-fixed-bottom-tui.md 的全屏方案）。
+        # 清屏再重印启动区：/new /reset 只擦可见屏（rich clear() = \x1b[2J +
+        # 光标归位），终端 scrollback 保留、往回滚仍可核对旧输出；/clear 是显式
+        # 清屏，额外追加 E3（\x1b[3J，Erase Saved Lines）连滚动区一并清空。经
+        # patched stdout 写出会先擦除输入区、写完再重绘，输入框与状态栏回到屏幕
+        # 底部（见 issues/10-fixed-bottom-tui.md 的全屏方案）。
         self.renderer._console.clear()
-        self.renderer._console.file.write("\x1b[3J")
+        if wipe_scrollback:
+            self.renderer._console.file.write("\x1b[3J")
         print_welcome(
             self.renderer._console,
             project_memory=self.agent.project_memory,
@@ -481,7 +604,7 @@ class InteractiveSession:
                 self._run_command(text, command)
             return True
         if text.startswith("!") and len(text) > 1:
-            self.state["status"] = "Running Bash"
+            self.state["status"] = t("ui.status.running_tool", tool="Bash")
             _run_shell_bang(self.agent, self.root, text[1:].strip(), self.say)
             return True
         if text.startswith("#") and len(text) > 1:
@@ -500,7 +623,9 @@ class InteractiveSession:
             if not self._local(text):
                 self.agent.append_user_message(text)
                 self.say("❯ " + text, "cyan")
-                self.say(t("ui.loop.steering_delivered"), "dim")
+                self.say(
+                    t("ui.loop.steering_delivered", text=text.replace("\n", " ")[:60]), "dim"
+                )
 
     def _borrow_terminal(self, callback):
         if self.stop.is_set() or self.closing:
@@ -600,6 +725,7 @@ class InteractiveSession:
             return
         if command.name in (
             "/new",
+            "/clear",
             "/resume",
             "/fork",
             "/clone",
@@ -796,16 +922,10 @@ class InteractiveSession:
                 await command
             if pending_title is not None:
                 self._apply_generated_title(*pending_title)
-            for title_task, epoch in title_tasks.items():
-                if epoch != self._title_epoch or self._title_generated:
-                    title_task.cancel()
-                    continue
-                try:
-                    title = await asyncio.wait_for(title_task, timeout=21.0)
-                except Exception:  # noqa: BLE001 - 退出仍以已落盘的临时主题兜底
-                    continue
-                if isinstance(title, str) and title:
-                    self._apply_generated_title(epoch, title)
+            # 退出不等标题：临时主题已落盘，装饰性请求不拦退出（票 10）。在飞的
+            # 标题任务直接取消；to_thread 的底层请求无法中断，但不再阻塞退出。
+            for title_task in title_tasks:
+                title_task.cancel()
             if title_tasks:
                 await asyncio.gather(*title_tasks, return_exceptions=True)
             self.renderer.on_status = lambda renderer: None
@@ -824,6 +944,7 @@ def run_repl(agent: Agent, root: str, renderer: TerminalRenderer) -> None:
                 trusted=agent.trusted,
             )
             box = InputBox(files=ProjectFiles(Path(root)))
+            box._files.warmup()  # 后台预热 @ 索引，首帧输入不阻塞（票 09）
             asyncio.run(InteractiveSession(agent, root, renderer, box).run())
         return
 

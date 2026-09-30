@@ -32,9 +32,10 @@ cp .env.example .env
 # edit .env: OPENAI_API_KEY (and optionally OPENAI_BASE_URL / OPENAI_MODEL)
 ```
 
-Prompts and user-facing messages are localized via `POLYA_LANG` (`zh` default, `en`
-available). The prompts are evaluated at import time, so the choice is stable for the
-whole session and the KV-cache prefix stays intact.
+Interface language resolves as `POLYA_LANG` > `"language"` in
+`~/.polya/settings.json` > `en` default (`zh` available); model-side prompts stay
+English regardless. The prompts are evaluated at import time, so the choice is stable
+for the whole session and the KV-cache prefix stays intact.
 
 For multiple providers or coding plans, log in entirely inside the REPL. `/login`
 opens the provider list (first batch: OpenRouter, DeepSeek, z.ai global/CN,
@@ -80,14 +81,14 @@ Useful flags: `--root DIR` (working dir; file tools are jailed inside), `--plan`
 |---|---|
 | `Enter` | send (steering: injected before the next model request) |
 | `Alt+Enter` | queue a follow-up (runs after the current task) · `Ctrl+J` / trailing `\` + Enter: newline |
-| `/help` `/todos` `/status` `/plan on\|go\|off` `/login [provider\|custom]` `/logout <provider>` `/model [provider/model]` `/thinking [level]` `/compact [note]` `/details [ID]` `/resume [name]` `/fork <id>` `/clone` `/export [path]` `/import <path>` `/trust [decision]` `/new` `/clear` `/reset` `/exit` | slash commands (`/` completes with descriptions) |
+| `/help` `/todos` `/status` `/queue [list\|drop N\|take N]` `/paste [list\|show N\|expand N\|drop N]` `/plan on\|go\|off` `/login [provider\|custom]` `/logout <provider>` `/model [provider/model]` `/thinking [level]` `/compact [note]` `/details [ID]` `/resume [name]` `/fork <id>` `/clone` `/export [path]` `/import <path>` `/trust [decision]` `/new` `/reset` `/clear` `/exit` | slash commands (`/` completes with descriptions) |
 | `@` | file-path completion |
 | `!command` | run a shell command locally; output goes into the conversation |
 | `#note` | append a line to the project memory file (`AGENTS.md`) |
-| `Esc` | close completion, or request task interruption; queued messages return to the editor |
+| `Esc` | close completion, or request task interruption (a running `bash` is cancelled immediately); queued messages return to the editor |
 | `Alt+Up` | pull queued messages back into the editor |
 | `Ctrl+C` | clears the input; press twice within 2s on an empty box to quit |
-| big paste | folds to `[Pasted #1 +200 lines]`, expanded again on submit |
+| big paste | folds to `[Pasted #1 +200 lines]`, expanded again on submit; `/paste` inspects, expands or drops a block |
 
 `/plan`, `/login`, `/logout` and `/model` without arguments open options in the
 input box; the current value is marked. `Ctrl+S` inside the `/model` picker saves
@@ -95,19 +96,25 @@ the highlighted model as the default startup model. Choose with arrows and
 Tab/Enter, then Enter to execute; Esc closes the menu. You can also type
 `/plan on|go|off`, `/login zai`, `/logout zai` or `/model zai/glm-5.3` directly,
 with argument completion. Invalid commands and arguments stay in the
-editor with a hint; `/details [ID]` takes an optional positive integer (no argument shows
-the last five blocks).
+editor with a hint; `/details [ID]` takes an optional positive integer that is a
+**session-tree entry id** (no argument shows the most recent tool/assistant entries).
 `/help` lists all commands and aliases from the same flat registry. Commands run
-immediately; the ones that rewrite the session (`/new`, `/exit`, `/compact`,
-`/rewind`, `/jump`, `/edit`, `/load`, `/resume`, `/fork`, `/clone`, `/import`, `/model`, `/reload`, `/save`)
-need an idle agent
+immediately; the session-mutating and mode-switching ones (`/new`, `/clear`, `/exit`,
+`/compact`, `/rewind`, `/jump`, `/edit`, `/load`, `/resume`, `/fork`, `/clone`,
+`/import`, `/model`, `/reload`, `/save`, `/plan`, `/thinking`, `/rename`, `/sessions`,
+`/tree`, `/export`) need an idle agent
 and ask you to press Esc first when a task is running. In a piped REPL, supply options
 explicitly.
 
 **Sessions** get a stable name and metadata (title, created/updated, cwd) and are
 auto-saved to `~/.polya/sessions/<name>.jsonl` after every task (including one-shot
-`-p` runs) so `/resume` lists conversations you actually had. `/resume` with no argument opens a picker in the input
-box (title · name · updated); `/resume <name>` switches directly. `/fork <id>` derives a
+`-p` runs) so `/resume` lists conversations you actually had. An auto-created session
+is renamed to a topic-derived slug once the first task sets the topic, so the name
+and topic match; `/save <name>` and `/resume` lock the name. `/resume` with no argument opens a picker in the input
+box (topic · time); `/resume <name>` switches directly. Restoring **replays the
+conversation into the scrollback** (user turns, answers, collapsed tool summaries),
+so you can see what the session contained; only the latest 30 entries are shown, with
+a dim omission notice for the rest. `/fork <id>` derives a
 new session from the ancestor path up to entry `#id` (`/tree` shows ids); `/clone`
 duplicates the current session. Switching resets stats, todos and file tracking so
 sessions never bleed into each other. `/export [path]` writes the active branch as
@@ -120,9 +127,12 @@ rebuilt, honoring `compaction` and `context_edit`).
 per-vendor (`reasoning_effort` for o-series/gpt-5, `thinking` toggle for GLM/DeepSeek);
 models whose profile has no reasoning style report that no level is available.
 
-`/new` (aliases `/clear`, `/reset`) starts a fresh session: the conversation —
+`/new` (alias `/reset`) starts a fresh session: the conversation —
 history, todos, stats — is replaced, a new session name is assigned, the topic resets
 (re-derived from the next task), queued messages are dropped and the banner reprints.
+The visible screen is cleared but the terminal scrollback is kept, so you can still
+scroll back to the previous session. `/clear` is a separate explicit command that
+also wipes the scrollback.
 The previous session is kept on disk and can be recovered with `/resume`.
 
 **Project memory**: if the working directory is trusted and has an `AGENTS.md`, it is
@@ -189,8 +199,10 @@ scrollback and ends the turn; `plan_mode` stays on. Reply with `/plan go` (or an
 `批准`/`go`-style approval) to execute, or send any other message to keep revising the
 plan read-only.
 
-**Interrupts**: `Esc` requests a stop at the next event boundary. A running tool or
-model request may need to finish first. Completed steps stay in history, pending tool
+**Interrupts**: `Esc` requests a stop at the next event boundary and immediately
+cancels a running foreground `bash` (SIGINT to the shell's process group; the session
+auto-restarts on the next `bash` call). A model request may need to finish first.
+Completed steps stay in history, pending tool
 results are back-filled, and queued messages return to the editor. `Ctrl+C` edits/quits
 the input; `-p` retains Ctrl+C interruption.
 
@@ -207,7 +219,7 @@ holds mode and queue state on the left and context-sensitive action hints on the
 right. Narrow terminals drop provider, thinking, branch, topic and usage details in
 that order, always keeping the model, project name and mode.
 `/rename <topic>` changes the topic and terminal title (one line, up to 120 characters).
-`/new` (and its aliases `/clear`, `/reset`) resets the topic. In interactive mode,
+`/new` (and `/reset`) resets the topic. In interactive mode,
 the first task supplies a provisional topic; a separate asynchronous model request
 generates a concise title and saves it with the session. One-shot `-p` generates the
 title before saving. Manual `/rename` takes precedence.
@@ -215,8 +227,9 @@ title before saving. Manual `/rename` takes precedence.
 You can keep typing while the agent runs. `Enter` sends a **steering** message: it is
 injected before the next model request, after **all** results of the current tool batch
 are recorded. `Alt+Enter` queues a **follow-up** that runs after the current task ends.
-`Alt+Up` pulls queued messages back into the editor; Esc-aborting does the same.
-`/new` (and its aliases `/clear`, `/reset`), `/exit` and `/quit` need an idle agent — press Esc first.
+`Alt+Up` pulls queued messages back into the editor; Esc-aborting does the same, and
+`/queue` lists, drops or recalls individual items.
+`/new` (and `/reset`), `/clear`, `/exit` and `/quit` need an idle agent — press Esc first.
 Enter selects a completion when its menu is open; otherwise it
 submits at the end of the buffer or inserts a newline inside the text.
 
@@ -233,7 +246,8 @@ model`, `Thinking`, `Responding`, `Running …`, or `Reviewing`.
 Tool changes do not reset the task timer. `Stopping` identifies the activity being
 waited on. Each model task leaves a turn-ended, interrupted or failed receipt
 with duration; turn-ended does not claim that the requested goal was achieved.
-The most recent 20 blocks are retained; expired IDs report unavailable.
+The most recent entries are retained through the session tree, so early tool output
+stays retrievable and survives `/resume`; `/details ID` uses the tree entry id.
 With completions open, Esc closes them first. Streaming text appears before a newline
 in a live Markdown tail above the input (up to eight content lines, fewer on short
 terminals). Completed messages retain full table, list and code-block formatting.

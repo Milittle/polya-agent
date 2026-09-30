@@ -14,6 +14,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from polya.filefind import ProjectFiles
+from polya.i18n import t
 from polya.input import (
     KEY_HINTS,
     PASTE_FOLD_THRESHOLD,
@@ -294,7 +295,7 @@ def test_slash_completer_matches_case_insensitive():
 
 
 def test_slash_completer_alias_yields_canonical_name():
-    completions = list(SlashCompleter().get_completions(Document("/qu"), None))
+    completions = list(SlashCompleter().get_completions(Document("/qui"), None))
     assert [c.text for c in completions] == ["/exit"]  # 别名不单列菜单行
     assert "/quit" in "".join(str(completions[0].display_meta))  # 别名标注在 meta
 
@@ -332,6 +333,26 @@ def test_at_completer_respects_gitignore_and_lists_hidden(tmp_path):
     assert "ignored/secret.py" not in texts
     texts = [c.text for c in completer.get_completions(Document("@"), None)]
     assert ".hidden" in texts  # 未入 ignore 的隐藏文件照常出现
+
+
+def test_paste_blocks_listing_and_expand_text(tmp_path):
+    """票 08：折叠块可列出/看全文，apply_text 可把占位符换成原文。"""
+    with make_box(tmp_path) as (box, _):
+        original = big_paste()
+        box._pastes.append(original)
+        box._tokens.append("[Pasted #1 +15 lines]")
+        blocks = box.paste_blocks()
+        assert blocks[0][0] == 1
+        assert blocks[0][1] == "[Pasted #1 +15 lines]"
+        assert blocks[0][2] == 15
+        assert box.paste_text(1) == original
+        assert box.paste_text(2) is None
+
+        box._draft = Document("请看 [Pasted #1 +15 lines] 谢谢")
+        box.apply_text(lambda text: text.replace("[Pasted #1 +15 lines]", original, 1))
+        assert "line-14" in box._draft.text
+        # 已展开：提交时不再二次替换
+        assert box._expand_pastes(box._draft.text) == box._draft.text
 
 
 def test_at_completer_ignores_plain_text(tmp_path):
@@ -433,6 +454,29 @@ def test_bottom_bar_without_state_shows_hints_only(tmp_path):
         assert KEY_HINTS in _bar_text(box)
 
 
+def test_bottom_bar_shows_indexing_hint_for_warmed_index(tmp_path):
+    """预热中的 @ 补全：底栏显“索引中”，不把空菜单当成“无文件”（票 09）。"""
+    from polya.filefind import ProjectFiles as _PF
+
+    class StubFiles:
+        warmed = True
+        ready = False
+
+        def refresh_soon(self):
+            pass
+
+    with make_box(tmp_path) as (box, _):
+        box._state = {}
+        box._files = StubFiles()
+        buffer = Buffer()
+        buffer.document = Document("@ap")
+        box._session.default_buffer = buffer
+        assert "索引中" in _bar_text(box)
+        # 已就绪：回到常规多行提示
+        box._files = _PF(tmp_path)
+        assert "索引中" not in _bar_text(box)
+
+
 def test_bottom_bar_keeps_command_description_when_menu_closed(tmp_path):
     """命令打全后补全菜单收起（无增量重置），底栏须接过说明而不是只回显命令名。"""
     with make_box(tmp_path) as (box, _):
@@ -456,12 +500,15 @@ def test_working_bar_explains_escape_and_stopping(tmp_path):
         def text():
             return "".join(fragment for _, fragment in box._working_bar())
 
-        assert "Waiting for model · 0s (esc to interrupt)" in text()
+        assert f'{t("ui.status.waiting_model")} · 0s ({t("ui.input.hint_interrupt")})' in text()
         box._session.default_buffer._set_completions(completions=[Completion("test")])
-        assert "esc to close completions" in text()
+        assert t("ui.input.hint_close_completions") in text()
         box._state["stopping"] = True
-        assert "Stopping" in text() and "waiting" in text()
-        assert "esc to interrupt" not in text()
+        assert t("ui.status.stopping") in text()
+        assert (
+            t("ui.status.stopping_hint", status=t("ui.status.current_operation")) in text()
+        )
+        assert t("ui.input.hint_interrupt") not in text()
 
 
 def test_working_timer_formats_elapsed_time(monkeypatch, tmp_path):
@@ -469,10 +516,10 @@ def test_working_timer_formats_elapsed_time(monkeypatch, tmp_path):
         box._state = {"busy": True, "started_at": 100.0}
         monkeypatch.setattr("polya.input.time.monotonic", lambda: 172.0)
         text = "".join(fragment for _, fragment in box._working_bar())
-        assert "Waiting for model · 1m 12s (esc to interrupt)" in text
+        assert f'{t("ui.status.waiting_model")} · 1m 12s ({t("ui.input.hint_interrupt")})' in text
         box._state["started_at"] = 170.0
         text = "".join(fragment for _, fragment in box._working_bar())
-        assert "Waiting for model · 2s" in text
+        assert f'{t("ui.status.waiting_model")} · 2s' in text
 
 
 @pytest.mark.parametrize("width", [24, 40, 80, 120])
@@ -519,9 +566,14 @@ def test_footer_preserves_model_project_and_topic_with_unicode(tmp_path, width):
 
 def test_working_bar_uses_actual_phase(tmp_path):
     with make_box(tmp_path) as (box, _):
-        for phase in ("Thinking", "Responding", "Running Bash", "Reviewing"):
+        for phase in (
+            t("ui.status.thinking"),
+            t("ui.status.responding"),
+            t("ui.status.running_tool", tool="Bash"),
+            t("ui.status.reviewing"),
+        ):
             box._state = {"busy": True, "status": phase}
-            assert phase in "".join(t for _, t in box._working_bar())
-        box._state = {"busy": True, "status": "Reviewing", "stopping": True}
-        text = "".join(t for _, t in box._working_bar())
-        assert "Stopping" in text and "Reviewing" in text
+            assert phase in "".join(fragment for _, fragment in box._working_bar())
+        box._state = {"busy": True, "status": t("ui.status.reviewing"), "stopping": True}
+        text = "".join(fragment for _, fragment in box._working_bar())
+        assert t("ui.status.stopping") in text and t("ui.status.reviewing") in text

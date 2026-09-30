@@ -219,6 +219,29 @@ class ShellSession:
             self._proc = None
             self._reader = None
 
+    @property
+    def busy(self) -> bool:
+        """是否有前台命令仍在运行（Esc 取消前先判断，避免误断空闲会话）。"""
+        return self.alive and self._active is not None and self._active.code is None
+
+    def cancel(self) -> bool:
+        """中断当前前台命令：向会话进程组发 SIGINT，命令立即结束。
+
+        用于 Esc 及时取消长工具（票 02）。非交互 bash 可能随 SIGINT 一并退出，
+        下次 bash 调用会自动重启会话（cwd / 环境变量需重新建立）；返回 False
+        表示当前没有可取消的前台命令。
+        """
+        if not self.busy or self._proc is None:
+            return False
+        try:
+            if os.name == "posix":
+                os.killpg(self._proc.pid, signal.SIGINT)
+            else:
+                self._proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+        except (ProcessLookupError, OSError, ValueError):
+            return False
+        return True
+
     def __del__(self):
         try:
             self.kill()

@@ -44,6 +44,34 @@ def test_wait_timeout_keeps_command_and_environment(tmp_path):
     session.kill()
 
 
+def test_cancel_interrupts_running_command(tmp_path):
+    import threading
+    import time
+
+    session = ShellSession(str(tmp_path))
+    result: dict = {}
+    worker = threading.Thread(
+        target=lambda: result.update(out=session.run("sleep 30", timeout=20))
+    )
+    worker.start()
+    for _ in range(100):  # 等命令真正开始
+        if session.busy:
+            break
+        time.sleep(0.02)
+    assert session.busy
+    assert session.cancel() is True
+    worker.join(5)
+    assert not worker.is_alive()  # 不再等满 timeout
+    assert "Exit code" in result["out"]
+    # 会话可继续用（必要时自动重启）
+    assert "Exit code 0" in session.run("echo resumed")
+
+
+def test_cancel_is_noop_without_running_command(tmp_path):
+    session = ShellSession(str(tmp_path))
+    assert session.cancel() is False
+
+
 def test_output_returns_pending_lines_without_waiting(tmp_path):
     session = ShellSession(str(tmp_path))
     session.run("echo before")

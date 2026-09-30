@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from polya.i18n import t
+
 
 @pytest.mark.parametrize("width", [40, 100])
 def test_terminal_session_runs_tool_and_exits(tmp_path, width):
@@ -91,7 +93,7 @@ loop.run_repl(agent, str(Path(__file__).parent), TerminalRenderer())
         read_until("polya · v")  # banner 版本行：REPL 已启动
         read_until("❯")
         os.write(master, b"hello\r")
-        read_until("esc to interrupt)")
+        read_until(t("ui.input.hint_interrupt") + ")")
         read_until("Checking file.")
         (tmp_path / "preview_seen").touch()
         read_until("changed")  # 默认放行：工具无需审批直接执行并落滚动区

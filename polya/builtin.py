@@ -333,6 +333,7 @@ def default_tools(
     root: str | os.PathLike[str] = ".",
     todos: TodoStore | None = None,
     on_shell_output: Callable[[str], None] | None = None,
+    session: ShellSession | None = None,
 ) -> list[Tool]:
     """构造一组受限在 ``root`` 目录内的编码工具。
 
@@ -343,9 +344,12 @@ def default_tools(
 
     工具名与顺序与历史一致：read_file, list_dir, glob, grep, write_file, edit_file,
     multi_edit, bash, bash_output, kill_bash, web_fetch（+ 可选 todo_write）。
+
+    传入 ``session`` 时复用它（调用方持有引用，以便 Esc 取消运行中的 bash，
+    见票 02）；缺省自建一个。
     """
     base = Path(root).resolve()
-    session = ShellSession(str(base))
+    session = session or ShellSession(str(base))
     read_tools = _make_read_tools(base)
     web_fetch = [item for item in read_tools if item.name == "web_fetch"]
     read_core = [item for item in read_tools if item.name != "web_fetch"]

@@ -169,8 +169,10 @@ _Avoid_: 切点、保留区边界（保留区是 keep 参数，不是 cut point�
 ### 会话身份
 
 **会话身份**:
-当前会话的稳定名字（`agent.session_name`），跨落盘/恢复保持不变；`/new`（含 `/clear`、
-`/reset`）`/fork` `/clone` `/resume` 改换它。
+当前会话的稳定名字（`agent.session_name`）；自动创建的会话先取临时时间戳名，首条任务
+确定主题后改名为主题 slug（旧临时文件删除），此后跨落盘/恢复保持不变。`/new`（`/reset`
+为别名）、`/clear`、`/fork`、`/clone`、`/resume` 改换它；用户显式 `/save <名>` 与恢复的
+会话锁定名字，不随主题改写。
 _Avoid_: 会话 id、会话号
 
 **会话元数据**:

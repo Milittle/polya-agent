@@ -75,8 +75,9 @@ uv run polya -p "修复 pytest 失败的测试" --plan   # 单任务模式：执
 （压缩保留区消息数，默认 30）、`--keep-recent-tokens N`（按 token 预算定保留区，
 优先于 `--keep-recent`）、`--reserve-tokens N`（全量压缩绝对预留，默认 16384）。
 
-提示词与用户可见文案由 `POLYA_LANG` 选择语言（`zh` 默认，`en` 面向英文受众）；
-提示词在导入时求值，会话内稳定，不破 KV Cache 前缀。
+界面文案语言按 `POLYA_LANG` > `~/.polya/settings.json` 的 `"language"` > 默认 `en` 解析
+（`zh` 面向中文受众，settings 持久化、env 临时覆盖）；模型侧提示词固定英文、
+导入时求值，会话内稳定，不破 KV Cache 前缀。
 
 REPL 斜杠命令：
 
@@ -84,36 +85,42 @@ REPL 斜杠命令：
 |---|---|
 | `/help` | 命令列表 |
 | `/todos` `/status` | 查看 TODO 清单 / 会话状态（模式、用量、工具计数） |
+| `/queue [list\|drop N\|take N]` | 查看忙时队列：按送达顺序列类型/摘要/时点，`drop N` 丢弃单条，`take N` 取回编辑器 |
+| `/paste [list\|show N\|expand N\|drop N]` | 检查折叠的粘贴块：列摘要、看原文、展开到编辑器或删除 |
 | `/plan on\|go\|off` | 切换规划模式；`go` 批准当前计划进入执行（`exit_plan_mode` 构造时已注册，切换不动工具数组，缓存安全） |
 | `/login [provider\|custom]` | 登录 provider：provider 列表 → base_url（预填可改）→ 隐藏输 key → 立即落盘，模型目录后台刷新；`custom` 自填端点与模型名 |
 | `/logout <provider>` | 登出并移除 provider 凭据（若是默认模型则清空 active） |
 | `/model [provider/模型]` | 切换模型：对话保留、旧模型 thinking 剥离、能力档案与窗口跟随；无参数跨已登录 provider 展开选项器，`Ctrl+S` 把高亮项存为默认启动模型 |
 | `/thinking [off\|low\|medium\|high]` | 设置推理档位（一家一策）：o 系/gpt-5 发 `reasoning_effort`，GLM/DeepSeek 发 `thinking` 开关；档案无档位的模型明确提示不可切 |
-| `/details [ID]` | 查看留档块全文：无参数看最近 5 块，带 ID 看指定块——滚动区的折叠块在这里看全量 |
+| `/details [ID]` | 查看入口详情：ID 就是**会话树入口 id**（与 `/tree`、`history_read` 同源），无参数看当前分支最近的工具/助手入口——折叠块在这里看全量 |
 | `/compact [说明]` | 立即压缩上下文（不等阈值）；可选说明聚焦摘要重点 |
 | `/rename <主题>` | 重命名当前会话主题与终端标题（单行，最多 120 字） |
-| `/resume [名称]` | 恢复已保存会话：无参数在原输入框按主题选择（主题 · 名字 · 更新时间）；自动落盘的会话都在这 |
+| `/resume [名称]` | 恢复已保存会话：无参数在原输入框按主题选择（主题 · 时间 MM-DD HH:MM）；自动落盘的会话都在这 |
 | `/fork <id>` | 从指定入口分叉出新会话（复制根→该入口的祖先路径，`/tree` 看 id） |
 | `/clone` | 复制当前会话为新会话（含投影编辑与主题） |
 | `/export [路径]` | 导出当前会话：`.md` 为 Markdown（默认 `~/.polya/exports/<名字>.md`），`.jsonl` 为原始会话 |
 | `/import <路径>` | 从任意路径导入会话为新会话：支持 polya JSONL 与 pi 会话格式（按 pi 规则重建活动分支，含 compaction / context_edit） |
 | `/trust [决定]` | 查看/保存项目信任决定：`trust` / `trust-parent` / `untrust` / `clear`（true/false/null，父目录继承；下次启动生效） |
-| `/new` | 开新会话：清空历史、TODO 与统计，分配新会话名，重置主题、丢弃排队消息并重印启动区；旧会话保留可 `/resume` 找回（别名 `/clear`、`/reset`） |
+| `/new` | 开新会话：清空历史、TODO 与统计，分配新会话名，重置主题、丢弃排队消息并重印启动区；只擦可见屏、保留 terminal scrollback；旧会话保留可 `/resume` 找回（别名 `/reset`） |
+| `/clear` | 开新会话并额外清空 terminal scrollback（回滚不再可见） |
 | `/exit` `/quit` | 退出（输入处 Ctrl+D / 空框双击 Ctrl+C 同效） |
 
 `/plan`、`/login`、`/logout`、`/model` 无参数时在原输入框展开选项，并标记当前值；
 `/model` 选项器里 `Ctrl+S` 把高亮项存为默认启动模型。方向键移动，
 Tab / Enter 选中，再按 Enter 执行，Esc 关闭菜单。也可直接输入 `/plan on|go|off`、
 `/login zai`、`/logout zai`、`/model zai/glm-5.3`，支持参数补全。命令或参数错误时保留草稿并提示；
-`/details [ID]` 的 ID 只接受正整数（无参数看最近 5 块）。`/help` 的名称、别名与参数
-与补全、执行共用同一平面注册表。命令随到随执行；会改会话树的命令
-（`/new`、`/exit`、`/compact`、`/rewind`、`/jump`、`/edit`、`/load`、`/resume`、`/fork`、`/clone`、`/import`、`/model`、`/reload`、`/save`）
+`/details [ID]` 的 ID 只接受正整数，含义是会话树入口 id（无参数看当前分支最近的入口）。`/help` 的名称、别名与参数
+与补全、执行共用同一平面注册表。命令随到随执行；会改会话树或切模式的命令
+（`/new`、`/clear`、`/exit`、`/compact`、`/rewind`、`/jump`、`/edit`、`/load`、`/resume`、`/fork`、`/clone`、`/import`、`/model`、`/reload`、`/save`、`/plan`、`/thinking`、`/rename`、`/sessions`、`/tree`、`/export`）
 需要无运行中的任务，否则提示先按 Esc 中断。管道 REPL 不显示选项菜单，需要显式提供参数。
 
 **会话**：每个会话有稳定名字与元数据（标题 / 创建 / 更新 / cwd），任务收尾自动落盘到
 `~/.polya/sessions/<名字>.jsonl`（含 `-p` 单次运行：成功 / 未完成 / 中断 / 异常都会保存），
-所以 `/resume` 列出的是真正用过的会话。无参 `/resume`
-在原输入框展开选择器（主题 · 名字 · 更新时间），`/resume <名字>` 直切。切会话会清零统计、
+所以 `/resume` 列出的是真正用过的会话。自动创建的会话在首条任务确定主题后重命名为主题
+slug，使会话名与主题一致（临时时间戳文件被清掉）；`/save <名字>` 与 `/resume` 会锁定名字。无参 `/resume`
+在原输入框展开选择器（主题 · 时间 MM-DD HH:MM），`/resume <名字>` 直切。恢复会**把会话内容
+回放到滚动区**（用户消息、回答、折叠的工具摘要），看得见这个会话聊了什么；默认只放最近
+30 条，更早的先打一行 dim 省略提示。切会话会清零统计、
 TODO 与读改追踪，互不串味。`/fork <id>` 从祖先路径派生新会话，`/clone` 复制当前会话。
 `/export [路径]` 按当前分支导出 Markdown；`/save` 仍落原始 JSONL 供 `/load`。
 
@@ -173,15 +180,16 @@ YAML frontmatter 声明 `name` 和 `description`；无效条目警告后跳过�
   交互会话先取首条任务作为临时名称，再异步请求当前模型生成简短名称；生成后更新会话文件，
   `-p` 单次运行在保存前生成主题。
   `/resume` 按主题显示。`/rename <主题>` 优先于自动生成，同步修改底部主题与终端标题，
-  `/new`（及别名 `/clear`、`/reset`）重置主题。
+  `/new`（及 `/reset`）重置主题；`/clear` 是独立命令，额外清空 terminal scrollback。
 - **输入操作**：Enter 发送（steering：下一模型请求前注入）；Alt+Enter 追加
   （follow-up：本任务结束后运行）；Ctrl+J / 行尾 `\` + Enter 换行；Alt+Up 取回排队
   消息；补全菜单打开时 Enter 选择候选。`/` 补命令，`@` 补文件；候选最多六行；
   长粘贴折叠，提交时展开。历史保存在 `~/.polya/history`。
 - **忙时排队**：运行中仍可输入。Enter 的 steering 消息在当前批次的所有工具结果回填后、
   下次模型请求前注入；Alt+Enter 的 follow-up 在当前任务结束后作为下一任务运行。
-  Alt+Up 把排队消息取回编辑器；Esc 中断也会把排队消息送回编辑器，不静默丢弃。
-  `/new`（及别名 `/clear`、`/reset`）、`/exit` 等需先按 Esc 让任务空闲。
+  Alt+Up 把排队消息取回编辑器（`/queue` 可列/单条丢弃/取回）；Esc 中断也会把排队消息送回编辑器，不静默丢弃。
+  运行中按 Esc 会立即向 bash 进程组发 SIGINT 取消前台命令（不必等工具超时；下次 bash 自动重启会话）。
+  `/new`（及 `/reset`）、`/clear`、`/exit` 等需先按 Esc 让任务空闲。
 - **内容区**：保留原生终端滚动与复制。正文无需等换行，在输入框上方的尾窗持续
   显示 Markdown 尾部（最多八行正文，矮终端自动减少）；消息完成后一次写入滚动区，
   保留表格、列表与代码块排版。中断时保留已生成的正文并标记未完成。
@@ -191,11 +199,10 @@ YAML frontmatter 声明 `name` 和 `description`；无效条目警告后跳过�
   在尾窗持续更新尾部，滚动区只留下完成摘要。`+ Show details: /details ID` 按固定编号查看对应工具块
   的完整参数和返回结果
   （工具自身的输出上限仍有效）。
-- **任务状态**：输入框上方统一显示当前动作与整轮耗时：`Waiting for model`、`Thinking`、
-  `Responding`、`Running …` 或 `Reviewing`；工具切换不重置计时。
-  `Stopping` 显示正在等待哪个动作。每轮模型任务留下结束、中断或失败回执及耗时，
-  「本轮结束」不代表目标已验证成功。最近保留 20 块，
-  过期编号会提示不可用。补全打开时提示 Esc 关闭补全，已请求停止时提示等待当前操作结束。
+- **任务状态**：输入框上方统一显示当前动作与整轮耗时：`等待模型`、`思考中`、`回答中`、
+  `执行 …` 或 `审核中`（`POLYA_LANG=en` 时为英文标签）；工具切换不重置计时。
+  `停止中` 显示正在等待哪个动作。每轮模型任务留下结束、中断或失败回执及耗时，
+  「本轮结束」不代表目标已验证成功。详情按会话树入口 id 从持久树读取，早期输出不会因滚动淘汰而失效，退出恢复会话后仍可 `/details`。补全打开时提示 Esc 关闭补全，已请求停止时提示等待当前操作结束。
 - **输出协调**：交互模式经同一输出代理，prompt_toolkit 独占输入区刷新，单一渲染路径、
   无 Rich Live。`-p` 的最终答案 stdout / 诊断 stderr 契约保持不变。
 
@@ -391,7 +398,7 @@ polya/
   skills.py      # 技能发现、元数据目录、只读正文与资源加载
   history.py     # 压缩前原始历史的内存只读快照与分页回查
   prompt.py      # 系统提示词具名 section 装配
-  i18n.py        # 文案目录：POLYA_LANG 选择语言（zh 默认 / en）
+  i18n.py        # 文案目录：POLYA_LANG / settings.json 选语言（en 默认 / zh）
   providers.py   # 模型能力声明：只问能力不特判型号
 examples/       # 可运行示例（库用法）与演示工具
 tests/          # 用假 LLM 验证循环 + 内置工具/会话/抓取的沙箱测试

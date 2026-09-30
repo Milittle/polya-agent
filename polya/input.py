@@ -232,6 +232,40 @@ class InputBox:
             prefix = self._draft.text
             self._draft = Document((prefix + "\n" + text) if prefix else text)
 
+    # ---- 粘贴块检查（票 08）：列/看/展开/删除，供 /paste ----
+
+    def paste_blocks(self) -> list[tuple[int, str, int, str]]:
+        """已折叠块：(序号, 占位符, 行数, 预览)。"""
+        blocks: list[tuple[int, str, int, str]] = []
+        for index, content in enumerate(self._pastes, 1):
+            preview = " ⏎ ".join(content.splitlines()[:3])
+            blocks.append(
+                (index, self._tokens[index - 1], content.count("\n") + 1, preview[:80])
+            )
+        return blocks
+
+    def paste_text(self, index: int) -> str | None:
+        return self._pastes[index - 1] if 1 <= index <= len(self._pastes) else None
+
+    def paste_token(self, index: int) -> str | None:
+        return self._tokens[index - 1] if 1 <= index <= len(self._tokens) else None
+
+    def current_text(self) -> str:
+        """当前编辑中的文本（活动 buffer 或草稿）。"""
+        if self._session.app.is_running and not self._session.app.is_done:
+            return self._session.default_buffer.text
+        return self._draft.text
+
+    def apply_text(self, transform) -> None:
+        """把当前输入文本换成 ``transform(text)``；须在主线程调用（见 loop）。"""
+        if self._session.app.is_running and not self._session.app.is_done:
+            buffer = self._session.default_buffer
+            buffer.text = transform(buffer.text)
+            buffer.cursor_position = len(buffer.text)
+            self._session.app.invalidate()
+        else:
+            self._draft = Document(transform(self._draft.text))
+
     def _submitted(self, text: str) -> str:
         self._draft = Document("")
         expanded = self._expand_pastes(text)
@@ -513,14 +547,17 @@ class InputBox:
         minutes, seconds = divmod(elapsed, 60)
         duration = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
         if self._state.get("stopping"):
-            label = "Stopping"
-            hint = "waiting: " + self._state.get("status", "current operation")
+            label = t("ui.status.stopping")
+            hint = t(
+                "ui.status.stopping_hint",
+                status=self._state.get("status") or t("ui.status.current_operation"),
+            )
         else:
-            label = self._state.get("status", "Waiting for model")
+            label = self._state.get("status") or t("ui.status.waiting_model")
             hint = (
-                "esc to close completions"
+                t("ui.input.hint_close_completions")
                 if self._session.default_buffer.complete_state
-                else "esc to interrupt"
+                else t("ui.input.hint_interrupt")
             )
         width = self._session.output.get_size().columns
         text = f"  {label} · {duration} ({hint})"
@@ -642,6 +679,9 @@ class InputBox:
                 hint = " · ".join(p for p in (command.argument_hint, command.description) if p)
         elif buffer.text and not busy:
             hint = t("ui.input.hint_multiline")
+        # 预热中的 @ 补全：先给“索引中”反馈，不让空菜单看起来像“无文件”（票 09）。
+        if "@" in buffer.text and self._files.warmed and not self._files.ready:
+            hint = t("ui.input.indexing")
         flashed = time.monotonic() < self._hint_until
         if flashed:
             hint = self._hint

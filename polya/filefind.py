@@ -49,6 +49,24 @@ class ProjectFiles:
         self._listed_at = 0.0
         self._lock = threading.Lock()
         self._refreshing = threading.Event()
+        self._warmed = False
+
+    @property
+    def warmed(self) -> bool:
+        """是否已请求过预热（交互会话启动时）。"""
+        return self._warmed
+
+    @property
+    def ready(self) -> bool:
+        """索引是否已就绪（至少完成过一次构建）。"""
+        with self._lock:
+            return bool(self._paths)
+
+    def warmup(self) -> None:
+        """启动时后台预热：首次 ``@`` 不在输入线程里同步建索引（票 09）。"""
+        self._warmed = True
+        if not self.ready:
+            self.refresh_soon()
 
     def search(self, query: str) -> list[str]:
         """按分数降序返回至多 RESULT_LIMIT 条路径；空查询按字母序。"""
@@ -75,10 +93,10 @@ class ProjectFiles:
             fresh = self._paths and time.monotonic() - self._listed_at < self._interval
         if fresh:
             return
-        if not self._paths:
-            self._rebuild()  # 首次不能空手而归，同步构建
+        if not self._paths and not self._warmed:
+            self._rebuild()  # 未预热的库/测试路径：首次同步构建，不能空手而归
             return
-        self.refresh_soon()  # 过期：拿旧索引先答，后台换新
+        self.refresh_soon()  # 已预热或已过期：拿现有索引先答，后台换新，不阻塞
 
     def _rebuild(self) -> None:
         try:
@@ -90,8 +108,10 @@ class ProjectFiles:
                 timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return  # rg 缺席或超时：保留旧索引，下次再试
+            self._refreshing.clear()  # rg 缺席或超时：保留旧索引，下次再试
+            return
         paths = sorted(line for line in completed.stdout.splitlines() if line)
         with self._lock:
             self._paths = paths
             self._listed_at = time.monotonic()
+        self._refreshing.clear()

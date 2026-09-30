@@ -197,6 +197,9 @@ class LLM:
         # 推理档位（/thinking，一家一策）：风格由模型能力档案决定，None=用厂商默认。
         self.reasoning_style = profile_for(self.model).reasoning_style
         self.thinking_level: str | None = None
+        # 标题请求用量单独计量（票 10）：不计入会话 total_usage，避免装饰性请求
+        # 误导上下文/费用统计。
+        self.title_usage: dict[str, int] = {}
 
     def _base_kwargs(self, messages: list[dict], tools: list[dict] | None) -> dict:
         kwargs: dict = {"model": self.model, "messages": messages}
@@ -209,11 +212,20 @@ class LLM:
         return kwargs
 
     def generate_title(self, user_message: str) -> str | None:
-        """独立短请求生成会话主题，不改变主对话或流式状态。"""
+        """独立短请求生成会话主题，不改变主对话或流式状态。
+
+        用量计到 ``title_usage``（与 ``total_usage`` 分开），不计入会话统计。
+        """
         response = self.client.with_options(timeout=20.0, max_retries=0).chat.completions.create(
             model=self.model,
             messages=title_messages(user_message),
         )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            for key in ("prompt_tokens", "completion_tokens"):
+                value = getattr(usage, key, None)
+                if value:
+                    self.title_usage[key] = self.title_usage.get(key, 0) + int(value)
         return parse_title(response.choices[0].message.content)
 
     def _open_stream(self, kwargs: dict):
