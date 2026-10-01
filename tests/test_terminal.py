@@ -190,7 +190,7 @@ def test_terminal_login_saves_config_without_freezing(tmp_path):
     home.mkdir()
     script = tmp_path / "login_demo.py"
     script.write_text(
-        f'''
+        f"""
 import os
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -216,7 +216,7 @@ class LLM:
 loop.InputBox = lambda **kw: InputBox(Path(os.environ["HOME"]) / "history", **kw)
 agent = Agent(llm=LLM(), tools=[], status_bar=False)
 loop.run_repl(agent, {str(tmp_path)!r}, TerminalRenderer())
-''',
+""",
         encoding="utf-8",
     )
     master, slave = os.openpty()

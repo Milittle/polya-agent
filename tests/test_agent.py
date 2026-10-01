@@ -305,8 +305,7 @@ def test_budget_checkpoint_auto_continues():
 def test_max_steps_zero_is_unbounded():
     """票 01：max_steps=0 表示无界，不发检查点。"""
     replies = [
-        make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')])
-        for _ in range(3)
+        make_message(tool_calls=[make_tool_call("c1", "add", '{"a": 1, "b": 1}')]) for _ in range(3)
     ] + [make_message(content="完成")]
     agent = Agent(llm=ScriptedLLM(replies), tools=[add], max_steps=0)
 
@@ -337,7 +336,10 @@ def test_loop_guard_nudges_then_stops():
     same = '{"a": 1, "b": 1}'
     replies = [make_message(tool_calls=[make_tool_call(f"c{i}", "add", same)]) for i in range(4)]
     agent = Agent(
-        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        llm=ScriptedLLM(replies),
+        tools=[add],
+        max_steps=0,
+        loop_guard=True,
         loop_repeat_limit=2,
     )
 
@@ -358,7 +360,10 @@ def test_loop_guard_ignores_different_arguments():
         for i in range(4)
     ] + [make_message(content="完成")]
     agent = Agent(
-        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        llm=ScriptedLLM(replies),
+        tools=[add],
+        max_steps=0,
+        loop_guard=True,
         loop_repeat_limit=2,
     )
 
@@ -378,7 +383,10 @@ def test_loop_guard_skips_poll_tools():
         make_message(tool_calls=[make_tool_call(f"c{i}", "waiter", "{}")]) for i in range(5)
     ] + [make_message(content="完成")]
     agent = Agent(
-        llm=ScriptedLLM(replies), tools=[waiter], max_steps=0, loop_guard=True,
+        llm=ScriptedLLM(replies),
+        tools=[waiter],
+        max_steps=0,
+        loop_guard=True,
         loop_repeat_limit=2,
     )
 
@@ -392,7 +400,10 @@ def test_loop_guard_ignores_bad_json():
         make_message(tool_calls=[make_tool_call(f"c{i}", "add", "not-json")]) for i in range(4)
     ] + [make_message(content="完成")]
     agent = Agent(
-        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        llm=ScriptedLLM(replies),
+        tools=[add],
+        max_steps=0,
+        loop_guard=True,
         loop_repeat_limit=2,
     )
 
@@ -414,11 +425,12 @@ def test_loop_guard_off_by_default():
 def test_loop_guard_stop_backfills_remaining_tool_calls():
     """票 06：同一条 assistant 消息内多条 tool_call，熔断停在中间也要回填其余调用。"""
     same = '{"a": 1, "b": 1}'
-    message = make_message(
-        tool_calls=[make_tool_call(f"c{i}", "add", same) for i in range(4)]
-    )
+    message = make_message(tool_calls=[make_tool_call(f"c{i}", "add", same) for i in range(4)])
     agent = Agent(
-        llm=ScriptedLLM([message]), tools=[add], max_steps=0, loop_guard=True,
+        llm=ScriptedLLM([message]),
+        tools=[add],
+        max_steps=0,
+        loop_guard=True,
         loop_repeat_limit=2,
     )
 
@@ -435,7 +447,10 @@ def test_loop_guard_stop_is_resumable():
         make_message(tool_calls=[make_tool_call(f"c{i}", "add", same)]) for i in range(3)
     ] + [make_message(content="完成")]
     agent = Agent(
-        llm=ScriptedLLM(replies), tools=[add], max_steps=0, loop_guard=True,
+        llm=ScriptedLLM(replies),
+        tools=[add],
+        max_steps=0,
+        loop_guard=True,
         loop_repeat_limit=2,
     )
 

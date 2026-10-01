@@ -590,8 +590,7 @@ def test_generated_title_updates_saved_session_and_resume_choice(tmp_path, monke
             await until(lambda: session.topic == "设计会话 Banner 标题")
             saved = tmp_path / ".polya" / "sessions" / f"{session.agent.session_name}.jsonl"
             await until(
-                lambda: saved.exists()
-                and '"title": "设计会话 Banner 标题"' in saved.read_text()
+                lambda: saved.exists() and '"title": "设计会话 Banner 标题"' in saved.read_text()
             )
             assert _session_choices()[0][1].startswith("设计会话 Banner 标题 · ")
             pipe.send_text("继续调整标题\r")
@@ -854,9 +853,11 @@ def test_budget_exhausted_is_not_a_failure(tmp_path, monkeypatch):
     """预算收尾走正常路径：给可继续提示，不出现 [任务失败]。"""
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     llm = FakeLLM([reply(calls=[call("_noop", f"c{i}")]) for i in range(2)])
-    with session_for(
-        tmp_path, llm, tools=[_noop], max_steps=2, max_continuations=0
-    ) as (session, pipe, output):
+    with session_for(tmp_path, llm, tools=[_noop], max_steps=2, max_continuations=0) as (
+        session,
+        pipe,
+        output,
+    ):
 
         async def scenario():
             task = asyncio.create_task(session.run())
@@ -878,8 +879,12 @@ def test_budget_exhausted_is_not_a_failure(tmp_path, monkeypatch):
 def test_run_task_loop_guard_stops_with_outcome():
     llm = FakeLLM([reply(calls=[call("_noop", f"c{i}")]) for i in range(2)])
     agent = Agent(
-        llm=llm, tools=[_noop], status_bar=False, max_steps=0,
-        loop_guard=True, loop_repeat_limit=1,
+        llm=llm,
+        tools=[_noop],
+        status_bar=False,
+        max_steps=0,
+        loop_guard=True,
+        loop_repeat_limit=1,
     )
     output = StringIO()
     renderer = TerminalRenderer(Console(file=output))

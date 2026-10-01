@@ -500,14 +500,12 @@ def test_working_bar_explains_escape_and_stopping(tmp_path):
         def text():
             return "".join(fragment for _, fragment in box._working_bar())
 
-        assert f'{t("ui.status.waiting_model")} · 0s ({t("ui.input.hint_interrupt")})' in text()
+        assert f"{t('ui.status.waiting_model')} · 0s ({t('ui.input.hint_interrupt')})" in text()
         box._session.default_buffer._set_completions(completions=[Completion("test")])
         assert t("ui.input.hint_close_completions") in text()
         box._state["stopping"] = True
         assert t("ui.status.stopping") in text()
-        assert (
-            t("ui.status.stopping_hint", status=t("ui.status.current_operation")) in text()
-        )
+        assert t("ui.status.stopping_hint", status=t("ui.status.current_operation")) in text()
         assert t("ui.input.hint_interrupt") not in text()
 
 
@@ -516,10 +514,10 @@ def test_working_timer_formats_elapsed_time(monkeypatch, tmp_path):
         box._state = {"busy": True, "started_at": 100.0}
         monkeypatch.setattr("polya.input.time.monotonic", lambda: 172.0)
         text = "".join(fragment for _, fragment in box._working_bar())
-        assert f'{t("ui.status.waiting_model")} · 1m 12s ({t("ui.input.hint_interrupt")})' in text
+        assert f"{t('ui.status.waiting_model')} · 1m 12s ({t('ui.input.hint_interrupt')})" in text
         box._state["started_at"] = 170.0
         text = "".join(fragment for _, fragment in box._working_bar())
-        assert f'{t("ui.status.waiting_model")} · 2s' in text
+        assert f"{t('ui.status.waiting_model')} · 2s" in text
 
 
 @pytest.mark.parametrize("width", [24, 40, 80, 120])

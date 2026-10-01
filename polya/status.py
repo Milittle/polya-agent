@@ -41,7 +41,8 @@ def render_status(snapshot: StatusSnapshot) -> str:
     usage = snapshot.usage
     mode_line = (
         "- mode: planning (read-only; submit via exit_plan_mode when the plan is complete)\n"
-        if snapshot.plan_mode else ""
+        if snapshot.plan_mode
+        else ""
     )
     todo_lines = ""
     if snapshot.todos:
