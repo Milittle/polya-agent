@@ -451,9 +451,7 @@ class TerminalRenderer:
             self._console.print()
         self._console.print(Text(t("ui.render.plan_submitted"), style="cyan"))
         self._console.print(Markdown(plan))
-        self._console.print(
-            Text(t("ui.render.plan_hint"), style="dim")
-        )
+        self._console.print(Text(t("ui.render.plan_hint"), style="dim"))
 
     def _print_tool_header(self, name: str, arguments: dict) -> None:
         self._console.print()  # 块间空行分组

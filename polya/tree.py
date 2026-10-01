@@ -260,6 +260,7 @@ class SessionTree:
     def from_jsonl(cls, lines: list[str]) -> SessionTree:
         """从 :meth:`to_jsonl` 的产物重建树；坏行即报，不静默吞。"""
         tree = cls()
+        saw_active = False
         for raw in lines:
             line = raw.strip()
             if not line:
@@ -285,7 +286,11 @@ class SessionTree:
                 tree._overrides[record["id"]] = record["payload"]
             elif kind == "active":
                 tree._active_id = record.get("id")
+                saw_active = True
             # 未知 type：跳过（前向兼容）
+        if not saw_active and tree._entries:
+            # 尾行 active 丢失（如崩溃截断）：退回最新入口，不把会话读成空树
+            tree._active_id = max(tree._entries)
         return tree
 
 

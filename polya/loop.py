@@ -128,9 +128,7 @@ def run_tool_call(
     内置驱动 / 子代理共用；交互驱动走 \
     `run_task`（把结果渲染延后到入口回填后，带上 entry_id）。
     """
-    result, payload = _run_tool(
-        agent, renderer, ev, reviewer, origin=origin, progress=progress
-    )
+    result, payload = _run_tool(agent, renderer, ev, reviewer, origin=origin, progress=progress)
     if payload is not None and renderer is not None:
         renderer.update("tool_result", payload)
     return result
@@ -623,9 +621,7 @@ class InteractiveSession:
             if not self._local(text):
                 self.agent.append_user_message(text)
                 self.say("❯ " + text, "cyan")
-                self.say(
-                    t("ui.loop.steering_delivered", text=text.replace("\n", " ")[:60]), "dim"
-                )
+                self.say(t("ui.loop.steering_delivered", text=text.replace("\n", " ")[:60]), "dim")
 
     def _borrow_terminal(self, callback):
         if self.stop.is_set() or self.closing:
@@ -685,9 +681,7 @@ class InteractiveSession:
                 elif task_outcome == "budget":
                     # 软检查点收尾：不是失败，历史完整，下一条消息即可继续。
                     outcome = t("ui.loop.outcome_checkpoint")
-                    self.say(
-                        t("ui.loop.budget_message"), "yellow"
-                    )
+                    self.say(t("ui.loop.budget_message"), "yellow")
                 elif task_outcome == "no_progress":
                     # 无进展熔断收尾：同样不是失败。
                     outcome = t("ui.loop.outcome_no_progress")

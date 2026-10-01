@@ -239,9 +239,7 @@ class InputBox:
         blocks: list[tuple[int, str, int, str]] = []
         for index, content in enumerate(self._pastes, 1):
             preview = " ⏎ ".join(content.splitlines()[:3])
-            blocks.append(
-                (index, self._tokens[index - 1], content.count("\n") + 1, preview[:80])
-            )
+            blocks.append((index, self._tokens[index - 1], content.count("\n") + 1, preview[:80]))
         return blocks
 
     def paste_text(self, index: int) -> str | None:
@@ -666,7 +664,7 @@ class InputBox:
         busy = state.get("busy", False)
         mode = state.get("mode", "normal")
         if state.get("queued"):
-            mode += " · " + t("ui.input.queued_count", count=state['queued'])
+            mode += " · " + t("ui.input.queued_count", count=state["queued"])
         hint = t("ui.input.hint_steer") if busy else KEY_HINTS
         buffer = self._session.default_buffer
         if buffer.complete_state:
@@ -688,12 +686,12 @@ class InputBox:
         # 窄屏：提示退到最短，但模式（plan/normal）一定保留。
         if not flashed and get_cwidth(mode) + get_cwidth(hint) + 4 > width:
             hint = (
-            t("ui.input.hint_esc_close")
-            if buffer.complete_state
-            else t("ui.input.hint_enter_steer")
-            if busy
-            else "/help"
-        )
+                t("ui.input.hint_esc_close")
+                if buffer.complete_state
+                else t("ui.input.hint_enter_steer")
+                if busy
+                else "/help"
+            )
         return [("class:rule", "  " + _align(mode, hint, width))]
 
     def _flash_hint(self, message: str) -> None:

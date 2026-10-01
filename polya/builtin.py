@@ -61,6 +61,35 @@ def _resolve(root: Path, path: str) -> Path:
     return target
 
 
+def _read_text(target: Path) -> tuple[str, str]:
+    """读文本并保真行尾：返回 (统一为 \\n 的正文, 原行尾)。
+
+    ``Path.read_text`` 的通用换行会把 CRLF 悄悄改成 LF，写回时整文件 diff；
+    这里显式记下原行尾，:func:`_write_text` 再还原。
+    """
+    raw = target.read_bytes().decode("utf-8")
+    eol = "\r\n" if "\r\n" in raw else "\n"
+    return raw.replace("\r\n", "\n"), eol
+
+
+def _write_text(target: Path, text: str, eol: str = "\n") -> None:
+    if eol != "\n":
+        text = text.replace("\n", eol)
+    target.write_bytes(text.encode("utf-8"))
+
+
+def _stamp(target: Path) -> tuple[int, int]:
+    info = target.stat()
+    return info.st_mtime_ns, info.st_size
+
+
+def _check_fresh(seen: dict[Path, tuple[int, int]], target: Path, path: str) -> None:
+    """读过的文件在读后又被外部改动（bash、编辑器）→ 拒绝基于旧内容的编辑。"""
+    recorded = seen.get(target)
+    if recorded is not None and recorded != _stamp(target):
+        raise ValueError(f"File changed since it was last read: {path}. Re-read it before editing")
+
+
 def _walk_files(root: Path, name_filter: str | None = None):
     """确定性遍历 root 下的文件，跳过 IGNORED_DIRS；name_filter 按 fnmatch 过滤文件名。"""
     if root.is_file():
@@ -83,7 +112,7 @@ def _walk_files(root: Path, name_filter: str | None = None):
 # ---------- 工具工厂（票 02） ----------
 
 
-def _make_read_tools(base: Path) -> list[Tool]:
+def _make_read_tools(base: Path, seen: dict[Path, tuple[int, int]] | None = None) -> list[Tool]:
     """只读工具（无 shell 依赖）：read_file / list_dir / glob / grep / web_fetch。"""
 
     @tool(**tool_schema("read_file"))
@@ -103,7 +132,13 @@ def _make_read_tools(base: Path) -> list[Tool]:
         raw = target.read_bytes()
         if b"\x00" in raw[:8192]:
             raise ValueError("Binary file; cannot read as text")
-        lines = raw.decode("utf-8", errors="replace").splitlines()
+        # 只按 \n / \r\n / \r 断行（str.splitlines 还会在 \x0c、\u2028 处断，行号会与编辑器不一致）
+        text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if seen is not None:
+            seen[target] = _stamp(target)
         start = (start_line or 1) - 1
         end = end_line if end_line is not None else len(lines)
         numbered = [
@@ -204,8 +239,13 @@ def _make_read_tools(base: Path) -> list[Tool]:
     return [read_file, list_dir, glob, grep, web_fetch]
 
 
-def _make_write_tools(base: Path) -> list[Tool]:
-    """写文件工具：write_file / edit_file / multi_edit。"""
+def _make_write_tools(base: Path, seen: dict[Path, tuple[int, int]] | None = None) -> list[Tool]:
+    """写文件工具：write_file / edit_file / multi_edit。
+
+    ``seen`` 记录 read_file 读到的文件指纹（mtime+size）：编辑前发现文件已被外部改动
+    即拒绝，避免基于旧内容覆盖他人修改；本工具自己写完后刷新指纹。
+    """
+    seen = seen if seen is not None else {}
 
     @tool(name="write_file", kind="write", **tool_schema("write_file"))
     def write_file(path: str, content: str) -> str:
@@ -214,7 +254,10 @@ def _make_write_tools(base: Path) -> list[Tool]:
         NEVER 用本工具覆盖整文件来做小修改。"""
         target = _resolve(base, path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        if target.is_file():
+            _check_fresh(seen, target, path)
+        _write_text(target, content)
+        seen[target] = _stamp(target)
         return f"Wrote {target.relative_to(base)} ({len(content)} chars)"
 
     @tool(name="edit_file", kind="write", **tool_schema("edit_file"))
@@ -223,7 +266,10 @@ def _make_write_tools(base: Path) -> list[Tool]:
         逐字符匹配（含缩进），默认要求全文件唯一——不唯一时补充上下文使其唯一，
         或传 replace_all=True 全部替换。使用前先 read_file 读过目标区域。"""
         target = _resolve(base, path)
-        text = target.read_text(encoding="utf-8")
+        _check_fresh(seen, target, path)
+        text, eol = _read_text(target)
+        old_string = old_string.replace("\r\n", "\n")
+        new_string = new_string.replace("\r\n", "\n")
         count = text.count(old_string)
         if count == 0:
             raise ValueError("old_string not found")
@@ -231,7 +277,8 @@ def _make_write_tools(base: Path) -> list[Tool]:
             raise ValueError(
                 f"old_string occurs {count} times, not unique; add context or pass replace_all=True"
             )
-        target.write_text(text.replace(old_string, new_string), encoding="utf-8")
+        _write_text(target, text.replace(old_string, new_string), eol)
+        seen[target] = _stamp(target)
         return f"Edited {target.relative_to(base)} ({count} replacements)"
 
     @tool(name="multi_edit", kind="write", **tool_schema("multi_edit"))
@@ -241,11 +288,12 @@ def _make_write_tools(base: Path) -> list[Tool]:
         old_string 必须在轮到它时恰好唯一（不唯一时补充上下文，或给该条加
         "replace_all": true）。多处相关修改优先用本工具，而不是多次 edit_file。"""
         target = _resolve(base, path)
-        text = target.read_text(encoding="utf-8")
+        _check_fresh(seen, target, path)
+        text, eol = _read_text(target)
         draft = text  # 先在副本上完整模拟，全部通过才落盘
         for index, edit in enumerate(edits, 1):
-            old = edit.get("old_string", "")
-            new = edit.get("new_string", "")
+            old = edit.get("old_string", "").replace("\r\n", "\n")
+            new = edit.get("new_string", "").replace("\r\n", "\n")
             if not old:
                 raise ValueError(f"Edit #{index} is missing old_string")
             count = draft.count(old)
@@ -259,7 +307,8 @@ def _make_write_tools(base: Path) -> list[Tool]:
             draft = (
                 draft.replace(old, new) if edit.get("replace_all") else draft.replace(old, new, 1)
             )
-        target.write_text(draft, encoding="utf-8")
+        _write_text(target, draft, eol)
+        seen[target] = _stamp(target)
         return f"Edited {target.relative_to(base)} ({len(edits)} edits)"
 
     return [write_file, edit_file, multi_edit]
@@ -350,12 +399,13 @@ def default_tools(
     """
     base = Path(root).resolve()
     session = session or ShellSession(str(base))
-    read_tools = _make_read_tools(base)
+    seen: dict[Path, tuple[int, int]] = {}  # read_file 与写工具共享的文件指纹
+    read_tools = _make_read_tools(base, seen)
     web_fetch = [item for item in read_tools if item.name == "web_fetch"]
     read_core = [item for item in read_tools if item.name != "web_fetch"]
     tools = [
         *read_core,
-        *_make_write_tools(base),
+        *_make_write_tools(base, seen),
         *_make_session_tools(base, session, on_shell_output),
         *web_fetch,
     ]

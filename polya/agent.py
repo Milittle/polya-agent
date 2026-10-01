@@ -975,9 +975,7 @@ class Agent:
                         ):
                             self._last_signature, self._streak, self._nudged = None, 0, False
                         else:
-                            signature = json.dumps(
-                                arguments, sort_keys=True, ensure_ascii=False
-                            )
+                            signature = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
                             if signature == self._last_signature:
                                 self._streak += 1
                             else:
@@ -997,9 +995,8 @@ class Agent:
                         annotated = f"（{name} 第 {self.tool_counts[name]} 次调用）\n{result}"
                     if nudge:
                         # 独立于 status_bar：guard 必须始终生效。
-                        annotated = (
-                            f"{annotated}\n\n"
-                            + msg("agent.no_progress_nudge", tool=name, count=self._streak)
+                        annotated = f"{annotated}\n\n" + msg(
+                            "agent.no_progress_nudge", tool=name, count=self._streak
                         )
 
                     logger.debug("工具 %s 返回: %.200s", name, result)
@@ -1027,9 +1024,7 @@ class Agent:
                             phase="stopped",
                         )
                         self.last_run_exhausted = True
-                        return msg(
-                            "agent.no_progress_stopped", tool=name, count=self._streak
-                        )
+                        return msg("agent.no_progress_stopped", tool=name, count=self._streak)
             except (KeyboardInterrupt, GeneratorExit):
                 # 中断可能落在工具序列中间：assistant 已声明 N 个 tool_call，
                 # 只回填一部分的话，下一轮请求的序列残缺会被 API 拒绝（每个

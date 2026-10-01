@@ -50,9 +50,7 @@ def test_cancel_interrupts_running_command(tmp_path):
 
     session = ShellSession(str(tmp_path))
     result: dict = {}
-    worker = threading.Thread(
-        target=lambda: result.update(out=session.run("sleep 30", timeout=20))
-    )
+    worker = threading.Thread(target=lambda: result.update(out=session.run("sleep 30", timeout=20)))
     worker.start()
     for _ in range(100):  # 等命令真正开始
         if session.busy:

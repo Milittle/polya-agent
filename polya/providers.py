@@ -93,13 +93,27 @@ PROFILES: dict[str, ModelProfile] = {
 }
 
 
+def _name_candidates(model: str) -> tuple[str, ...]:
+    """查表用的名字候选：完整名优先，再退到去掉厂商前缀的基名。
+
+    聚合器（OpenRouter / Together 等）的模型 id 形如 ``anthropic/claude-sonnet-4``、
+    ``openai/gpt-5``；不剥前缀就全部回落默认档案，温度、推理档位与压缩策略都会错。
+    """
+    base = model.rsplit("/", 1)[-1]
+    return (model, base) if base != model else (model,)
+
+
 def profile_for(model: str | None) -> ModelProfile:
-    """按模型名查档案：前缀匹配（如 'claude-opus-4-5' 命中 'claude'），未命中回落默认。"""
+    """按模型名查档案：前缀匹配（如 'claude-opus-4-5' 命中 'claude'），未命中回落默认。
+
+    带厂商前缀的聚合器 id（``openai/gpt-5``）先按完整名再按基名匹配。
+    """
     if not model:
         return _DEFAULT
-    for prefix, profile in PROFILES.items():
-        if model.startswith(prefix):
-            return profile
+    for name in _name_candidates(model):
+        for prefix, profile in PROFILES.items():
+            if name.startswith(prefix):
+                return profile
     return _DEFAULT
 
 
@@ -171,12 +185,13 @@ def estimate_cost(
     """
     if not model:
         return None
-    for prefix, (in_price, out_price, read_price, write_price) in PRICES.items():
-        if model.startswith(prefix):
-            return (
-                input_tokens * in_price
-                + output_tokens * out_price
-                + cache_read_tokens * read_price
-                + cache_write_tokens * write_price
-            ) / 1_000_000
+    for name in _name_candidates(model):
+        for prefix, (in_price, out_price, read_price, write_price) in PRICES.items():
+            if name.startswith(prefix):
+                return (
+                    input_tokens * in_price
+                    + output_tokens * out_price
+                    + cache_read_tokens * read_price
+                    + cache_write_tokens * write_price
+                ) / 1_000_000
     return None
