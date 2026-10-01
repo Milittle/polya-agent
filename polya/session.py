@@ -132,13 +132,14 @@ def read(name: str) -> tuple[SessionMeta, list[str]] | None:
         return None
     header: dict = {}
     entries: list[str] = []
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    for index, stripped in enumerate(lines):
         try:
             record = json.loads(stripped)
         except json.JSONDecodeError:
+            # 只容忍尾部半行（写入中途崩溃的典型残留）；中段坏行说明文件真损坏
+            if index == len(lines) - 1:
+                break
             return None
         if isinstance(record, dict) and record.get("type") == "session":
             header = record
@@ -157,7 +158,16 @@ def write(meta: SessionMeta, entry_lines: list[str]) -> Path:
         meta.created = meta.updated
     path = directory / f"{meta.name}.jsonl"
     body = [json.dumps(meta.header(), ensure_ascii=False), *entry_lines]
-    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    # 原子落盘：先写临时文件再 replace，写到一半被杀也不会留下半截会话文件
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(body) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     try:
         os.chmod(path, 0o600)
     except OSError:  # Windows 等不支持时不强求

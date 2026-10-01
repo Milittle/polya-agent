@@ -72,3 +72,18 @@ def test_subscription_providers_marked():
     assert "zai" in SUBSCRIPTION_PROVIDERS
     assert "qwen-token-plan-cn" in SUBSCRIPTION_PROVIDERS
     assert "deepseek" not in SUBSCRIPTION_PROVIDERS
+
+
+def test_profile_for_strips_vendor_prefix_of_aggregator_ids():
+    assert profile_for("anthropic/claude-sonnet-4").supports_inplace_tool_edit is False
+    assert profile_for("openai/gpt-5").temperature is None
+    assert profile_for("openai/gpt-5").reasoning_style == "reasoning_effort"
+    assert profile_for("some-vendor/unknown-model") == profile_for("unknown-model")
+
+
+def test_estimate_cost_strips_vendor_prefix():
+    assert estimate_cost("deepseek/deepseek-flash", 1_000_000, 0) == estimate_cost(
+        "deepseek-flash", 1_000_000, 0
+    )
+    # 带前缀的精确条目仍优先于基名
+    assert estimate_cost("moonshotai/Kimi-K2.6", 1_000_000, 0) == 1.2

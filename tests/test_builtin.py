@@ -335,3 +335,46 @@ def test_read_only_tools_is_read_subset_without_shell():
     assert all(item.kind == "read" for item in readonly)
     assert not names & {"bash", "bash_output", "kill_bash", "write_file", "edit_file"}
     assert names == {"read_file", "list_dir", "glob", "grep", "web_fetch"}
+
+
+def test_edit_preserves_crlf_line_endings(tools, tmp_path):
+    (tmp_path / "w.txt").write_bytes(b"a\r\nb\r\nc\r\n")
+    # 模型给的 old_string 用 \n，也要能匹配 CRLF 文件
+    tools.call("edit_file", {"path": "w.txt", "old_string": "a\nb", "new_string": "x\ny"})
+    assert (tmp_path / "w.txt").read_bytes() == b"x\r\ny\r\nc\r\n"
+    tools.call("multi_edit", {"path": "w.txt", "edits": [{"old_string": "c", "new_string": "z"}]})
+    assert (tmp_path / "w.txt").read_bytes() == b"x\r\ny\r\nz\r\n"
+
+
+def test_edit_preserves_lf_files(tools, tmp_path):
+    (tmp_path / "l.txt").write_bytes(b"a\nb\n")
+    tools.call("edit_file", {"path": "l.txt", "old_string": "b", "new_string": "c"})
+    assert (tmp_path / "l.txt").read_bytes() == b"a\nc\n"
+
+
+def test_edit_rejected_when_file_changed_since_read(tools, tmp_path):
+    (tmp_path / "s.txt").write_text("one\n")
+    tools.call("read_file", {"path": "s.txt"})
+    (tmp_path / "s.txt").write_text("one\nexternally added\n")  # bash / 编辑器改动
+    result = tools.call("edit_file", {"path": "s.txt", "old_string": "one", "new_string": "two"})
+    assert result.startswith("Error:") and "changed since" in result
+    assert "externally added" in (tmp_path / "s.txt").read_text()
+    # 重读后可编辑
+    tools.call("read_file", {"path": "s.txt"})
+    assert "Edited" in tools.call(
+        "edit_file", {"path": "s.txt", "old_string": "one", "new_string": "two"}
+    )
+
+
+def test_consecutive_edits_do_not_trip_freshness(tools, tmp_path):
+    (tmp_path / "c.txt").write_text("a b c\n")
+    tools.call("read_file", {"path": "c.txt"})
+    tools.call("edit_file", {"path": "c.txt", "old_string": "a", "new_string": "x"})
+    assert "Edited" in tools.call(
+        "edit_file", {"path": "c.txt", "old_string": "b", "new_string": "y"}
+    )
+
+
+def test_read_file_line_numbers_ignore_exotic_separators(tools, tmp_path):
+    (tmp_path / "x.txt").write_text("a\x0cb\nc\n", encoding="utf-8")
+    assert tools.call("read_file", {"path": "x.txt"}) == "     1\ta\x0cb\n     2\tc"

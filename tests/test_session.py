@@ -294,3 +294,36 @@ def test_failed_resume_does_not_replay(tmp_path, monkeypatch):
     result = dispatch_command("/resume missing", CommandContext(_agent(), renderer=renderer))
     assert result.startswith("无法")
     assert buf.getvalue() == ""
+
+
+def test_write_is_atomic_and_leaves_no_temp_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = _seed(_agent())
+    agent.save_session("atomic")
+    names = sorted(p.name for p in (tmp_path / ".polya" / "sessions").iterdir())
+    assert names == ["atomic.jsonl"]
+
+
+def test_truncated_tail_line_is_tolerated(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = _seed(_agent())
+    agent.save_session("crashy")
+    path = tmp_path / ".polya" / "sessions" / "crashy.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    # 模拟崩溃：丢掉尾行 active，并留一段半截 JSON
+    path.write_text("\n".join(lines[:-1]) + '\n{"type": "entry", "id": 9', encoding="utf-8")
+
+    fresh = _agent()
+    assert "已恢复会话" in fresh.load_session("crashy")
+    assert [m["content"] for m in fresh.history] == ["任务一", "答一"]  # 退回最新入口
+
+
+def test_corrupt_middle_line_is_still_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    agent = _seed(_agent())
+    agent.save_session("broken")
+    path = tmp_path / ".polya" / "sessions" / "broken.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines.insert(2, "{not json")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    assert "无法读取会话" in _agent().load_session("broken")
